@@ -1,26 +1,28 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v3
+ * Anima 灵枢 · Webhook 服务 v4
  * ─────────────────────────────────────────────────────────────
  * 功能：
- *   1. 充值卡激活       POST  /activate
- *   2. API 计费记录     POST  /billing/record
- *   3. 用户余额查询     GET   /billing/balance/:email
- *   4. 用户消费历史     GET   /billing/history/:email
- *   5. 查看可用模型     GET   /models
- *   6. 健康检查        GET   /health
+ *   1. 充值卡激活           POST  /activate
+ *   2. API 计费记录         POST  /billing/record
+ *   3. 用户余额查询         GET   /billing/balance/:email
+ *   4. 用户消费历史         GET   /billing/history/:email
+ *   5. 预检余额是否充足      POST  /billing/check
+ *   6. 查看可用模型（用户）  GET   /models
+ *   7. 健康检查             GET   /health
  *   ── 管理员接口（需 ADMIN_TOKEN）──────────────────────────
- *   7. 添加/更新模型定价  POST /admin/models
- *   8. 修改模型定价      PUT  /admin/models/:id
- *   9. 人工调整余额      POST /admin/adjust
+ *   8.  查看所有模型         GET   /admin/models
+ *   9.  添加/更新模型定价    POST  /admin/models
+ *   10. 修改模型定价         PUT   /admin/models/:id
+ *   11. 人工调整余额         POST  /admin/adjust
  *
  * 计费规则：
- *   · 每个模型在 api_models 表中独立定价（管理员自由设定）
+ *   · 每个模型在 api_models 表中独立定价（管理员自由设定），无套餐绑定
  *   · is_free=true 的模型永久免费，不扣余额
  *   · 付费模型按字数计费：(inputChars/1000)*price_in + (outputChars/1000)*price_out
  *   · 余额不足时拒绝请求，返回 402
- *   · 本地 Ollama 模型保留接口条目（is_active=false），不参与计费
+ *   · is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费调用
  *
  * 安全：
  *   · helmet 安全响应头
@@ -329,6 +331,75 @@ app.get('/billing/history/:email', async (req, res) => {
 });
 
 /**
+ * POST /billing/check
+ * 调用前预检：根据估算字数判断余额是否充足，不扣费
+ *
+ * Body: { userEmail, modelName, estimatedInputChars?, estimatedOutputChars? }
+ * estimatedInputChars/estimatedOutputChars 默认为 0；
+ * 如未提供，estimated_fen=0，can_proceed 仅反映账户是否可用而非余额充足。
+ *
+ * 返回：
+ * {
+ *   success:       boolean,
+ *   can_proceed:   boolean,  // true = 余额充足可继续
+ *   is_free:       boolean,
+ *   estimated_fen: number,   // 估算费用（分）
+ *   balance_fen:   number,
+ *   is_suspended:  boolean
+ * }
+ */
+app.post('/billing/check', async (req, res) => {
+  const { userEmail, modelName, estimatedInputChars, estimatedOutputChars } = req.body ?? {};
+
+  if (!EMAIL_RE.test(userEmail || '')) {
+    return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
+  }
+  if (!modelName) {
+    return res.status(400).json({ success: false, msg: '缺少 modelName' });
+  }
+
+  const model = await lookupModel(modelName).catch(() => null);
+
+  if (!model) {
+    return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
+  }
+  if (!model.is_active) {
+    return res.status(400).json({ success: false, msg: '该模型当前未启用' });
+  }
+
+  if (model.is_free) {
+    return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false });
+  }
+
+  const inChars  = Math.max(0, parseInt(estimatedInputChars  || '0', 10));
+  const outChars = Math.max(0, parseInt(estimatedOutputChars || '0', 10));
+  const priceIn  = Number(model.price_input_per_1k_chars);
+  const priceOut = Number(model.price_output_per_1k_chars);
+  const estimatedFen = Math.ceil(((inChars / 1000) * priceIn + (outChars / 1000) * priceOut) * 100);
+
+  try {
+    const balRes = await db.query(
+      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+      [userEmail]
+    );
+    const balance     = balRes.rows.length > 0 ? Number(balRes.rows[0].balance_fen) : 0;
+    const isSuspended = balRes.rows.length > 0 ? balRes.rows[0].is_suspended : false;
+
+    res.json({
+      success:       true,
+      can_proceed:   !isSuspended && balance >= estimatedFen,
+      is_free:       false,
+      estimated_fen: estimatedFen,
+      balance_fen:   balance,
+      is_suspended:  isSuspended,
+    });
+  } catch (err) {
+    logger.error('Billing check error', { err: err.message, userEmail });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+/**
  * POST /billing/record
  * 记录一次 API 调用并执行计费
  *
@@ -369,15 +440,20 @@ app.post('/billing/record', async (req, res) => {
     return null;
   });
 
-  // 模型未注册：记录日志但不阻断，按付费处理（兜底保守策略）
-  const modelId   = model ? model.id : null;
-  const isFree    = model ? model.is_free : false;
-  const priceIn   = model ? Number(model.price_input_per_1k_chars)  : 0;
-  const priceOut  = model ? Number(model.price_output_per_1k_chars) : 0;
-
   if (!model) {
     logger.warn('Model not registered in api_models', { modelName, apiProvider });
+    return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
   }
+
+  // is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费
+  if (!model.is_active) {
+    return res.status(400).json({ success: false, msg: '该模型当前未启用，无法计费' });
+  }
+
+  const modelId  = model.id;
+  const isFree   = model.is_free;
+  const priceIn  = Number(model.price_input_per_1k_chars);
+  const priceOut = Number(model.price_output_per_1k_chars);
 
   // ── 2. 免费模型：只记录，不扣费 ────────────────────────────
   if (isFree) {
@@ -489,6 +565,26 @@ app.post('/billing/record', async (req, res) => {
 // =============================================================
 
 /**
+ * GET /admin/models
+ * 查看所有模型（含未启用的本地模型）
+ */
+app.get('/admin/models', requireAdmin, async (_req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, provider, model_name, display_name, is_free,
+              price_input_per_1k_chars, price_output_per_1k_chars,
+              is_active, description, created_at, updated_at
+         FROM api_models
+         ORDER BY provider, model_name`
+    );
+    res.json({ success: true, models: result.rows });
+  } catch (err) {
+    logger.error('Admin models query error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+/**
  * POST /admin/models
  * 新增 API 模型定价
  *
@@ -530,7 +626,8 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
            price_output_per_1k_chars = EXCLUDED.price_output_per_1k_chars,
            description = EXCLUDED.description,
            is_active   = true
-         RETURNING id, model_name, is_free, price_input_per_1k_chars, price_output_per_1k_chars`,
+         RETURNING id, provider, model_name, display_name, is_free,
+                   price_input_per_1k_chars, price_output_per_1k_chars, is_active`,
       [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, description || null]
     );
 
