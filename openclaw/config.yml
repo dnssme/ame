@@ -1,0 +1,73 @@
+# =============================================================
+# Anima 灵枢 · OpenClaw Agent 配置
+# 部署节点：VPS B (172.16.1.2)
+#
+# 安全提示：所有 <占位符> 内容请替换为真实值后将文件权限设为 600：
+#   chmod 600 /opt/openclaw/config.yml
+# 如果 OpenClaw 支持环境变量插值（${ENV_VAR}），推荐改用环境变量注入
+# =============================================================
+
+# ─── 服务器 ──────────────────────────────────────────────────
+server:
+  host: 172.16.1.2
+  port: 3000
+
+# ─── AI 推理（优先本地 Ollama，复杂任务自动 fallback 到云端）─
+llm:
+  provider: ollama
+  baseUrl: http://172.16.1.5:11434
+  model: qwen2.5:7b-instruct-q4_K_M
+  timeout: 120          # 秒，7B 模型推理可能较慢
+  maxRetries: 2
+
+  # 备用云端 API（Ollama 不可用时自动切换，会产生计费）
+  fallback:
+    provider: anthropic
+    apiKey: <你的 Claude API Key>   # 留空则不启用 fallback
+    model: claude-haiku-4-5-20251001
+    timeout: 30
+
+# ─── 计费 Webhook（向 CXI4 报告每次 API 调用）────────────────
+billing:
+  enabled: true
+  webhookUrl: http://172.16.1.5:3002/billing/record
+
+# ─── 记忆数据库 ───────────────────────────────────────────────
+memory:
+  enabled: true
+  database: postgresql://animaapp:<密码>@anima-db.postgres.database.azure.com:5432/openclaw?sslmode=require
+
+# ─── Redis 缓存（复用 CXI4 的 Redis）────────────────────────
+redis:
+  url: redis://:<Redis密码>@172.16.1.5:6379
+  # 对话上下文缓存 TTL（秒）
+  sessionTtl: 3600
+
+# ─── 工具配置 ─────────────────────────────────────────────────
+tools:
+  # 网页搜索（DuckDuckGo 免费，无需 API Key）
+  search:
+    enabled: true
+    provider: duckduckgo
+    maxResults: 5
+
+  # Nextcloud 日历（CalDAV）
+  calendar:
+    enabled: true
+    provider: nextcloud
+    url: http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
+    username: admin
+    password: <Nextcloud 管理员密码>
+
+  # Home Assistant 智能家居控制
+  homeassistant:
+    enabled: true
+    baseUrl: http://172.16.1.5:8123
+    token: <HA 长效访问令牌>
+
+  # 语音服务
+  voice:
+    recognition:
+      url: http://172.16.1.5:8080/transcribe
+    synthesis:
+      url: http://172.16.1.1:8082/api/tts
