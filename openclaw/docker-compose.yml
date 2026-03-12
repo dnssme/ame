@@ -25,6 +25,11 @@ services:
       - ./config.yml:/app/config.yml:ro
       - ./data:/app/data
 
+    # API Key 等敏感变量从 .env 文件加载（docker compose 自动读取同目录 .env）
+    env_file:
+      - path: ./.env
+        required: true
+
     environment:
       NODE_ENV: production
       TZ: Asia/Shanghai

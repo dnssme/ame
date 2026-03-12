@@ -315,15 +315,21 @@ app.get('/billing/history/:email', async (req, res) => {
   const offset = Math.max(parseInt(req.query.offset || '0',  10), 0);
 
   try {
-    const result = await db.query(
-      `SELECT type, amount_fen, balance_after_fen, description, created_at
-         FROM billing_transactions
-        WHERE user_email=$1
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3`,
-      [email, limit, offset]
-    );
-    res.json({ success: true, records: result.rows });
+    const [result, countRes] = await Promise.all([
+      db.query(
+        `SELECT type, amount_fen, balance_after_fen, description, created_at
+           FROM billing_transactions
+          WHERE user_email=$1
+          ORDER BY created_at DESC
+          LIMIT $2 OFFSET $3`,
+        [email, limit, offset]
+      ),
+      db.query(
+        'SELECT COUNT(*) AS total FROM billing_transactions WHERE user_email=$1',
+        [email]
+      ),
+    ]);
+    res.json({ success: true, records: result.rows, total: Number(countRes.rows[0]?.total ?? 0) });
   } catch (err) {
     logger.error('History query error', { err: err.message, email });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -382,8 +388,9 @@ app.post('/billing/check', async (req, res) => {
       'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
       [userEmail]
     );
-    const balance     = balRes.rows.length > 0 ? Number(balRes.rows[0].balance_fen) : 0;
-    const isSuspended = balRes.rows.length > 0 ? balRes.rows[0].is_suspended : false;
+    const userExists  = balRes.rows.length > 0;
+    const balance     = userExists ? Number(balRes.rows[0].balance_fen) : 0;
+    const isSuspended = userExists ? balRes.rows[0].is_suspended : false;
 
     res.json({
       success:       true,
@@ -611,6 +618,9 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
   if (!isFree && (typeof priceInput !== 'number' || typeof priceOutput !== 'number')) {
     return res.status(400).json({ success: false, msg: '付费模型必须提供 priceInput 和 priceOutput' });
   }
+  if (!isFree && (priceInput < 0 || priceOutput < 0)) {
+    return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
+  }
 
   try {
     const result = await db.query(
@@ -674,10 +684,16 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
     }
   }
   if (!isFree && typeof priceInput === 'number') {
+    if (priceInput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceInput 必须为非负数' });
+    }
     updates.push(`price_input_per_1k_chars = $${values.length + 1}`);
     values.push(priceInput);
   }
   if (!isFree && typeof priceOutput === 'number') {
+    if (priceOutput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceOutput 必须为非负数' });
+    }
     updates.push(`price_output_per_1k_chars = $${values.length + 1}`);
     values.push(priceOutput);
   }
@@ -743,6 +759,13 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
 
     await ensureUser(client, userEmail);
 
+    // 先取当前余额（ensureUser 保证行已存在）
+    const prevRes = await client.query(
+      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
+      [userEmail]
+    );
+    const oldBalance = Number(prevRes.rows[0].balance_fen);
+
     const result = await client.query(
       `UPDATE user_billing
           SET balance_fen = GREATEST(0, balance_fen + $1)
@@ -751,18 +774,20 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
       [amount_fen, userEmail]
     );
     const newBalance = Number(result.rows[0].balance_fen);
+    // 实际生效金额（减少时若余额不足会被截断到 0，实际扣减 = newBalance - oldBalance）
+    const actualApplied = newBalance - oldBalance;
 
     await client.query(
       `INSERT INTO billing_transactions
            (user_email, type, amount_fen, balance_after_fen, description)
          VALUES ($1,$2,$3,$4,$5)`,
-      [userEmail, type, amount_fen, newBalance, description || '管理员调整']
+      [userEmail, type, actualApplied, newBalance, description || '管理员调整']
     );
 
     await client.query('COMMIT');
 
-    logger.info('Admin balance adjusted', { userEmail, amount_fen, type });
-    res.json({ success: true, balance_fen: newBalance });
+    logger.info('Admin balance adjusted', { userEmail, amount_fen, actualApplied, type });
+    res.json({ success: true, balance_fen: newBalance, actual_applied_fen: actualApplied });
   } catch (err) {
     await client.query('ROLLBACK');
     logger.error('Admin adjust error', { err: err.message });

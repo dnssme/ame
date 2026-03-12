@@ -1,5 +1,5 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v3
+-- Anima 灵枢 · 数据库 Schema v4
 -- 数据库: librechat (Azure PostgreSQL)
 -- 设计原则：
 --   · 按模型按量计费，无套餐绑定
@@ -22,8 +22,8 @@ CREATE TABLE IF NOT EXISTS api_models (
     display_name VARCHAR(128) NOT NULL,            -- 界面显示名称
     -- 定价（元/1000字）；is_free=true 时忽略这两个字段
     is_free                   BOOLEAN      NOT NULL DEFAULT false,
-    price_input_per_1k_chars  NUMERIC(10,4) NOT NULL DEFAULT 0, -- 输入字价格（元/1000字）
-    price_output_per_1k_chars NUMERIC(10,4) NOT NULL DEFAULT 0, -- 输出字价格（元/1000字）
+    price_input_per_1k_chars  NUMERIC(10,4) NOT NULL DEFAULT 0 CHECK (price_input_per_1k_chars >= 0),
+    price_output_per_1k_chars NUMERIC(10,4) NOT NULL DEFAULT 0 CHECK (price_output_per_1k_chars >= 0),
     -- 是否启用（false = 仅保留接口定义，用户不可选）
     is_active    BOOLEAN      NOT NULL DEFAULT true,
     description  TEXT,                             -- 管理员备注
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS user_billing (
     -- LibreChat 用户邮箱（外部关联，无 FK 保证解耦）
     user_email        VARCHAR(254) NOT NULL UNIQUE,
     -- 余额（分），预付费模式
-    balance_fen       NUMERIC(12,2) NOT NULL DEFAULT 0,
+    balance_fen       NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (balance_fen >= 0),
     -- 累计消费（分），仅统计用
     total_charged_fen NUMERIC(12,2) NOT NULL DEFAULT 0,
     -- 账户状态（管理员可暂停）
@@ -114,7 +114,7 @@ ON CONFLICT (key) DO NOTHING;
 CREATE TABLE IF NOT EXISTS api_usage (
     id              BIGSERIAL     PRIMARY KEY,
     user_email      VARCHAR(254)  NOT NULL,
-    -- 关联模型（NULL = 模型未在 api_models 表注册时的兜底）
+    -- 关联模型（NULL = 早期兜底记录或模型已被删除）
     api_model_id    INT           REFERENCES api_models(id) ON DELETE SET NULL,
     api_provider    VARCHAR(32)   NOT NULL,
     model_name      VARCHAR(128)  NOT NULL,
@@ -142,7 +142,7 @@ CREATE INDEX IF NOT EXISTS idx_api_usage_model
 CREATE TABLE IF NOT EXISTS billing_transactions (
     id                BIGSERIAL     PRIMARY KEY,
     user_email        VARCHAR(254)  NOT NULL,
-    type              VARCHAR(16)   NOT NULL, -- 'charge' | 'recharge' | 'refund' | 'admin_adjust'
+    type              VARCHAR(16)   NOT NULL CHECK (type IN ('charge','recharge','refund','admin_adjust')),
     amount_fen        NUMERIC(12,4) NOT NULL,
     balance_after_fen NUMERIC(12,2) NOT NULL,
     description       TEXT,
