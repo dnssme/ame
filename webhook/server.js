@@ -311,8 +311,8 @@ app.get('/billing/history/:email', async (req, res) => {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
-  const limit  = Math.min(parseInt(req.query.limit  || '20', 10), 100);
-  const offset = Math.max(parseInt(req.query.offset || '0',  10), 0);
+  const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20,  1), 100);
+  const offset = Math.max(parseInt(req.query.offset || '0',  10) || 0, 0);
 
   try {
     const [result, countRes] = await Promise.all([
@@ -364,7 +364,14 @@ app.post('/billing/check', async (req, res) => {
     return res.status(400).json({ success: false, msg: '缺少 modelName' });
   }
 
-  const model = await lookupModel(modelName).catch(() => null);
+  // DB 错误单独捕获，避免与"模型不存在"混淆
+  let model;
+  try {
+    model = await lookupModel(modelName);
+  } catch (err) {
+    logger.error('Model lookup error in /billing/check', { err: err.message, modelName });
+    return res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
 
   if (!model) {
     return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
@@ -377,8 +384,8 @@ app.post('/billing/check', async (req, res) => {
     return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false });
   }
 
-  const inChars  = Math.max(0, parseInt(estimatedInputChars  || '0', 10));
-  const outChars = Math.max(0, parseInt(estimatedOutputChars || '0', 10));
+  const inChars  = Math.max(0, parseInt(estimatedInputChars  || '0', 10) || 0);
+  const outChars = Math.max(0, parseInt(estimatedOutputChars || '0', 10) || 0);
   const priceIn  = Number(model.price_input_per_1k_chars);
   const priceOut = Number(model.price_output_per_1k_chars);
   const estimatedFen = Math.ceil(((inChars / 1000) * priceIn + (outChars / 1000) * priceOut) * 100);
@@ -442,10 +449,14 @@ app.post('/billing/record', async (req, res) => {
   }
 
   // ── 1. 查询模型定价 ─────────────────────────────────────────
-  const model = await lookupModel(modelName).catch((err) => {
-    logger.error('Model lookup error', { err: err.message });
-    return null;
-  });
+  // DB 错误单独捕获，避免与"模型不注册"混淆
+  let model;
+  try {
+    model = await lookupModel(modelName);
+  } catch (err) {
+    logger.error('Model lookup error in /billing/record', { err: err.message, modelName });
+    return res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
 
   if (!model) {
     logger.warn('Model not registered in api_models', { modelName, apiProvider });
@@ -619,6 +630,7 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: '付费模型必须提供 priceInput 和 priceOutput' });
   }
   if (!isFree && (priceInput < 0 || priceOutput < 0)) {
+    // 应用层提前拦截，与 db/schema.sql 中 CHECK(>= 0) 约束互为防御
     return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
   }
 
@@ -822,10 +834,15 @@ const server = app.listen(PORT, HOST, () => {
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
   server.close(() => {
-    db.end().then(() => {
-      logger.info('数据库连接池已关闭');
-      process.exit(0);
-    });
+    db.end()
+      .then(() => {
+        logger.info('数据库连接池已关闭');
+        process.exit(0);
+      })
+      .catch((err) => {
+        logger.error('数据库连接池关闭失败', { err: err.message });
+        process.exit(1);
+      });
   });
   setTimeout(() => process.exit(1), 10_000);
 };

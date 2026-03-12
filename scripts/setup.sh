@@ -97,8 +97,9 @@ if ! command -v psql &>/dev/null; then
   apt-get install -y postgresql-client
 fi
 
+# --quiet 抑制 CREATE TABLE / INSERT 等成功提示；ERROR 级别消息仍会输出到 stderr
 PGPASSWORD="${PG_PASSWORD}" PGSSLMODE=require psql \
-  --quiet \   # 抑制 CREATE TABLE / INSERT 等成功提示；ERROR 级别消息仍会输出到 stderr
+  --quiet \
   -h "${PG_HOST}" \
   -U animaapp \
   -d librechat \

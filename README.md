@@ -113,12 +113,13 @@ ping -c 2 172.16.1.5   # CXI4 (Webhook/Redis)
 apt-get update && apt-get install -y redis-server
 
 # 配置 Redis 监听内网、设置密码
+# ⚠️ 密码请勿包含 / & \ 等特殊字符（会破坏下方 sed 命令）
 REDIS_PASS="<强随机字符串>"   # 记录此密码，后续 LibreChat 和 OpenClaw 需要
 
-sed -i \
-  -e 's/^bind 127.0.0.1.*/bind 172.16.1.5 127.0.0.1/' \
-  -e "s/^# requirepass .*/requirepass ${REDIS_PASS}/" \
-  /etc/redis/redis.conf
+# 修改监听地址
+sed -i 's/^bind 127.0.0.1.*/bind 172.16.1.5 127.0.0.1/' /etc/redis/redis.conf
+# 设置密码（取消 requirepass 注释并写入密码）
+sed -i "s/^# requirepass .*/requirepass ${REDIS_PASS}/" /etc/redis/redis.conf
 
 systemctl enable --now redis-server
 systemctl restart redis-server
@@ -452,14 +453,17 @@ curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
 ### 5.5 生成充值卡
 
 ```bash
-# 通过数据库生成充值卡
+# 通过数据库生成充值卡（使用 heredoc 避免 shell 引号嵌套问题）
 PGPASSWORD="<animaapp密码>" PGSSLMODE=require psql \
   -h anima-db.postgres.database.azure.com \
-  -U animaapp -d librechat \
-  -c "INSERT INTO recharge_cards (key, credit_fen, label)
-      SELECT 'ANIMA-' || upper(encode(gen_random_bytes(8),'hex')), 2000, '¥20 充值卡'
-      FROM generate_series(1,5)   -- 一次生成5张
-      RETURNING key, credit_fen, label;"
+  -U animaapp -d librechat <<'SQL'
+INSERT INTO recharge_cards (key, credit_fen, label)
+SELECT 'ANIMA-' || upper(encode(gen_random_bytes(8),'hex')),
+       2000,
+       '¥20 充值卡'
+FROM generate_series(1,5)   -- 一次生成5张
+RETURNING key, credit_fen, label;
+SQL
 ```
 
 ### 5.6 人工为用户充值
@@ -734,12 +738,13 @@ WHERE model_name='claude-sonnet-4-5';
 INSERT INTO recharge_cards (key, credit_fen, label)
 VALUES ('ANIMA-' || upper(encode(gen_random_bytes(8),'hex')), 2000, '¥20 充值卡');
 
--- ─── 批量生成充值卡 ────────────────────────────────────────
-SELECT 'ANIMA-' || upper(encode(gen_random_bytes(8),'hex')) AS key,
-       2000 AS credit_fen,
-       '¥20 充值卡' AS label
-FROM generate_series(1,10);
--- 将上面输出复制到 INSERT 语句中
+-- ─── 批量生成充值卡（一次生成10张¥20充值卡）──────────────
+INSERT INTO recharge_cards (key, credit_fen, label)
+SELECT 'ANIMA-' || upper(encode(gen_random_bytes(8),'hex')),
+       2000,
+       '¥20 充值卡'
+FROM generate_series(1,10)
+RETURNING key, credit_fen, label;
 
 -- ─── 暂停/恢复用户 ────────────────────────────────────────
 UPDATE user_billing SET is_suspended=true  WHERE user_email='user@example.com';
