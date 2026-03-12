@@ -4,7 +4,7 @@
 #
 # 安全提示：所有 <占位符> 内容请替换为真实值后将文件权限设为 600：
 #   chmod 600 /opt/openclaw/config.yml
-# 如果 OpenClaw 支持环境变量插值（${ENV_VAR}），推荐改用环境变量注入
+# 推荐改用环境变量插值（${ENV_VAR}），避免密钥直接写入文件
 # =============================================================
 
 # ─── 服务器 ──────────────────────────────────────────────────
@@ -12,60 +12,86 @@ server:
   host: 172.16.1.2
   port: 3000
 
-# ─── AI 推理（优先本地 Ollama，复杂任务自动 fallback 到云端）─
+# ─── AI 推理（直接调用云端 API，用户自行选择模型）────────────
+# 可用模型列表由 billing webhook 的 GET /models 接口返回。
+# OpenClaw 将用户所选模型的 provider/modelName 字段用于此处路由。
 llm:
-  provider: ollama
+  providers:
+    - name: anthropic
+      apiKey: ${ANTHROPIC_API_KEY}       # 通过环境变量注入，勿写死
+      models:
+        - claude-haiku-4-5-20251001      # 免费模型
+        - claude-sonnet-4-5              # 付费模型
+      timeout: 30
+      maxRetries: 2
+
+    - name: openai
+      apiKey: ${OPENAI_API_KEY}
+      baseUrl: https://api.openai.com/v1
+      models:
+        - gpt-4o-mini
+        - gpt-4o
+      timeout: 30
+      maxRetries: 2
+
+    - name: mistral
+      apiKey: ${MISTRAL_API_KEY}
+      models:
+        - mistral-small-latest
+      timeout: 30
+      maxRetries: 2
+
+  # 默认模型（未指定时使用此模型）
+  defaultProvider: anthropic
+  defaultModel: claude-haiku-4-5-20251001
+
+# ─── 本地模型接口（保留定义，当前不启用）─────────────────────
+# 如需重新启用本地 Ollama，将 enabled 改为 true 并在 api_models
+# 表中执行：UPDATE api_models SET is_active=true WHERE provider='ollama';
+ollama:
+  enabled: false
   baseUrl: http://172.16.1.5:11434
-  model: qwen2.5:7b-instruct-q4_K_M
-  timeout: 120          # 秒，7B 模型推理可能较慢
-  maxRetries: 2
+  models:
+    - qwen2.5:7b-instruct-q4_K_M
+    - llama3.2:3b
 
-  # 备用云端 API（Ollama 不可用时自动切换，会产生计费）
-  fallback:
-    provider: anthropic
-    apiKey: <你的 Claude API Key>   # 留空则不启用 fallback
-    model: claude-haiku-4-5-20251001
-    timeout: 30
-
-# ─── 计费 Webhook（向 CXI4 报告每次 API 调用）────────────────
+# ─── 计费 Webhook（向 CXI4 汇报每次 API 调用）────────────────
 billing:
   enabled: true
   webhookUrl: http://172.16.1.5:3002/billing/record
+  # 调用 /models 接口获取最新定价列表，每 5 分钟缓存一次
+  modelsCacheUrl: http://172.16.1.5:3002/models
+  modelsCacheTtl: 300
 
 # ─── 记忆数据库 ───────────────────────────────────────────────
 memory:
   enabled: true
-  database: postgresql://animaapp:<密码>@anima-db.postgres.database.azure.com:5432/openclaw?sslmode=require
+  database: postgresql://animaapp:${PG_PASSWORD}@anima-db.postgres.database.azure.com:5432/openclaw?sslmode=require
 
 # ─── Redis 缓存（复用 CXI4 的 Redis）────────────────────────
 redis:
-  url: redis://:<Redis密码>@172.16.1.5:6379
-  # 对话上下文缓存 TTL（秒）
-  sessionTtl: 3600
+  url: redis://:${REDIS_PASSWORD}@172.16.1.5:6379
+  sessionTtl: 3600  # 对话上下文缓存 TTL（秒）
 
 # ─── 工具配置 ─────────────────────────────────────────────────
 tools:
-  # 网页搜索（DuckDuckGo 免费，无需 API Key）
   search:
     enabled: true
     provider: duckduckgo
     maxResults: 5
 
-  # Nextcloud 日历（CalDAV）
   calendar:
     enabled: true
     provider: nextcloud
     url: http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
     username: admin
-    password: <Nextcloud 管理员密码>
+    password: ${NEXTCLOUD_PASSWORD}
 
-  # Home Assistant 智能家居控制
   homeassistant:
     enabled: true
     baseUrl: http://172.16.1.5:8123
-    token: <HA 长效访问令牌>
+    token: ${HA_TOKEN}
 
-  # 语音服务
   voice:
     recognition:
       url: http://172.16.1.5:8080/transcribe
