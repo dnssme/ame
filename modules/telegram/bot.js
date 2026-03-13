@@ -62,6 +62,15 @@ const sessionCleanupTimer = setInterval(() => {
 }, SESSION_TTL);
 
 // ─── Agent API 调用 ──────────────────────────────────────────
+
+/** 标记长耗时任务类型（web-search / file-analysis） */
+const LONG_RUNNING_KEYWORDS = ['搜索', '搜一下', '查一下', '帮我搜', 'search', '分析文件', '分析一下', '看看这个文件', 'analyze'];
+
+function isLongRunningTask(message) {
+  const lower = message.toLowerCase();
+  return LONG_RUNNING_KEYWORDS.some(kw => lower.includes(kw));
+}
+
 async function callAgent(userId, message) {
   const session = getSession(userId);
   session.messages.push({ role: 'user', content: message });
@@ -177,7 +186,35 @@ bot.on('text', async (ctx) => {
 
   logger.info('收到消息', { userId: ctx.from.id, text: text.substring(0, 100) });
 
+  const longRunning = isLongRunningTask(text);
+
+  if (longRunning) {
+    await ctx.reply('⏳ 任务处理中，完成后会通知你...');
+  }
+
   await ctx.sendChatAction('typing');
+
+  // 长耗时任务在后台执行，完成后主动推送通知
+  if (longRunning) {
+    callAgent(ctx.from.id, text)
+      .then(async (reply) => {
+        const prefix = '✅ 任务完成：\n\n';
+        const fullReply = prefix + reply;
+        if (fullReply.length <= 4096) {
+          await ctx.reply(fullReply);
+        } else {
+          for (let i = 0; i < fullReply.length; i += 4096) {
+            await ctx.reply(fullReply.substring(i, i + 4096));
+          }
+        }
+      })
+      .catch(async (err) => {
+        logger.error('Long-running task failed', { err: err.message, userId: ctx.from.id });
+        await ctx.reply('❌ 任务执行失败，请稍后重试。');
+      });
+    return;
+  }
+
   const reply = await callAgent(ctx.from.id, text);
 
   // Telegram 消息限制 4096 字符，超长分段发送

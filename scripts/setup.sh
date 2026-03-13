@@ -125,6 +125,7 @@ Type=simple
 WorkingDirectory=/opt/ai/webhook
 EnvironmentFile=/opt/ai/webhook/.env
 ExecStart=/usr/bin/node /opt/ai/webhook/server.js
+Environment=NODE_OPTIONS=--max-old-space-size=256
 Restart=on-failure
 RestartSec=10
 

@@ -30,6 +30,7 @@ services:
 
     environment:
       NODE_ENV: production
+      NODE_OPTIONS: "--max-old-space-size=192"
       TZ: Asia/Shanghai
 
     healthcheck:
