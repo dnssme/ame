@@ -224,6 +224,9 @@ app.post('/activate', activateLimiter, async (req, res) => {
   if (!cardKey || !userEmail) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 cardKey 和 userEmail' });
   }
+  if (typeof cardKey !== 'string') {
+    return res.status(400).json({ success: false, msg: 'cardKey 必须为字符串' });
+  }
   if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
@@ -692,6 +695,9 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     // 应用层提前拦截，与 db/schema.sql 中 CHECK(>= 0) 约束互为防御
     return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
   }
+  if (description != null && (typeof description !== 'string' || description.length > 1000)) {
+    return res.status(400).json({ success: false, msg: 'description 长度不能超过 1000 字符' });
+  }
 
   try {
     const result = await db.query(
@@ -783,6 +789,9 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     values.push(displayName);
   }
   if (typeof description === 'string') {
+    if (description.length > 1000) {
+      return res.status(400).json({ success: false, msg: 'description 长度不能超过 1000 字符' });
+    }
     updates.push(`description = $${values.length + 1}`);
     values.push(description);
   }
@@ -828,6 +837,9 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
     return res.status(400).json({ success: false, msg: `type 必须是 ${validTypes.join('/')} 之一` });
+  }
+  if (description != null && (typeof description !== 'string' || description.length > 500)) {
+    return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
   }
 
   const client = await db.connect();

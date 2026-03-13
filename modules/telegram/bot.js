@@ -51,6 +51,16 @@ function getSession(userId) {
   return newSession;
 }
 
+// 定期清理过期会话（防止内存泄漏）
+const sessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [userId, session] of sessions) {
+    if (now - session.lastActive >= SESSION_TTL) {
+      sessions.delete(userId);
+    }
+  }
+}, SESSION_TTL);
+
 // ─── Agent API 调用 ──────────────────────────────────────────
 async function callAgent(userId, message) {
   const session = getSession(userId);
@@ -130,6 +140,9 @@ bot.command('model', (ctx) => {
     const current = userModels.get(ctx.from.id) || DEFAULT_MODEL;
     return ctx.reply(`当前模型：${current}\n\n用法：/model <模型名>`);
   }
+  if (model.length > 128) {
+    return ctx.reply('❌ 模型名称过长（最多 128 字符）');
+  }
   userModels.set(ctx.from.id, model);
   ctx.reply(`✅ 已切换到模型：${model}`);
 });
@@ -203,6 +216,7 @@ bot.launch()
 // ─── 优雅退出 ────────────────────────────────────────────────
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭...`);
+  clearInterval(sessionCleanupTimer);
   bot.stop(signal);
   healthServer.close();
   process.exit(0);

@@ -37,6 +37,11 @@ const VOICE_ENABLED   = process.env.VOICE_ENABLED === 'true';
 const WHISPER_URL     = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transcribe';
 const TTS_URL         = process.env.TTS_URL || 'http://172.16.1.1:8082/api/tts';
 
+/** 转义正则特殊字符，防止 new RegExp() 注入 */
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // ─── 会话上下文缓存（简易内存版，生产环境建议用 Redis）──────
 const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
@@ -51,6 +56,16 @@ function getSession(userId) {
   sessions.set(userId, newSession);
   return newSession;
 }
+
+// 定期清理过期会话（防止内存泄漏）
+const sessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [userId, session] of sessions) {
+    if (now - session.lastActive >= SESSION_TTL) {
+      sessions.delete(userId);
+    }
+  }
+}, SESSION_TTL);
 
 // ─── Agent API 调用 ──────────────────────────────────────────
 async function callAgent(userId, message) {
@@ -128,7 +143,7 @@ bot.on('message', async (msg) => {
       let text = msg.text().trim();
       // 去除群聊中的 @机器人 前缀
       if (isGroup) {
-        text = text.replace(new RegExp(`@${BOT_NAME}\\s*`, 'g'), '').trim();
+        text = text.replace(new RegExp(`@${escapeRegExp(BOT_NAME)}\\s*`, 'g'), '').trim();
       }
       if (!text) return;
 
@@ -173,6 +188,7 @@ bot.start()
 // ─── 优雅退出 ────────────────────────────────────────────────
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭...`);
+  clearInterval(sessionCleanupTimer);
   bot.stop()
     .then(() => {
       healthServer.close();
