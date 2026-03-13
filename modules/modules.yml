@@ -1,0 +1,105 @@
+# =============================================================
+# Anima 灵枢 · 模块注册表
+# 中央模块配置——启用/禁用任意功能模块
+#
+# 使用方法：
+#   1. 将 enabled 改为 true/false 控制模块启停
+#   2. 每个模块目录包含独立的 docker-compose.yml / .env.example / README.md
+#   3. 启用模块后，按模块目录内 README.md 部署即可
+#   4. 禁用模块时 docker compose down 或停止对应服务即可
+# =============================================================
+
+# ─── 核心模块（默认已部署）──────────────────────────────────
+core:
+  chat:
+    enabled: true
+    description: "日常 AI 对话（LibreChat Web UI）"
+    node: VPS-C
+    path: ../librechat/
+
+  agent:
+    enabled: true
+    description: "AI 推理后端（OpenClaw Agent）"
+    node: VPS-B
+    path: ../openclaw/
+
+  billing:
+    enabled: true
+    description: "订阅收费系统（Webhook 计费服务）"
+    node: CXI4
+    path: ../webhook/
+
+# ─── 通讯渠道模块 ──────────────────────────────────────────
+channels:
+  wechat:
+    enabled: false
+    description: "微信接入（基于 wechaty）"
+    node: VPS-B
+    path: ./wechat/
+    depends_on: [agent]
+
+  telegram:
+    enabled: false
+    description: "Telegram 接入（基于 telegraf）"
+    node: VPS-B
+    path: ./telegram/
+    depends_on: [agent]
+
+  email:
+    enabled: false
+    description: "邮件处理（IMAP 收件 + SMTP 发件 + AI 分析）"
+    node: CXI4
+    path: ./email/
+    depends_on: [agent]
+
+# ─── 工具模块 ──────────────────────────────────────────────
+tools:
+  voice:
+    enabled: true
+    description: "语音交互（Whisper STT + Coqui TTS）"
+    node: CXI4 / VPS-A
+    path: ./voice/
+    depends_on: [agent]
+
+  web_search:
+    enabled: true
+    description: "网页搜索（DuckDuckGo）"
+    node: VPS-B
+    path: ./web-search/
+    depends_on: [agent]
+
+  file_analysis:
+    enabled: true
+    description: "文件分析（LibreChat 文件上传 + AI 解析）"
+    node: VPS-C
+    path: ./file-analysis/
+    depends_on: [chat]
+
+  calendar:
+    enabled: false
+    description: "日历管理（Nextcloud CalDAV 同步手机/Web）"
+    node: VPS-B
+    path: ./calendar/
+    depends_on: [agent]
+
+  smart_home:
+    enabled: false
+    description: "智能家居控制（Home Assistant）"
+    node: VPS-B
+    path: ./smart-home/
+    depends_on: [agent]
+
+  cloud_storage:
+    enabled: false
+    description: "用户网盘（Nextcloud WebDAV）"
+    node: VPS-B
+    path: ./cloud-storage/
+    depends_on: [agent]
+
+# ─── 客户端模块 ──────────────────────────────────────────────
+clients:
+  mobile_app:
+    enabled: false
+    description: "独立手机 APP（Flutter，兼容 iOS/Android）"
+    path: ../mobile/
+    depends_on: [chat, agent]

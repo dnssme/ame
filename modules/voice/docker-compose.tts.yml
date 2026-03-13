@@ -1,0 +1,41 @@
+version: '3.8'
+
+# =============================================================
+# Anima 灵枢 · Coqui TTS 语音合成
+# 部署节点：VPS-A (本机) 或 CXI4
+# =============================================================
+
+services:
+  tts:
+    image: ghcr.io/coqui-ai/tts:latest
+    container_name: anima-tts
+    restart: unless-stopped
+
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: '1.0'
+
+    security_opt:
+      - no-new-privileges:true
+
+    ports:
+      - "127.0.0.1:8082:5002"
+
+    environment:
+      TZ: Asia/Shanghai
+
+    command: >
+      --model_name tts_models/multilingual/multi-dataset/xtts_v2
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"

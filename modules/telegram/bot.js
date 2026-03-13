@@ -1,0 +1,212 @@
+'use strict';
+
+/**
+ * Anima 灵枢 · Telegram 接入模块
+ * 基于 Telegraf 框架，将 Telegram 消息桥接到 OpenClaw Agent API
+ */
+
+const http        = require('http');
+const { Telegraf } = require('telegraf');
+const { request }  = require('undici');
+const winston     = require('winston');
+
+// ─── 日志 ────────────────────────────────────────────────────
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+  ],
+});
+
+// ─── 配置 ────────────────────────────────────────────────────
+const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
+const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
+const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'claude-haiku-4-5-20251001';
+const BILLING_URL   = process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.5:3002';
+const ALLOWED_IDS   = (process.env.ALLOWED_USER_IDS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+if (!BOT_TOKEN) {
+  logger.error('TELEGRAM_BOT_TOKEN 未设置');
+  process.exit(1);
+}
+
+// ─── 会话上下文 ──────────────────────────────────────────────
+const sessions = new Map();
+const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
+const userModels = new Map(); // userId → model name
+
+function getSession(userId) {
+  const session = sessions.get(userId);
+  if (session && Date.now() - session.lastActive < SESSION_TTL) {
+    session.lastActive = Date.now();
+    return session;
+  }
+  const newSession = { messages: [], lastActive: Date.now() };
+  sessions.set(userId, newSession);
+  return newSession;
+}
+
+// ─── Agent API 调用 ──────────────────────────────────────────
+async function callAgent(userId, message) {
+  const session = getSession(userId);
+  session.messages.push({ role: 'user', content: message });
+
+  if (session.messages.length > 20) {
+    session.messages = session.messages.slice(-20);
+  }
+
+  const model = userModels.get(userId) || DEFAULT_MODEL;
+
+  try {
+    const { body } = await request(`${AGENT_API_URL}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: session.messages,
+        userId: String(userId),
+      }),
+    });
+    const data = await body.json();
+    const reply = data.reply || data.choices?.[0]?.message?.content || '抱歉，我暂时无法回答。';
+    session.messages.push({ role: 'assistant', content: reply });
+    return reply;
+  } catch (err) {
+    logger.error('Agent API call failed', { err: err.message, userId });
+    return '抱歉，AI 服务暂时不可用，请稍后再试。';
+  }
+}
+
+// ─── 访问控制 ────────────────────────────────────────────────
+function isAllowed(userId) {
+  if (ALLOWED_IDS.length === 0) return true;
+  return ALLOWED_IDS.includes(String(userId));
+}
+
+// ─── Telegraf Bot ─────────────────────────────────────────────
+const bot = new Telegraf(BOT_TOKEN);
+
+// 中间件：访问控制
+bot.use((ctx, next) => {
+  if (!isAllowed(ctx.from?.id)) {
+    return ctx.reply('⛔ 你没有使用此 Bot 的权限。');
+  }
+  return next();
+});
+
+// /start 欢迎
+bot.start((ctx) => {
+  ctx.reply(
+    '🤖 你好！我是 Anima 灵枢 AI 助手。\n\n' +
+    '直接发送消息即可与 AI 对话。\n\n' +
+    '可用命令：\n' +
+    '/model <模型名> — 切换 AI 模型\n' +
+    '/balance <邮箱> — 查询余额\n' +
+    '/clear — 清除对话上下文\n' +
+    '/help — 查看帮助'
+  );
+});
+
+// /help 帮助
+bot.help((ctx) => {
+  ctx.reply(
+    '📖 Anima 灵枢 命令列表：\n\n' +
+    '/model <模型名> — 切换模型（如 claude-sonnet-4-5）\n' +
+    '/balance <邮箱> — 查询账户余额\n' +
+    '/clear — 清除当前对话上下文\n' +
+    '/help — 显示此帮助'
+  );
+});
+
+// /model 切换模型
+bot.command('model', (ctx) => {
+  const model = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!model) {
+    const current = userModels.get(ctx.from.id) || DEFAULT_MODEL;
+    return ctx.reply(`当前模型：${current}\n\n用法：/model <模型名>`);
+  }
+  userModels.set(ctx.from.id, model);
+  ctx.reply(`✅ 已切换到模型：${model}`);
+});
+
+// /balance 查询余额
+bot.command('balance', async (ctx) => {
+  const email = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!email) return ctx.reply('用法：/balance <邮箱>');
+  try {
+    const { body } = await request(`${BILLING_URL}/billing/balance/${encodeURIComponent(email)}`);
+    const data = await body.json();
+    if (data.success) {
+      ctx.reply(`💰 余额：¥${(data.balance_fen / 100).toFixed(2)}`);
+    } else {
+      ctx.reply(`查询失败：${data.msg}`);
+    }
+  } catch (err) {
+    ctx.reply('余额查询服务暂不可用。');
+  }
+});
+
+// /clear 清除上下文
+bot.command('clear', (ctx) => {
+  sessions.delete(ctx.from.id);
+  ctx.reply('🗑 对话上下文已清除。');
+});
+
+// 文字消息 → AI 对话
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text.trim();
+  if (!text || text.startsWith('/')) return;
+
+  logger.info('收到消息', { userId: ctx.from.id, text: text.substring(0, 100) });
+
+  await ctx.sendChatAction('typing');
+  const reply = await callAgent(ctx.from.id, text);
+
+  // Telegram 消息限制 4096 字符，超长分段发送
+  if (reply.length <= 4096) {
+    await ctx.reply(reply);
+  } else {
+    for (let i = 0; i < reply.length; i += 4096) {
+      await ctx.reply(reply.substring(i, i + 4096));
+    }
+  }
+});
+
+// ─── 健康检查 ────────────────────────────────────────────────
+let botRunning = false;
+
+const healthServer = http.createServer((_req, res) => {
+  res.writeHead(botRunning ? 200 : 503, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: botRunning ? 'ok' : 'starting' }));
+});
+
+healthServer.listen(3003, () => {
+  logger.info('健康检查服务已启动 :3003');
+});
+
+// ─── 启动 ────────────────────────────────────────────────────
+bot.launch()
+  .then(() => {
+    botRunning = true;
+    logger.info('Telegram Bot 已启动');
+  })
+  .catch((err) => {
+    logger.error('Telegram Bot 启动失败', { err: err.message });
+    process.exit(1);
+  });
+
+// ─── 优雅退出 ────────────────────────────────────────────────
+const shutdown = (signal) => {
+  logger.info(`收到 ${signal}，正在关闭...`);
+  bot.stop(signal);
+  healthServer.close();
+  process.exit(0);
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

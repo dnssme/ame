@@ -1,0 +1,46 @@
+version: '3.8'
+
+# =============================================================
+# Anima 灵枢 · Telegram 接入模块
+# 部署节点：VPS-B (172.16.1.2)
+# =============================================================
+
+services:
+  telegram-bot:
+    build: .
+    container_name: anima-telegram
+    restart: unless-stopped
+
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: '0.5'
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+
+    env_file:
+      - path: ./.env
+        required: true
+
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3003/health', r => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
