@@ -233,7 +233,8 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled promise rejection', { err: String(reason) });
+  logger.error('Unhandled promise rejection, shutting down', { err: String(reason) });
+  process.exit(1);
 });
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception, shutting down', { err: err.message, stack: err.stack });
