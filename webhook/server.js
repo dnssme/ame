@@ -1,26 +1,28 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v3
+ * Anima 灵枢 · Webhook 服务 v4
  * ─────────────────────────────────────────────────────────────
  * 功能：
- *   1. 充值卡激活       POST  /activate
- *   2. API 计费记录     POST  /billing/record
- *   3. 用户余额查询     GET   /billing/balance/:email
- *   4. 用户消费历史     GET   /billing/history/:email
- *   5. 查看可用模型     GET   /models
- *   6. 健康检查        GET   /health
+ *   1. 充值卡激活           POST  /activate
+ *   2. API 计费记录         POST  /billing/record
+ *   3. 用户余额查询         GET   /billing/balance/:email
+ *   4. 用户消费历史         GET   /billing/history/:email
+ *   5. 预检余额是否充足      POST  /billing/check
+ *   6. 查看可用模型（用户）  GET   /models
+ *   7. 健康检查             GET   /health
  *   ── 管理员接口（需 ADMIN_TOKEN）──────────────────────────
- *   7. 添加/更新模型定价  POST /admin/models
- *   8. 修改模型定价      PUT  /admin/models/:id
- *   9. 人工调整余额      POST /admin/adjust
+ *   8.  查看所有模型         GET   /admin/models
+ *   9.  添加/更新模型定价    POST  /admin/models
+ *   10. 修改模型定价         PUT   /admin/models/:id
+ *   11. 人工调整余额         POST  /admin/adjust
  *
  * 计费规则：
- *   · 每个模型在 api_models 表中独立定价（管理员自由设定）
+ *   · 每个模型在 api_models 表中独立定价（管理员自由设定），无套餐绑定
  *   · is_free=true 的模型永久免费，不扣余额
  *   · 付费模型按字数计费：(inputChars/1000)*price_in + (outputChars/1000)*price_out
  *   · 余额不足时拒绝请求，返回 402
- *   · 本地 Ollama 模型保留接口条目（is_active=false），不参与计费
+ *   · is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费调用
  *
  * 安全：
  *   · helmet 安全响应头
@@ -31,6 +33,7 @@
  *   · 管理员接口通过 ADMIN_TOKEN 环境变量保护
  */
 
+const crypto    = require('crypto');
 const express   = require('express');
 const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -99,13 +102,29 @@ const activateLimiter = rateLimit({
 // ─── 管理员鉴权中间件 ─────────────────────────────────────────
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
+/**
+ * 定时安全的字符串比较，防止计时攻击（PCI-DSS 6.3.2 / CIS）。
+ * 对不同长度的输入补齐后再比较，保持固定时间路径，不泄露任何信息。
+ */
+function safeCompare(a, b) {
+  const aBuf = Buffer.from(typeof a === 'string' ? a : '');
+  const bBuf = Buffer.from(typeof b === 'string' ? b : '');
+  // 补齐到相同长度后比较，确保长度不同时同样走固定时间路径
+  const len = Math.max(aBuf.length, bBuf.length);
+  const paddedA = Buffer.concat([aBuf, Buffer.alloc(len - aBuf.length)]);
+  const paddedB = Buffer.concat([bBuf, Buffer.alloc(len - bBuf.length)]);
+  const equal = crypto.timingSafeEqual(paddedA, paddedB);
+  // 长度不同时即使字节相同（补零填充）也视为不等
+  return equal && aBuf.length === bBuf.length;
+}
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
     return res.status(503).json({ success: false, msg: '管理员接口未启用（未设置 ADMIN_TOKEN）' });
   }
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (token !== ADMIN_TOKEN) {
+  if (!safeCompare(token, ADMIN_TOKEN)) {
     return res.status(401).json({ success: false, msg: '未授权' });
   }
   next();
@@ -309,21 +328,104 @@ app.get('/billing/history/:email', async (req, res) => {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
-  const limit  = Math.min(parseInt(req.query.limit  || '20', 10), 100);
-  const offset = Math.max(parseInt(req.query.offset || '0',  10), 0);
+  const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20,  1), 100);
+  const offset = Math.max(parseInt(req.query.offset || '0',  10) || 0, 0);
 
   try {
-    const result = await db.query(
-      `SELECT type, amount_fen, balance_after_fen, description, created_at
-         FROM billing_transactions
-        WHERE user_email=$1
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3`,
-      [email, limit, offset]
-    );
-    res.json({ success: true, records: result.rows });
+    const [result, countRes] = await Promise.all([
+      db.query(
+        `SELECT type, amount_fen, balance_after_fen, description, created_at
+           FROM billing_transactions
+          WHERE user_email=$1
+          ORDER BY created_at DESC
+          LIMIT $2 OFFSET $3`,
+        [email, limit, offset]
+      ),
+      db.query(
+        'SELECT COUNT(*) AS total FROM billing_transactions WHERE user_email=$1',
+        [email]
+      ),
+    ]);
+    res.json({ success: true, records: result.rows, total: Number(countRes.rows[0]?.total ?? 0) });
   } catch (err) {
     logger.error('History query error', { err: err.message, email });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+/**
+ * POST /billing/check
+ * 调用前预检：根据估算字数判断余额是否充足，不扣费
+ *
+ * Body: { userEmail, modelName, estimatedInputChars?, estimatedOutputChars? }
+ * estimatedInputChars/estimatedOutputChars 默认为 0；
+ * 如未提供，estimated_fen=0，can_proceed 仅反映账户是否可用而非余额充足。
+ *
+ * 返回：
+ * {
+ *   success:       boolean,
+ *   can_proceed:   boolean,  // true = 余额充足可继续
+ *   is_free:       boolean,
+ *   estimated_fen: number,   // 估算费用（分）
+ *   balance_fen:   number,
+ *   is_suspended:  boolean
+ * }
+ */
+app.post('/billing/check', async (req, res) => {
+  const { userEmail, modelName, estimatedInputChars, estimatedOutputChars } = req.body ?? {};
+
+  if (!EMAIL_RE.test(userEmail || '')) {
+    return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
+  }
+  if (!modelName) {
+    return res.status(400).json({ success: false, msg: '缺少 modelName' });
+  }
+
+  // DB 错误单独捕获，避免与"模型不存在"混淆
+  let model;
+  try {
+    model = await lookupModel(modelName);
+  } catch (err) {
+    logger.error('Model lookup error in /billing/check', { err: err.message, modelName });
+    return res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+
+  if (!model) {
+    return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
+  }
+  if (!model.is_active) {
+    return res.status(400).json({ success: false, msg: '该模型当前未启用' });
+  }
+
+  if (model.is_free) {
+    return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false });
+  }
+
+  const inChars  = Math.max(0, parseInt(estimatedInputChars  || '0', 10) || 0);
+  const outChars = Math.max(0, parseInt(estimatedOutputChars || '0', 10) || 0);
+  const priceIn  = Number(model.price_input_per_1k_chars);
+  const priceOut = Number(model.price_output_per_1k_chars);
+  const estimatedFen = Math.ceil(((inChars / 1000) * priceIn + (outChars / 1000) * priceOut) * 100);
+
+  try {
+    const balRes = await db.query(
+      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+      [userEmail]
+    );
+    const userExists  = balRes.rows.length > 0;
+    const balance     = userExists ? Number(balRes.rows[0].balance_fen) : 0;
+    const isSuspended = userExists ? balRes.rows[0].is_suspended : false;
+
+    res.json({
+      success:       true,
+      can_proceed:   !isSuspended && balance >= estimatedFen,
+      is_free:       false,
+      estimated_fen: estimatedFen,
+      balance_fen:   balance,
+      is_suspended:  isSuspended,
+    });
+  } catch (err) {
+    logger.error('Billing check error', { err: err.message, userEmail });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -356,28 +458,39 @@ app.post('/billing/record', async (req, res) => {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
   }
   if (typeof inputChars !== 'number' || typeof outputChars !== 'number'
+      || !Number.isFinite(inputChars) || !Number.isFinite(outputChars)
+      || !Number.isInteger(inputChars) || !Number.isInteger(outputChars)
       || inputChars < 0 || outputChars < 0) {
-    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为非负数字' });
+    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为有限的非负整数' });
   }
   if (!EMAIL_RE.test(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
   // ── 1. 查询模型定价 ─────────────────────────────────────────
-  const model = await lookupModel(modelName).catch((err) => {
-    logger.error('Model lookup error', { err: err.message });
-    return null;
-  });
-
-  // 模型未注册：记录日志但不阻断，按付费处理（兜底保守策略）
-  const modelId   = model ? model.id : null;
-  const isFree    = model ? model.is_free : false;
-  const priceIn   = model ? Number(model.price_input_per_1k_chars)  : 0;
-  const priceOut  = model ? Number(model.price_output_per_1k_chars) : 0;
+  // DB 错误单独捕获，避免与"模型不注册"混淆
+  let model;
+  try {
+    model = await lookupModel(modelName);
+  } catch (err) {
+    logger.error('Model lookup error in /billing/record', { err: err.message, modelName });
+    return res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
 
   if (!model) {
     logger.warn('Model not registered in api_models', { modelName, apiProvider });
+    return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
   }
+
+  // is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费
+  if (!model.is_active) {
+    return res.status(400).json({ success: false, msg: '该模型当前未启用，无法计费' });
+  }
+
+  const modelId  = model.id;
+  const isFree   = model.is_free;
+  const priceIn  = Number(model.price_input_per_1k_chars);
+  const priceOut = Number(model.price_output_per_1k_chars);
 
   // ── 2. 免费模型：只记录，不扣费 ────────────────────────────
   if (isFree) {
@@ -489,6 +602,26 @@ app.post('/billing/record', async (req, res) => {
 // =============================================================
 
 /**
+ * GET /admin/models
+ * 查看所有模型（含未启用的本地模型）
+ */
+app.get('/admin/models', requireAdmin, async (_req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, provider, model_name, display_name, is_free,
+              price_input_per_1k_chars, price_output_per_1k_chars,
+              is_active, description, created_at, updated_at
+         FROM api_models
+         ORDER BY provider, model_name`
+    );
+    res.json({ success: true, models: result.rows });
+  } catch (err) {
+    logger.error('Admin models query error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+/**
  * POST /admin/models
  * 新增 API 模型定价
  *
@@ -512,8 +645,13 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
   if (typeof isFree !== 'boolean') {
     return res.status(400).json({ success: false, msg: 'isFree 必须为布尔值' });
   }
-  if (!isFree && (typeof priceInput !== 'number' || typeof priceOutput !== 'number')) {
-    return res.status(400).json({ success: false, msg: '付费模型必须提供 priceInput 和 priceOutput' });
+  if (!isFree && (typeof priceInput !== 'number' || typeof priceOutput !== 'number'
+        || !Number.isFinite(priceInput) || !Number.isFinite(priceOutput))) {
+    return res.status(400).json({ success: false, msg: '付费模型必须提供有限数值的 priceInput 和 priceOutput' });
+  }
+  if (!isFree && (priceInput < 0 || priceOutput < 0)) {
+    // 应用层提前拦截，与 db/schema.sql 中 CHECK(>= 0) 约束互为防御
+    return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
   }
 
   try {
@@ -530,7 +668,8 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
            price_output_per_1k_chars = EXCLUDED.price_output_per_1k_chars,
            description = EXCLUDED.description,
            is_active   = true
-         RETURNING id, model_name, is_free, price_input_per_1k_chars, price_output_per_1k_chars`,
+         RETURNING id, provider, model_name, display_name, is_free,
+                   price_input_per_1k_chars, price_output_per_1k_chars, is_active`,
       [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, description || null]
     );
 
@@ -577,10 +716,16 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
     }
   }
   if (!isFree && typeof priceInput === 'number') {
+    if (!Number.isFinite(priceInput) || priceInput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
+    }
     updates.push(`price_input_per_1k_chars = $${values.length + 1}`);
     values.push(priceInput);
   }
   if (!isFree && typeof priceOutput === 'number') {
+    if (!Number.isFinite(priceOutput) || priceOutput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceOutput 必须为有限的非负数' });
+    }
     updates.push(`price_output_per_1k_chars = $${values.length + 1}`);
     values.push(priceOutput);
   }
@@ -589,6 +734,9 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
     values.push(isActive);
   }
   if (typeof displayName === 'string') {
+    if (displayName.trim().length === 0) {
+      return res.status(400).json({ success: false, msg: 'displayName 不能为空' });
+    }
     updates.push(`display_name = $${values.length + 1}`);
     values.push(displayName);
   }
@@ -632,8 +780,8 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
   if (!EMAIL_RE.test(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
-  if (typeof amount_fen !== 'number' || amount_fen === 0) {
-    return res.status(400).json({ success: false, msg: 'amount_fen 必须为非零数字' });
+  if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0) {
+    return res.status(400).json({ success: false, msg: 'amount_fen 必须为有限的非零数字' });
   }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
@@ -646,6 +794,13 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
 
     await ensureUser(client, userEmail);
 
+    // 先取当前余额（ensureUser 保证行已存在）
+    const prevRes = await client.query(
+      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
+      [userEmail]
+    );
+    const oldBalance = Number(prevRes.rows[0].balance_fen);
+
     const result = await client.query(
       `UPDATE user_billing
           SET balance_fen = GREATEST(0, balance_fen + $1)
@@ -654,18 +809,20 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
       [amount_fen, userEmail]
     );
     const newBalance = Number(result.rows[0].balance_fen);
+    // 实际生效金额（减少时若余额不足会被截断到 0，实际扣减 = newBalance - oldBalance）
+    const actualApplied = newBalance - oldBalance;
 
     await client.query(
       `INSERT INTO billing_transactions
            (user_email, type, amount_fen, balance_after_fen, description)
          VALUES ($1,$2,$3,$4,$5)`,
-      [userEmail, type, amount_fen, newBalance, description || '管理员调整']
+      [userEmail, type, actualApplied, newBalance, description || '管理员调整']
     );
 
     await client.query('COMMIT');
 
-    logger.info('Admin balance adjusted', { userEmail, amount_fen, type });
-    res.json({ success: true, balance_fen: newBalance });
+    logger.info('Admin balance adjusted', { userEmail, amount_fen, actualApplied, type });
+    res.json({ success: true, balance_fen: newBalance, actual_applied_fen: actualApplied });
   } catch (err) {
     await client.query('ROLLBACK');
     logger.error('Admin adjust error', { err: err.message });
@@ -694,16 +851,24 @@ const server = app.listen(PORT, HOST, () => {
   logger.info(`Webhook 服务已启动 http://${HOST}:${PORT}`);
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
+  } else if (ADMIN_TOKEN.length < 32) {
+    // PCI-DSS 8.3.6：令牌长度至少 32 字节（64 个十六进制字符）
+    logger.warn('ADMIN_TOKEN 过短（< 32 字符），建议执行 openssl rand -hex 32 重新生成');
   }
 });
 
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
   server.close(() => {
-    db.end().then(() => {
-      logger.info('数据库连接池已关闭');
-      process.exit(0);
-    });
+    db.end()
+      .then(() => {
+        logger.info('数据库连接池已关闭');
+        process.exit(0);
+      })
+      .catch((err) => {
+        logger.error('数据库连接池关闭失败', { err: err.message });
+        process.exit(1);
+      });
   });
   setTimeout(() => process.exit(1), 10_000);
 };

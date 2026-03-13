@@ -3,9 +3,10 @@
 # Anima 灵枢 · 一键初始化脚本
 # 在 CXI4 (172.16.1.5) 上执行，完成：
 #   1. 安装 Node.js 20
-#   2. 初始化数据库 Schema
-#   3. 部署 Webhook 服务
+#   2. 部署 Webhook 服务目录
+#   3. 初始化数据库 Schema
 #   4. 创建 systemd 服务
+#   5. 验证服务运行状态
 # =============================================================
 set -euo pipefail
 
@@ -28,6 +29,8 @@ USAGE
 fi
 
 PG_PASSWORD="$1"
+# REDIS_PASSWORD 在此接受但 Webhook 服务本身不使用 Redis（Redis 由 LibreChat/OpenClaw 直接连接）。
+# 仍保留此参数以便在同一命令中记录两个密码，方便用户统一管理。
 REDIS_PASSWORD="$2"
 PG_HOST="${3:-anima-db.postgres.database.azure.com}"
 
@@ -68,6 +71,8 @@ ok "Webhook 依赖安装完成"
 # 创建 .env（仅在不存在时创建）
 ENV_FILE="${WEBHOOK_DIR}/.env"
 if [[ ! -f "${ENV_FILE}" ]]; then
+  # 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
+  ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
   cat > "${ENV_FILE}" <<ENV
 PG_HOST=${PG_HOST}
 PG_PORT=5432
@@ -77,9 +82,12 @@ PG_DATABASE=librechat
 PORT=3002
 HOST=172.16.1.5
 LOG_LEVEL=info
+# 管理员接口令牌（已自动生成，请妥善保管）
+ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
 ENV
   chmod 600 "${ENV_FILE}"
-  ok ".env 已创建"
+  ok ".env 已创建（ADMIN_TOKEN 已自动生成并写入）"
+  warn "请保存 ADMIN_TOKEN: ${ADMIN_TOKEN_VAL}"
 else
   warn ".env 已存在，跳过（如需更新请手动编辑 ${ENV_FILE}）"
 fi
@@ -91,14 +99,15 @@ if ! command -v psql &>/dev/null; then
   apt-get install -y postgresql-client
 fi
 
-PGPASSWORD="${PG_PASSWORD}" psql \
+# --quiet 抑制 CREATE TABLE / INSERT 等成功提示；ERROR 级别消息仍会输出到 stderr
+PGPASSWORD="${PG_PASSWORD}" PGSSLMODE=require psql \
+  --quiet \
   -h "${PG_HOST}" \
   -U animaapp \
   -d librechat \
-  --set=sslmode=require \
   -f "${REPO_ROOT}/db/schema.sql" \
-  -v ON_ERROR_STOP=0 \
-  2>&1 | grep -v "already exists" | grep -v "NOTICE" || true
+  -v ON_ERROR_STOP=1 \
+  || { err "数据库 Schema 初始化失败，请检查 PG_PASSWORD / PG_HOST 及 Azure PostgreSQL 防火墙规则"; exit 1; }
 
 ok "数据库 Schema 初始化完成"
 
@@ -137,6 +146,7 @@ SERVICE
 systemctl daemon-reload
 systemctl enable --now ai-webhook
 sleep 3
+ok "systemd 服务已创建并启动（ai-webhook）"
 
 # ─── 5. 验证 ──────────────────────────────────────────────────
 echo ""
