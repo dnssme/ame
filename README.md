@@ -6,18 +6,65 @@
 
 ## 目录
 
-1. [架构概览](#架构概览)
-2. [计费规则](#计费规则)
-3. [前置条件](#前置条件)
-4. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
-5. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
-6. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
-7. [第四步：VPS A — 配置 Nginx](#第四步vps-a--配置-nginx)
-8. [第五步：初始化模型定价](#第五步初始化模型定价)
-9. [API 接口完整参考](#api-接口完整参考)
-10. [常用运维 SQL](#常用运维-sql)
-11. [故障排查](#故障排查)
-12. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
+1. [最终用户使用说明](#最终用户使用说明)
+2. [架构概览](#架构概览)
+3. [计费规则](#计费规则)
+4. [前置条件](#前置条件)
+5. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
+6. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
+7. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
+8. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
+9. [第五步：初始化模型定价](#第五步初始化模型定价)
+10. [API 接口完整参考](#api-接口完整参考)
+11. [常用运维 SQL](#常用运维-sql)
+12. [故障排查](#故障排查)
+13. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
+
+---
+
+## 最终用户使用说明
+
+### 这是什么？
+
+Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreChat](https://github.com/danny-avila/LibreChat)（前端聊天界面）和 [OpenClaw](https://github.com/openclaw)（Agent 后端）构建，附带完整的**按量计费系统**和**生产级安全加固**。
+
+### 如何使用？
+
+**本项目不是一个需要从零开发的 App**，而是一套可以直接克隆并部署的完整方案。使用方式：
+
+1. **直接部署（推荐）**
+   - 克隆本仓库 → 按照下方五步部署教程操作 → 获得一个完整的私有 AI 助理
+   - 最终用户通过浏览器或手机访问你的域名（如 `https://ai.example.com`）即可使用
+   - 界面由 LibreChat 提供，支持多模型切换、对话历史、文件上传等功能
+
+2. **定制修改**
+   - **修改计费规则**：编辑 `webhook/server.js` 和 `db/schema.sql` 调整定价逻辑
+   - **增减 AI 模型**：通过管理员 API（`POST /admin/models`）或直接修改 `db/schema.sql` 的预置数据
+   - **修改前端界面**：LibreChat 本身支持自定义主题和配置，通过 `.env` 和 Docker 卷挂载实现
+   - **修改 Agent 行为**：编辑 `openclaw/config.yml` 调整 Agent 工具和推理后端
+   - **替换组件**：可以只使用计费系统（webhook/）配合其他 AI 前端，或只使用 Nginx 安全配置
+
+3. **最终用户（非部署者）的体验**
+   - 在浏览器中打开部署域名 → 注册/登录 → 选择模型 → 开始对话
+   - 如需使用付费模型，先输入管理员分发的充值卡密进行充值
+   - 免费模型（如 Claude Haiku）无需充值即可使用
+
+### 文件用途速查
+
+| 文件/目录 | 用途 | 你需要修改吗？ |
+|-----------|------|---------------|
+| `README.md` | 部署教程 | 否（参考即可） |
+| `db/schema.sql` | 数据库结构 + 预置模型 | 可选（调整预置模型价格） |
+| `webhook/server.js` | 计费 API 服务 | 一般不需要 |
+| `webhook/package.json` | Node.js 依赖 | 一般不需要 |
+| `nginx/anima.conf` | Nginx 反向代理 + WAF | 必须（替换域名占位符） |
+| `nginx/modsecurity/` | ModSecurity WAF 规则（含 `main.conf` 入口） | 可选（按需调整排除规则） |
+| `librechat/.env.example` | LibreChat 配置模板 | 必须（填写密钥和密码） |
+| `librechat/docker-compose.yml` | LibreChat 容器定义 | 可选（调整内存限制） |
+| `openclaw/.env.example` | OpenClaw 配置模板 | 必须（填写 API Key） |
+| `openclaw/config.yml` | OpenClaw Agent 配置 | 可选（调整工具和模型） |
+| `openclaw/docker-compose.yml` | OpenClaw 容器定义 | 可选（调整内存限制） |
+| `scripts/setup.sh` | CXI4 一键初始化脚本 | 否（直接执行） |
 
 ---
 
@@ -54,7 +101,12 @@
 │   ├── package.json         # Node.js 依赖
 │   └── server.js            # Webhook 计费服务（11 个接口）
 ├── nginx/
-│   └── anima.conf           # Nginx 反向代理配置
+│   ├── anima.conf           # Nginx 反向代理 + WAF 配置
+│   └── modsecurity/         # ModSecurity + OWASP CRS 规则
+│       ├── modsecurity.conf                            # ModSecurity 引擎配置
+│       ├── crs-setup.conf                              # OWASP CRS 调优（异常评分阈值等）
+│       ├── REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf # 应用专属排除规则（CRS 前）
+│       └── RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf # 响应排除规则（CRS 后）
 ├── librechat/
 │   ├── .env.example         # LibreChat 环境变量模板
 │   └── docker-compose.yml   # LibreChat Docker Compose
@@ -371,14 +423,30 @@ curl -sf http://172.16.1.2:3000/health
 
 ---
 
-## 第四步：VPS A — 配置 Nginx
+## 第四步：VPS A — 配置 Nginx + ModSecurity WAF
 
 > **执行节点：VPS A (172.16.1.1)**
 
-### 4.1 安装 Nginx
+### 4.1 安装 Nginx + ModSecurity + OWASP CRS
+
+使用自动安装脚本（编译安装 Nginx + ModSecurity v3 + OWASP CRS v4）：
 
 ```bash
-apt-get update && apt-get install -y nginx certbot python3-certbot-nginx
+# 下载并执行 Nginx 安装脚本
+# 该脚本将安装至以下路径：
+#   · Nginx:        /opt/nginx/
+#   · ModSecurity:  /opt/nginx/src/ModSecurity/
+#   · OWASP CRS:    /opt/owasp/owasp-rules/
+#   · WAF 入口配置: /opt/owasp/conf/main.conf
+wget -O /tmp/nginx-install.sh \
+  https://raw.githubusercontent.com/mzwrt/system_script/refs/heads/main/nginx/nginx-install.sh
+chmod +x /tmp/nginx-install.sh
+bash /tmp/nginx-install.sh
+
+# 创建 WAF 审计日志目录
+mkdir -p /www/wwwlogs/owasp
+chown root:root /www/wwwlogs/owasp
+chmod 700 /www/wwwlogs/owasp
 ```
 
 ### 4.2 申请 SSL 证书（Let's Encrypt）
@@ -386,62 +454,93 @@ apt-get update && apt-get install -y nginx certbot python3-certbot-nginx
 ```bash
 DOMAIN="ai.example.com"   # 替换为你的真实域名
 
+# 安装 certbot（如果尚未安装）
+apt-get update && apt-get install -y certbot
+
 # 先确保 80 端口可访问（UFW 允许）
 ufw allow 80/tcp
 ufw allow 443/tcp
 
-# 申请证书
-certbot certonly --nginx -d "${DOMAIN}" --non-interactive --agree-tos \
+# 申请证书（使用 standalone 模式，无需 Nginx 运行）
+certbot certonly --standalone -d "${DOMAIN}" --non-interactive --agree-tos \
   --email admin@example.com   # 替换为你的邮箱
 
 # 证书位置
 ls /etc/letsencrypt/live/${DOMAIN}/
-# 应有：fullchain.pem  privkey.pem
+# 应有：fullchain.pem  privkey.pem  chain.pem
 ```
 
-### 4.3 部署 Nginx 配置
+### 4.3 部署 ModSecurity WAF 配置
 
-> ⚠️ **Worker 进程数**：VPS A 为双核 CPU，请确认 `/etc/nginx/nginx.conf` 主配置中设置了 `worker_processes auto;`（默认值为 1，会浪费一个 CPU 核心）：
+```bash
+# 部署 ModSecurity 引擎配置（替换安装脚本的默认配置）
+cp /opt/ai/repo/nginx/modsecurity/modsecurity.conf \
+   /opt/nginx/src/ModSecurity/modsecurity.conf
+
+# 部署 OWASP CRS 调优配置（替换安装脚本的默认配置）
+cp /opt/ai/repo/nginx/modsecurity/crs-setup.conf \
+   /opt/owasp/owasp-rules/crs-setup.conf
+
+# 部署 WAF 入口配置（替换安装脚本的默认配置）
+cp /opt/ai/repo/nginx/modsecurity/main.conf \
+   /opt/owasp/conf/main.conf
+
+# 部署应用专属排除规则
+cp /opt/ai/repo/nginx/modsecurity/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf \
+   /opt/owasp/owasp-rules/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf
+cp /opt/ai/repo/nginx/modsecurity/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf \
+   /opt/owasp/owasp-rules/rules/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf
+
+# 设置文件权限（CIS 安全配置）
+chmod 600 /opt/nginx/src/ModSecurity/modsecurity.conf
+chmod 600 /opt/owasp/owasp-rules/crs-setup.conf
+chmod 600 /opt/owasp/conf/main.conf
+chown root:root /opt/nginx/src/ModSecurity/modsecurity.conf
+chown root:root /opt/owasp/owasp-rules/crs-setup.conf
+chown root:root /opt/owasp/conf/main.conf
+```
+
+> ⚠️ **首次部署建议**：先将 `modsecurity.conf` 中的 `SecRuleEngine On` 改为 `SecRuleEngine DetectionOnly`，
+> 观察 `/www/wwwlogs/owasp/modsec_audit.log` 一段时间确认无误报后，再改回 `On` 启用拦截模式。
+
+### 4.4 部署 Nginx 配置
+
+> ⚠️ **Worker 进程数**：VPS A 为双核 CPU，请确认 `/opt/nginx/conf/nginx.conf` 主配置中设置了 `worker_processes auto;`（默认值为 1，会浪费一个 CPU 核心）：
 > ```bash
 > # 确认或修改（该指令在 main 上下文，不在 http{} 中）
-> grep -n 'worker_processes' /etc/nginx/nginx.conf
+> grep -n 'worker_processes' /opt/nginx/conf/nginx.conf
 > # 如显示 "worker_processes 1;"，则改为：
-> sed -i 's/^worker_processes.*/worker_processes auto;/' /etc/nginx/nginx.conf
+> sed -i 's/^worker_processes.*/worker_processes auto;/' /opt/nginx/conf/nginx.conf
 > ```
 
 ```bash
 DOMAIN="ai.example.com"   # 与上面相同
 
-# 替换域名占位符
+# 替换域名占位符并部署
 sed "s/<你的域名>/${DOMAIN}/g" /opt/ai/repo/nginx/anima.conf \
-  > /etc/nginx/sites-available/anima
+  > /opt/nginx/conf/conf.d/anima.conf
 
-# 启用并测试
-ln -sf /etc/nginx/sites-available/anima /etc/nginx/sites-enabled/
-nginx -t
+# 测试配置
+/opt/nginx/sbin/nginx -t
 # 预期：configuration file ... syntax is ok
 #       configuration file ... test is successful
 
-# 重载
-systemctl reload nginx
+# 重载 Nginx
+/opt/nginx/sbin/nginx -s reload
 ```
 
-> **注意**：`nginx/anima.conf` 已包含 `ssl_trusted_certificate /etc/letsencrypt/live/<你的域名>/chain.pem;`  
-> 该文件由 certbot 自动生成（`chain.pem` 为 Let's Encrypt 中间 CA 链），上方 `sed` 替换域名后即可正确指向该文件。  
-> 此指令与 `ssl_stapling_verify on` 配合，使 Nginx 能验证 OCSP 响应的签名（CIS TLS 配置要求）。
-
-### 4.4 配置证书自动续期
+### 4.5 配置证书自动续期
 
 ```bash
 # 测试续期（不实际续期）
 certbot renew --dry-run
 # 预期：Congratulations, all simulated renewals succeeded.
 
-# certbot 安装时已自动配置 systemd timer，确认状态
-systemctl status certbot.timer
+# 如安装脚本未配置自动续期 timer，手动添加 crontab
+(crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --deploy-hook '/opt/nginx/sbin/nginx -s reload'") | crontab -
 ```
 
-### 4.5 验证
+### 4.6 验证
 
 ```bash
 # 测试 HTTPS
@@ -453,6 +552,14 @@ curl -Lv http://ai.example.com/ 2>&1 | grep "Location"
 
 # 检查安全头
 curl -sI https://ai.example.com/ | grep -E "Strict|Content-Security|X-Frame"
+
+# 验证 ModSecurity WAF 正常工作（发送测试攻击，应返回 403）
+curl -s -o /dev/null -w "%{http_code}" \
+  "https://ai.example.com/?param=<script>alert(1)</script>"
+# 预期：403（被 WAF 拦截）
+
+# 查看 ModSecurity 审计日志
+tail -20 /www/wwwlogs/owasp/modsec_audit.log
 ```
 
 ---
@@ -903,15 +1010,36 @@ docker compose logs --tail=50 openclaw
 ### Nginx 配置测试失败
 
 ```bash
-nginx -t
+/opt/nginx/sbin/nginx -t
 # 若报错 "unknown directive http2"，说明 Nginx 版本 < 1.25.1
-# 解决：编辑 /etc/nginx/sites-available/anima
+# 解决：编辑 /opt/nginx/conf/conf.d/anima.conf
 # 将 "http2 on;" 删除，改为 listen 行改为：
 # listen 443 ssl http2;
 # listen [::]:443 ssl http2;
 
+# 若报错 "unknown directive modsecurity"，说明 ModSecurity 模块未正确编译
+# 解决：重新运行安装脚本确保 ModSecurity-nginx 连接器已编译
+
 # 查看 Nginx 版本
-nginx -v
+/opt/nginx/sbin/nginx -v
+```
+
+### ModSecurity WAF 误报处理
+
+```bash
+# 查看最近被拦截的请求
+tail -100 /www/wwwlogs/owasp/modsec_audit.log | grep -A5 '"id"'
+
+# 若合法请求被误拦截：
+# 1. 从日志中找到触发的规则 ID（如 942100）
+# 2. 在 REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf 中添加排除规则
+# 3. 重载 Nginx：/opt/nginx/sbin/nginx -s reload
+
+# 临时切换为仅检测模式（不拦截）
+sed -i 's/^SecRuleEngine.*/SecRuleEngine DetectionOnly/' /opt/nginx/src/ModSecurity/modsecurity.conf
+/opt/nginx/sbin/nginx -s reload
+# 排查完成后记得改回 On
+sed -i 's/^SecRuleEngine.*/SecRuleEngine On/' /opt/nginx/src/ModSecurity/modsecurity.conf
 ```
 
 ### 查询 ADMIN_TOKEN
@@ -950,30 +1078,46 @@ curl http://172.16.1.5:3002/admin/models \
 
 | 控制项 | CIS/PCI-DSS 要求 | 本系统实现 |
 |--------|-----------------|-----------|
+| **WAF（PCI 6.4.1/6.4.2）** | 部署 WAF 保护公共 Web 应用，检测/阻止 OWASP Top 10 攻击 | ModSecurity v3 + OWASP CRS v4（异常评分模式，PL1 阈值=5）；覆盖 SQLi/XSS/RCE/LFI 等；JSON 审计日志 |
 | 网络安全（CIS 12, PCI 1.x） | 最小化暴露面，分段网络 | 所有服务仅监听 WireGuard 内网；Nginx 为唯一公网入口；UFW 白名单规则 |
 | 传输加密（CIS 3, PCI 4.x） | 仅 TLS 1.2/1.3，强密码套件 | Nginx 仅启用 TLSv1.2/1.3；ECDHE 密码套件；HSTS（max-age=63072000） |
 | OCSP Stapling（CIS TLS） | 证书状态验证 | `ssl_stapling on; ssl_stapling_verify on; ssl_trusted_certificate` |
-| 安全配置（CIS 4, PCI 2.x） | 关闭默认服务/版本信息 | `server_tokens off`；`X-Powered-By` 已禁用；helmet 安全响应头 |
+| 安全配置（CIS 4, PCI 2.x） | 关闭默认服务/版本信息 | `server_tokens off`；`X-Powered-By` 已禁用；helmet 安全响应头；ModSecurity `SecServerSignature " "` |
 | 访问控制（CIS 6, PCI 7.x） | 最小权限，强认证 | ADMIN_TOKEN 使用 `openssl rand -hex 32` 生成（256 位熵）；接口仅内网可达 |
-| 防暴力破解（PCI 8.3） | 速率限制，账户锁定 | 激活接口 5 次/10 分；全局 60 次/分；Express rate-limit |
+| 防暴力破解（PCI 8.3） | 速率限制，账户锁定 | 激活接口 5 次/10 分；全局 60 次/分；Express rate-limit；Nginx 三级限速（API/登录/TTS） |
 | 令牌安全（PCI 8.3.6, 8.6.3） | 令牌最小长度；定期轮换 | 启动时检查 ADMIN_TOKEN ≥ 32 字符；提供轮换操作步骤 |
 | 防计时攻击（PCI 6.3.2） | 定时安全比较 | `crypto.timingSafeEqual()` 用于 ADMIN_TOKEN 比较 |
-| 输入验证（CIS 16, PCI 6.4） | 拒绝非法输入 | 所有接口校验类型/范围/格式；字符串长度匹配 DB VARCHAR 约束；字符数上限 10M；`Number.isFinite()`；邮箱正则 |
-| SQL 注入防护（PCI 6.4） | 参数化查询 | 全部 DB 操作使用 `$1,$2,...` 参数化查询，无字符串拼接 |
+| 输入验证（CIS 16, PCI 6.4） | 拒绝非法输入 | 双层防御：应用层（类型/范围/格式校验）+ WAF 层（OWASP CRS 规则检测恶意 payload）；字符串长度匹配 DB VARCHAR 约束；字符数上限 10M |
+| SQL 注入防护（PCI 6.4） | 参数化查询 | 双层防御：全部 DB 操作使用 `$1,$2,...` 参数化查询 + OWASP CRS 942xxx SQLi 检测规则 |
 | 并发安全（PCI 6.4） | 防 TOCTOU/竞态 | 充值激活使用 `SELECT ... FOR UPDATE` 行锁；余额扣减及管理员调整均使用事务 + 行锁 |
-| 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | Winston 记录所有关键操作；日志文件 10 MB 自动轮替，保留 5 份 |
+| 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | 双层日志：Winston 应用日志（10 MB × 5 轮替）+ ModSecurity 审计日志（`/www/wwwlogs/owasp/modsec_audit.log`，并发模式） |
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
 | 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 600m）；JSON 日志轮替 |
-| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配 1 GB VPS；Redis `maxmemory 1gb` + LRU 淘汰策略；Nginx `worker_processes auto` |
-| 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | Nginx 显式阻断 `/health`、`/billing`、`/admin` 路径；内部端口不暴露公网 |
+| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配 1 GB VPS；Redis `maxmemory 1gb` + LRU 淘汰策略；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
+| 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | UFW 防火墙 → Nginx 限速/路径拦截 → ModSecurity WAF → 应用层校验 → DB 约束（五层纵深防御） |
+
+### WAF 性能优化措施
+
+为确保 ModSecurity WAF 不影响 AI 聊天的低延迟体验，已采取以下优化：
+
+| 优化项 | 措施 | 影响 |
+|--------|------|------|
+| 响应体检查 | `SecResponseBodyAccess Off` | 避免检查 AI 生成的长文本（可达数万字符），显著降低延迟 |
+| 请求体解析 | `SecRequestBodyJsonDepthLimit 512` + `SecArgumentsLimit 1000` | 防止深度嵌套 JSON 和参数污染，同时保证 AI 聊天低延迟 |
+| 静态资源 | 排除规则跳过 `.js/.css/.woff2/图片` | 静态资源零 WAF 开销 |
+| 语音上传 | `/whisper/` 路径完全跳过 WAF | 避免对二进制音频文件运行正则匹配 |
+| 健康检查 | `/health` 路径跳过 WAF + 审计日志 | 减少高频内部探测的日志噪声 |
+| AI 对话体 | 仅排除 `text/content/message` 字段的 SQLi/XSS 规则 | 请求头和 URL 仍受完整 CRS 保护 |
+| 正则防护 | `SecPcreMatchLimit 500000` | 防止恶意构造的正则导致 CPU 暴涨 |
+| 异常评分 | PL1 阈值=5（单条 CRITICAL 即拦截） | 避免 PL2+ 的大量规则增加延迟 |
 
 ### 已知合规说明（可接受风险）
 
 | 项目 | 说明 |
 |------|------|
 | CSP `'unsafe-inline'` | LibreChat 前端需要内联脚本/样式；已通过其他 CSP 指令（`object-src 'none'`、`base-uri 'self'`）降低风险 |
-| 无 WAF | 内部系统，依赖 UFW + Nginx 速率限制；如需 PCI 合规，建议在公网层增加 WAF（如 Cloudflare） |
+| AI 对话内容 WAF 排除 | AI 聊天的用户输入文本字段（text/content/message）排除了 SQLi/XSS/RCE 检测，因用户可能合法讨论代码；请求 URL 和 Header 仍受完整保护 |
 
 ---
 
