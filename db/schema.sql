@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS api_models (
     is_free                    BOOLEAN      NOT NULL DEFAULT false,
     price_input_per_1k_tokens  NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_input_per_1k_tokens >= 0),
     price_output_per_1k_tokens NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_output_per_1k_tokens >= 0),
+    -- 是否支持 Prompt Caching（用于智能分层计费）
+    supports_cache BOOLEAN    NOT NULL DEFAULT false,
     -- 是否启用（false = 仅保留接口定义，用户不可选）
     is_active    BOOLEAN      NOT NULL DEFAULT true,
     description  TEXT,                             -- 管理员备注
@@ -39,27 +41,27 @@ CREATE INDEX IF NOT EXISTS idx_api_models_active
 -- 预置模型（管理员可在运行时通过 POST /admin/models 增加更多）
 INSERT INTO api_models
     (provider, model_name, display_name, is_free,
-     price_input_per_1k_tokens, price_output_per_1k_tokens, is_active, description)
+     price_input_per_1k_tokens, price_output_per_1k_tokens, is_active, supports_cache, description)
 VALUES
     -- ── 免费模型 ──────────────────────────────────────────────
     ('anthropic', 'claude-haiku-4-5-20251001', 'Claude Haiku 4.5',
-     true, 0, 0, true, '免费模型'),
+     true, 0, 0, true, false, '免费模型'),
 
     -- ── 付费模型（价格由管理员自行定义，以下仅为示例占位）─
     ('anthropic', 'claude-sonnet-4-5',         'Claude Sonnet 4.5',
-     false, 0.0030, 0.0150, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
+     false, 0.0030, 0.0150, true, true, '付费模型，支持 Prompt Caching'),
     ('openai',    'gpt-4o-mini',               'GPT-4o Mini',
-     false, 0.000150, 0.000600, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
+     false, 0.000150, 0.000600, true, false, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
     ('openai',    'gpt-4o',                    'GPT-4o',
-     false, 0.0025, 0.0100, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
+     false, 0.0025, 0.0100, true, true, '付费模型，支持 Prompt Caching'),
     ('mistral',   'mistral-small-latest',      'Mistral Small',
-     false, 0.000200, 0.000600, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
+     false, 0.000200, 0.000600, true, false, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
 
     -- ── 本地模型（保留接口，默认不启用）─────────────────────
     ('ollama', 'qwen2.5:7b-instruct-q4_K_M', 'Qwen 2.5 7B (本地)',
-     true, 0, 0, false, '本地 Ollama 模型，保留接口定义，如需启用请设 is_active=true'),
+     true, 0, 0, false, false, '本地 Ollama 模型，保留接口定义，如需启用请设 is_active=true'),
     ('ollama', 'llama3.2:3b',                'LLaMA 3.2 3B (本地)',
-     true, 0, 0, false, '本地 Ollama 模型，保留接口定义')
+     true, 0, 0, false, false, '本地 Ollama 模型，保留接口定义')
 ON CONFLICT (model_name) DO NOTHING;
 
 -- =============================================================

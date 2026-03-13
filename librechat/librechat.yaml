@@ -1,0 +1,28 @@
+# =============================================================
+# Anima 灵枢 · LibreChat 配置
+# 部署节点：VPS C (172.16.1.3)
+#
+# 此文件挂载到容器内 /app/librechat.yaml
+# docker-compose volumes 中添加：
+#   - ./librechat.yaml:/app/librechat.yaml:ro
+# =============================================================
+
+version: 1.2.1
+
+cache: true
+
+interface:
+  # 启用参数侧边栏，允许用户按会话调整上下文窗口和 Token 限制
+  parameters: true
+
+endpoints:
+  # ── 全局默认参数 ─────────────────────────────────────────────
+  # 控制上下文窗口大小，降低单次请求消耗，配合 webhook 计费安全阈值
+  openAI:
+    titleModel: "gpt-4o-mini"
+    maxContextTokens: 4000
+    messageWindowSize: 12
+
+  anthropic:
+    maxContextTokens: 4000
+    messageWindowSize: 12

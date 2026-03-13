@@ -34,6 +34,7 @@ services:
 
     volumes:
       - ./.env:/app/.env:ro
+      - ./librechat.yaml:/app/librechat.yaml:ro
       - ./uploads:/app/uploads
       - ./logs:/app/logs
 
