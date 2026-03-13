@@ -51,6 +51,16 @@ function getSession(userId) {
   return newSession;
 }
 
+// 定期清理过期会话（防止内存泄漏）
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, session] of sessions) {
+    if (now - session.lastActive >= SESSION_TTL) {
+      sessions.delete(userId);
+    }
+  }
+}, SESSION_TTL);
+
 // ─── Agent API 调用 ──────────────────────────────────────────
 async function callAgent(userId, message) {
   const session = getSession(userId);
