@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v4
+ * Anima 灵枢 · Webhook 服务 v5
  * ─────────────────────────────────────────────────────────────
  * 功能：
  *   1. 充值卡激活           POST  /activate
@@ -17,10 +17,11 @@
  *   10. 修改模型定价         PUT   /admin/models/:id
  *   11. 人工调整余额         POST  /admin/adjust
  *
- * 计费规则：
+ * 计费规则（v5: 按 Token 计费，对齐上游 API 定价）：
  *   · 每个模型在 api_models 表中独立定价（管理员自由设定），无套餐绑定
  *   · is_free=true 的模型永久免费，不扣余额
- *   · 付费模型按字数计费：(inputChars/1000)*price_in + (outputChars/1000)*price_out
+ *   · 付费模型按 Token 计费：(inputTokens/1000)*price_in + (outputTokens/1000)*price_out
+ *   · 支持通过 Tiktoken 库在服务端估算 Token 数（当调用方传入文本时）
  *   · 余额不足时拒绝请求，返回 402
  *   · is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费调用
  *
@@ -39,6 +40,7 @@ const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Pool }  = require('pg');
 const winston   = require('winston');
+const { encoding_for_model, get_encoding } = require('tiktoken');
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -161,13 +163,48 @@ async function ensureUser(client, userEmail) {
   );
 }
 
+// ─── Tiktoken 编码器缓存 ──────────────────────────────────────
+const encoderCache = new Map();
+const FALLBACK_ENCODING = 'cl100k_base';
+
+/**
+ * 获取指定模型的 Tiktoken 编码器（带缓存）。
+ * 若模型未识别则回退到 cl100k_base（覆盖 GPT-4 / Claude 等主流模型）。
+ */
+function getEncoder(modelName) {
+  if (encoderCache.has(modelName)) return encoderCache.get(modelName);
+  try {
+    const enc = encoding_for_model(modelName);
+    encoderCache.set(modelName, enc);
+    return enc;
+  } catch {
+    // 模型未识别，使用通用编码
+    if (!encoderCache.has(FALLBACK_ENCODING)) {
+      encoderCache.set(FALLBACK_ENCODING, get_encoding(FALLBACK_ENCODING));
+    }
+    return encoderCache.get(FALLBACK_ENCODING);
+  }
+}
+
+/**
+ * 使用 Tiktoken 计算文本的 Token 数量。
+ * @param {string} text - 输入文本
+ * @param {string} modelName - 模型名称（用于选择编码器）
+ * @returns {number} Token 数量
+ */
+function countTokens(text, modelName) {
+  if (!text || typeof text !== 'string') return 0;
+  const enc = getEncoder(modelName);
+  return enc.encode(text).length;
+}
+
 /**
  * 从 api_models 表查询模型定价。
  * 若模型未注册，返回 null（调用方按"未知付费模型"处理）。
  */
 async function lookupModel(modelName) {
   const res = await db.query(
-    `SELECT id, is_free, price_input_per_1k_chars, price_output_per_1k_chars, is_active
+    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens, is_active
        FROM api_models WHERE model_name = $1`,
     [modelName]
   );
@@ -200,7 +237,7 @@ app.get('/models', async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT provider, model_name, display_name, is_free,
-              price_input_per_1k_chars, price_output_per_1k_chars, description
+              price_input_per_1k_tokens, price_output_per_1k_tokens, description
          FROM api_models
         WHERE is_active = true
         ORDER BY provider, model_name`
@@ -378,8 +415,8 @@ app.get('/billing/history/:email', async (req, res) => {
  * POST /billing/check
  * 调用前预检：根据估算字数判断余额是否充足，不扣费
  *
- * Body: { userEmail, modelName, estimatedInputChars?, estimatedOutputChars? }
- * estimatedInputChars/estimatedOutputChars 默认为 0；
+ * Body: { userEmail, modelName, estimatedInputTokens?, estimatedOutputTokens? }
+ * estimatedInputTokens/estimatedOutputTokens 默认为 0；
  * 如未提供，estimated_fen=0，can_proceed 仅反映账户是否可用而非余额充足。
  *
  * 返回：
@@ -393,7 +430,8 @@ app.get('/billing/history/:email', async (req, res) => {
  * }
  */
 app.post('/billing/check', async (req, res) => {
-  const { userEmail, modelName, estimatedInputChars, estimatedOutputChars } = req.body ?? {};
+  const { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
+          estimatedInputChars, estimatedOutputChars } = req.body ?? {};
 
   if (!isValidEmail(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -425,11 +463,11 @@ app.post('/billing/check', async (req, res) => {
     return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false });
   }
 
-  const inChars  = Math.max(0, parseInt(estimatedInputChars  || '0', 10) || 0);
-  const outChars = Math.max(0, parseInt(estimatedOutputChars || '0', 10) || 0);
-  const priceIn  = Number(model.price_input_per_1k_chars);
-  const priceOut = Number(model.price_output_per_1k_chars);
-  const estimatedFen = Math.ceil(((inChars / 1000) * priceIn + (outChars / 1000) * priceOut) * 100);
+  const inTokens  = Math.max(0, parseInt(estimatedInputTokens  || estimatedInputChars  || '0', 10) || 0);
+  const outTokens = Math.max(0, parseInt(estimatedOutputTokens || estimatedOutputChars || '0', 10) || 0);
+  const priceIn  = Number(model.price_input_per_1k_tokens);
+  const priceOut = Number(model.price_output_per_1k_tokens);
+  const estimatedFen = Math.ceil(((inTokens / 1000) * priceIn + (outTokens / 1000) * priceOut) * 100);
 
   try {
     const balRes = await db.query(
@@ -460,11 +498,13 @@ app.post('/billing/check', async (req, res) => {
  *
  * Body:
  * {
- *   userEmail:   string,
- *   apiProvider: string,   // 'anthropic' | 'openai' | 'mistral' ...
- *   modelName:   string,   // 与 api_models.model_name 对应
- *   inputChars:  number,
- *   outputChars: number
+ *   userEmail:    string,
+ *   apiProvider:  string,     // 'anthropic' | 'openai' | 'mistral' ...
+ *   modelName:    string,     // 与 api_models.model_name 对应
+ *   inputTokens:  number,     // v5: Tiktoken 计数（优先）
+ *   outputTokens: number,
+ *   inputChars?:  number,     // v4 兼容：若未提供 tokens 字段则回退使用
+ *   outputChars?: number
  * }
  *
  * 返回：
@@ -476,7 +516,13 @@ app.post('/billing/check', async (req, res) => {
  * }
  */
 app.post('/billing/record', async (req, res) => {
-  const { userEmail, apiProvider, modelName, inputChars, outputChars } = req.body ?? {};
+  const { userEmail, apiProvider, modelName,
+          inputTokens: rawInputTokens, outputTokens: rawOutputTokens,
+          inputChars, outputChars } = req.body ?? {};
+
+  // v5: 优先使用 inputTokens/outputTokens，向后兼容 inputChars/outputChars
+  const inputTokens  = rawInputTokens  ?? inputChars  ?? 0;
+  const outputTokens = rawOutputTokens ?? outputChars ?? 0;
 
   if (!userEmail || !apiProvider || !modelName) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
@@ -487,14 +533,14 @@ app.post('/billing/record', async (req, res) => {
   if (typeof modelName !== 'string' || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
-  if (typeof inputChars !== 'number' || typeof outputChars !== 'number'
-      || !Number.isFinite(inputChars) || !Number.isFinite(outputChars)
-      || !Number.isInteger(inputChars) || !Number.isInteger(outputChars)
-      || inputChars < 0 || outputChars < 0) {
-    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为有限的非负整数' });
+  if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number'
+      || !Number.isFinite(inputTokens) || !Number.isFinite(outputTokens)
+      || !Number.isInteger(inputTokens) || !Number.isInteger(outputTokens)
+      || inputTokens < 0 || outputTokens < 0) {
+    return res.status(400).json({ success: false, msg: 'inputTokens/outputTokens 必须为有限的非负整数' });
   }
-  if (inputChars > 10_000_000 || outputChars > 10_000_000) {
-    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 单次上限为 10,000,000 字符' });
+  if (inputTokens > 10_000_000 || outputTokens > 10_000_000) {
+    return res.status(400).json({ success: false, msg: 'inputTokens/outputTokens 单次上限为 10,000,000' });
   }
   if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -522,8 +568,8 @@ app.post('/billing/record', async (req, res) => {
 
   const modelId  = model.id;
   const isFree   = model.is_free;
-  const priceIn  = Number(model.price_input_per_1k_chars);
-  const priceOut = Number(model.price_output_per_1k_chars);
+  const priceIn  = Number(model.price_input_per_1k_tokens);
+  const priceOut = Number(model.price_output_per_1k_tokens);
 
   // ── 2. 免费模型：只记录，不扣费 ────────────────────────────
   if (isFree) {
@@ -531,9 +577,9 @@ app.post('/billing/record', async (req, res) => {
       await db.query(
         `INSERT INTO api_usage
              (user_email, api_model_id, api_provider, model_name,
-              is_free, input_chars, output_chars, charged_fen, status)
+              is_free, input_tokens, output_tokens, charged_fen, status)
            VALUES ($1,$2,$3,$4,true,$5,$6,0,'ok')`,
-        [userEmail, modelId, apiProvider, modelName, inputChars, outputChars]
+        [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens]
       );
     } catch (err) {
       logger.error('Free usage insert error', { err: err.message });
@@ -561,9 +607,9 @@ app.post('/billing/record', async (req, res) => {
       return res.status(403).json({ success: false, msg: '账户已被暂停' });
     }
 
-    // 计算本次费用（向上取整到整分；priceIn/priceOut 单位为 元/1000字，×100 转换为分）
+    // 计算本次费用（向上取整到整分；priceIn/priceOut 单位为 元/1000 Token，×100 转换为分）
     const chargedFen = Math.ceil(
-      ((inputChars / 1000) * priceIn + (outputChars / 1000) * priceOut) * 100
+      ((inputTokens / 1000) * priceIn + (outputTokens / 1000) * priceOut) * 100
     );
 
     if (Number(u.balance_fen) < chargedFen) {
@@ -596,10 +642,10 @@ app.post('/billing/record', async (req, res) => {
     const usageRes = await client.query(
       `INSERT INTO api_usage
            (user_email, api_model_id, api_provider, model_name,
-            is_free, input_chars, output_chars, charged_fen, status)
+            is_free, input_tokens, output_tokens, charged_fen, status)
          VALUES ($1,$2,$3,$4,false,$5,$6,$7,'ok')
          RETURNING id`,
-      [userEmail, modelId, apiProvider, modelName, inputChars, outputChars, chargedFen]
+      [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens, chargedFen]
     );
 
     // 记录扣费流水
@@ -611,7 +657,7 @@ app.post('/billing/record', async (req, res) => {
         userEmail,
         chargedFen,
         newBalance,
-        `${modelName}（输入 ${inputChars} 字 / 输出 ${outputChars} 字）`,
+        `${modelName}（输入 ${inputTokens} Token / 输出 ${outputTokens} Token）`,
         String(usageRes.rows[0].id),
       ]
     );
@@ -642,7 +688,7 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT id, provider, model_name, display_name, is_free,
-              price_input_per_1k_chars, price_output_per_1k_chars,
+              price_input_per_1k_tokens, price_output_per_1k_tokens,
               is_active, description, created_at, updated_at
          FROM api_models
          ORDER BY provider, model_name`
@@ -664,7 +710,7 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
  *   modelName:   string,
  *   displayName: string,
  *   isFree:      boolean,
- *   priceInput:  number,   // 分/1000字
+ *   priceInput:  number,   // 元/1000 Token
  *   priceOutput: number,
  *   description: string    // 可选
  * }
@@ -703,18 +749,18 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     const result = await db.query(
       `INSERT INTO api_models
            (provider, model_name, display_name, is_free,
-            price_input_per_1k_chars, price_output_per_1k_chars, description)
+            price_input_per_1k_tokens, price_output_per_1k_tokens, description)
          VALUES ($1,$2,$3,$4,$5,$6,$7)
          ON CONFLICT (model_name) DO UPDATE SET
            provider    = EXCLUDED.provider,
            display_name = EXCLUDED.display_name,
            is_free     = EXCLUDED.is_free,
-           price_input_per_1k_chars  = EXCLUDED.price_input_per_1k_chars,
-           price_output_per_1k_chars = EXCLUDED.price_output_per_1k_chars,
+           price_input_per_1k_tokens  = EXCLUDED.price_input_per_1k_tokens,
+           price_output_per_1k_tokens = EXCLUDED.price_output_per_1k_tokens,
            description = EXCLUDED.description,
            is_active   = true
          RETURNING id, provider, model_name, display_name, is_free,
-                   price_input_per_1k_chars, price_output_per_1k_chars, is_active`,
+                   price_input_per_1k_tokens, price_output_per_1k_tokens, is_active`,
       [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, description || null]
     );
 
@@ -754,9 +800,9 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     updates.push(`is_free = $${values.length + 1}`);
     values.push(isFree);
     if (isFree) {
-      updates.push(`price_input_per_1k_chars = $${values.length + 1}`);
+      updates.push(`price_input_per_1k_tokens = $${values.length + 1}`);
       values.push(0);
-      updates.push(`price_output_per_1k_chars = $${values.length + 1}`);
+      updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
       values.push(0);
     }
   }
@@ -764,14 +810,14 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     if (!Number.isFinite(priceInput) || priceInput < 0) {
       return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
     }
-    updates.push(`price_input_per_1k_chars = $${values.length + 1}`);
+    updates.push(`price_input_per_1k_tokens = $${values.length + 1}`);
     values.push(priceInput);
   }
   if (!isFree && typeof priceOutput === 'number') {
     if (!Number.isFinite(priceOutput) || priceOutput < 0) {
       return res.status(400).json({ success: false, msg: 'priceOutput 必须为有限的非负数' });
     }
-    updates.push(`price_output_per_1k_chars = $${values.length + 1}`);
+    updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
     values.push(priceOutput);
   }
   if (typeof isActive === 'boolean') {
