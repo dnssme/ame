@@ -929,10 +929,12 @@ curl http://172.16.1.5:3002/admin/models \
 | 防计时攻击（PCI 6.3.2） | 定时安全比较 | `crypto.timingSafeEqual()` 用于 ADMIN_TOKEN 比较 |
 | 输入验证（CIS 16, PCI 6.4） | 拒绝非法输入 | 所有接口校验类型/范围/格式；`Number.isFinite()`；邮箱正则 |
 | SQL 注入防护（PCI 6.4） | 参数化查询 | 全部 DB 操作使用 `$1,$2,...` 参数化查询，无字符串拼接 |
-| 并发安全（PCI 6.4） | 防 TOCTOU/竞态 | 充值激活使用 `SELECT ... FOR UPDATE` 行锁；余额扣减使用事务 |
+| 并发安全（PCI 6.4） | 防 TOCTOU/竞态 | 充值激活使用 `SELECT ... FOR UPDATE` 行锁；余额扣减及管理员调整均使用事务 + 行锁 |
 | 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | Winston 记录所有关键操作；日志文件 10 MB 自动轮替，保留 5 份 |
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
+| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制；JSON 日志轮替 |
+| 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | Nginx 显式阻断 `/health`、`/billing`、`/admin` 路径；内部端口不暴露公网 |
 
 ### 已知合规说明（可接受风险）
 

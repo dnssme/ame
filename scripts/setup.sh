@@ -107,7 +107,7 @@ PGPASSWORD="${PG_PASSWORD}" PGSSLMODE=require psql \
   -d librechat \
   -f "${REPO_ROOT}/db/schema.sql" \
   -v ON_ERROR_STOP=1 \
-  || { err "数据库 Schema 初始化失败，请检查 PG_PASSWORD / PG_HOST 及 Azure PostgreSQL 防火墙规则"; exit 1; }
+  || die "数据库 Schema 初始化失败，请检查 PG_PASSWORD / PG_HOST 及 Azure PostgreSQL 防火墙规则"
 
 ok "数据库 Schema 初始化完成"
 
