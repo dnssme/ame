@@ -21,6 +21,8 @@
  *   · 每个模型在 api_models 表中独立定价（管理员自由设定），无套餐绑定
  *   · is_free=true 的模型永久免费，不扣余额
  *   · 付费模型按 Token 计费：(inputTokens/1000)*price_in + (outputTokens/1000)*price_out
+ *   · 支持缓存感知分层计费：supports_cache 模型对超过阈值的历史上下文 Token 享受 90% 折扣
+ *   · 单次请求安全熔断：预估费用超过阈值时拒绝请求（防余额耗尽）
  *   · 支持通过 Tiktoken 库在服务端估算 Token 数（当调用方传入文本时）
  *   · 余额不足时拒绝请求，返回 402
  *   · is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费调用
@@ -154,6 +156,14 @@ function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
 }
 
+/** 解析可选的非负整数（用于 Token 分段字段），非法值返回 undefined */
+function parseOptionalNonNegInt(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  return undefined;
+}
+
 /** 确保 user_billing 行存在，不存在则自动创建 */
 async function ensureUser(client, userEmail) {
   await client.query(
@@ -207,11 +217,60 @@ function countTokens(text, modelName) {
  */
 async function lookupModel(modelName) {
   const res = await db.query(
-    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens, is_active
+    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens, is_active, supports_cache
        FROM api_models WHERE model_name = $1`,
     [modelName]
   );
   return res.rows[0] || null;
+}
+
+// ─── 缓存感知分层计费 ──────────────────────────────────────────
+// 历史上下文中前 CACHE_THRESHOLD_TOKENS 个 Token 按全价计费，
+// 超出部分享受 CACHE_DISCOUNT 折扣（仅限 supports_cache=true 的模型）
+const CACHE_THRESHOLD_TOKENS = 2000;
+const CACHE_DISCOUNT = 0.1;  // 超出阈值部分按 10% 的价格计费
+
+// 单次请求安全熔断阈值（分），默认 1000 分 = 10 元
+const MAX_SINGLE_REQUEST_FEN = parseInt(process.env.MAX_SINGLE_REQUEST_FEN || '1000', 10);
+
+/**
+ * 计算输入 Token 的费用（分），支持缓存感知分层定价。
+ *
+ * 当模型 supports_cache=true 且调用方提供了 promptTokens/historyTokens 分段，
+ * 且 historyTokens > CACHE_THRESHOLD_TOKENS 时：
+ *   费用 = (promptTokens + min(historyTokens, 阈值)) * 全价
+ *        + max(historyTokens - 阈值, 0) * 全价 * 0.1
+ *
+ * 否则按标准定价：所有 inputTokens * 全价
+ *
+ * @param {object} params
+ * @param {number} params.inputTokens    - 总输入 Token 数
+ * @param {number} params.outputTokens   - 总输出 Token 数
+ * @param {number} params.priceIn        - 输入价格（元/1000 Token）
+ * @param {number} params.priceOut       - 输出价格（元/1000 Token）
+ * @param {boolean} params.supportsCache - 模型是否支持缓存
+ * @param {number} [params.promptTokens]  - 新输入 Token 数（可选）
+ * @param {number} [params.historyTokens] - 历史上下文 Token 数（可选）
+ * @returns {number} 费用（分），向上取整
+ */
+function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, supportsCache, promptTokens, historyTokens }) {
+  let inputCostYuan;
+  const hasPartition = typeof promptTokens === 'number' && typeof historyTokens === 'number';
+
+  if (supportsCache && hasPartition && historyTokens > CACHE_THRESHOLD_TOKENS) {
+    // 分层计费：新输入 + 阈值内历史全价，阈值外历史打折
+    const fullPriceTokens = promptTokens + CACHE_THRESHOLD_TOKENS;
+    const discountedTokens = historyTokens - CACHE_THRESHOLD_TOKENS;
+    inputCostYuan = (fullPriceTokens / 1000) * priceIn
+                  + (discountedTokens / 1000) * priceIn * CACHE_DISCOUNT;
+  } else {
+    // 标准计费：所有输入 Token 全价
+    inputCostYuan = (inputTokens / 1000) * priceIn;
+  }
+
+  const outputCostYuan = (outputTokens / 1000) * priceOut;
+  // 转换为分并向上取整
+  return Math.ceil((inputCostYuan + outputCostYuan) * 100);
 }
 
 // =============================================================
@@ -240,7 +299,8 @@ app.get('/models', async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT provider, model_name, display_name, is_free,
-              price_input_per_1k_tokens, price_output_per_1k_tokens, description
+              price_input_per_1k_tokens, price_output_per_1k_tokens,
+              supports_cache, description
          FROM api_models
         WHERE is_active = true
         ORDER BY provider, model_name`
@@ -434,7 +494,8 @@ app.get('/billing/history/:email', async (req, res) => {
  */
 app.post('/billing/check', async (req, res) => {
   const { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
-          estimatedInputChars, estimatedOutputChars } = req.body ?? {};
+          estimatedInputChars, estimatedOutputChars,
+          estimatedPromptTokens, estimatedHistoryTokens } = req.body ?? {};
 
   if (!isValidEmail(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -470,7 +531,27 @@ app.post('/billing/check', async (req, res) => {
   const outTokens = Math.max(0, parseInt(estimatedOutputTokens || estimatedOutputChars || '0', 10) || 0);
   const priceIn  = Number(model.price_input_per_1k_tokens);
   const priceOut = Number(model.price_output_per_1k_tokens);
-  const estimatedFen = Math.ceil(((inTokens / 1000) * priceIn + (outTokens / 1000) * priceOut) * 100);
+
+  // 解析可选的 promptTokens / historyTokens 分段（用于缓存感知计费）
+  const promptTk  = parseOptionalNonNegInt(estimatedPromptTokens);
+  const historyTk = parseOptionalNonNegInt(estimatedHistoryTokens);
+
+  const estimatedFen = calculateChargedFen({
+    inputTokens: inTokens, outputTokens: outTokens,
+    priceIn, priceOut,
+    supportsCache: !!model.supports_cache,
+    promptTokens: promptTk, historyTokens: historyTk,
+  });
+
+  // 安全熔断：单次请求预估费用超过阈值，拒绝请求
+  if (estimatedFen > MAX_SINGLE_REQUEST_FEN) {
+    return res.status(402).json({
+      success:  false,
+      msg:      'Single request cost exceeds safety limit. Please start a new thread or reduce context.',
+      estimated_fen: estimatedFen,
+      limit_fen:     MAX_SINGLE_REQUEST_FEN,
+    });
+  }
 
   try {
     const balRes = await db.query(
@@ -501,13 +582,15 @@ app.post('/billing/check', async (req, res) => {
  *
  * Body:
  * {
- *   userEmail:    string,
- *   apiProvider:  string,     // 'anthropic' | 'openai' | 'mistral' ...
- *   modelName:    string,     // 与 api_models.model_name 对应
- *   inputTokens:  number,     // v5: Tiktoken 计数（优先）
- *   outputTokens: number,
- *   inputChars?:  number,     // v4 兼容：若未提供 tokens 字段则回退使用
- *   outputChars?: number
+ *   userEmail:      string,
+ *   apiProvider:    string,     // 'anthropic' | 'openai' | 'mistral' ...
+ *   modelName:      string,     // 与 api_models.model_name 对应
+ *   inputTokens:    number,     // v5: Tiktoken 计数（优先）
+ *   outputTokens:   number,
+ *   inputChars?:    number,     // v4 兼容：若未提供 tokens 字段则回退使用
+ *   outputChars?:   number,
+ *   promptTokens?:  number,     // 新输入 Token 数（用于缓存感知分层计费）
+ *   historyTokens?: number      // 历史上下文 Token 数（用于缓存感知分层计费）
  * }
  *
  * 返回：
@@ -521,7 +604,8 @@ app.post('/billing/check', async (req, res) => {
 app.post('/billing/record', async (req, res) => {
   const { userEmail, apiProvider, modelName,
           inputTokens: rawInputTokens, outputTokens: rawOutputTokens,
-          inputChars, outputChars } = req.body ?? {};
+          inputChars, outputChars,
+          promptTokens: rawPromptTokens, historyTokens: rawHistoryTokens } = req.body ?? {};
 
   // v5: 优先使用 inputTokens/outputTokens，向后兼容 inputChars/outputChars
   // 注意：若调用方仍传 inputChars/outputChars，值会被当作 Token 数使用；
@@ -580,6 +664,10 @@ app.post('/billing/record', async (req, res) => {
   const priceIn  = Number(model.price_input_per_1k_tokens);
   const priceOut = Number(model.price_output_per_1k_tokens);
 
+  // 解析可选的 promptTokens / historyTokens 分段（用于缓存感知计费）
+  const promptTk  = parseOptionalNonNegInt(rawPromptTokens);
+  const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
+
   // ── 2. 免费模型：只记录，不扣费 ────────────────────────────
   if (isFree) {
     try {
@@ -616,10 +704,24 @@ app.post('/billing/record', async (req, res) => {
       return res.status(403).json({ success: false, msg: '账户已被暂停' });
     }
 
-    // 计算本次费用（向上取整到整分；priceIn/priceOut 单位为 元/1000 Token，×100 转换为分）
-    const chargedFen = Math.ceil(
-      ((inputTokens / 1000) * priceIn + (outputTokens / 1000) * priceOut) * 100
-    );
+    // 计算本次费用（缓存感知分层计费）
+    const chargedFen = calculateChargedFen({
+      inputTokens, outputTokens,
+      priceIn, priceOut,
+      supportsCache: !!model.supports_cache,
+      promptTokens: promptTk, historyTokens: historyTk,
+    });
+
+    // 安全熔断：单次请求费用超过阈值，拒绝请求
+    if (chargedFen > MAX_SINGLE_REQUEST_FEN) {
+      await client.query('ROLLBACK');
+      return res.status(402).json({
+        success:  false,
+        msg:      'Single request cost exceeds safety limit. Please start a new thread or reduce context.',
+        charged_fen: chargedFen,
+        limit_fen:   MAX_SINGLE_REQUEST_FEN,
+      });
+    }
 
     if (Number(u.balance_fen) < chargedFen) {
       await client.query('ROLLBACK');
@@ -698,7 +800,7 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
     const result = await db.query(
       `SELECT id, provider, model_name, display_name, is_free,
               price_input_per_1k_tokens, price_output_per_1k_tokens,
-              is_active, description, created_at, updated_at
+              is_active, supports_cache, description, created_at, updated_at
          FROM api_models
          ORDER BY provider, model_name`
     );
@@ -715,17 +817,18 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
  *
  * Body:
  * {
- *   provider:    string,
- *   modelName:   string,
- *   displayName: string,
- *   isFree:      boolean,
- *   priceInput:  number,   // 元/1000 Token
- *   priceOutput: number,
- *   description: string    // 可选
+ *   provider:      string,
+ *   modelName:     string,
+ *   displayName:   string,
+ *   isFree:        boolean,
+ *   priceInput:    number,   // 元/1000 Token
+ *   priceOutput:   number,
+ *   supportsCache: boolean,  // 可选，是否支持 Prompt Caching
+ *   description:   string    // 可选
  * }
  */
 app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
-  const { provider, modelName, displayName, isFree, priceInput, priceOutput, description } = req.body ?? {};
+  const { provider, modelName, displayName, isFree, priceInput, priceOutput, supportsCache, description } = req.body ?? {};
 
   if (!provider || !modelName || !displayName) {
     return res.status(400).json({ success: false, msg: '缺少必填字段：provider、modelName、displayName' });
@@ -758,19 +861,21 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     const result = await db.query(
       `INSERT INTO api_models
            (provider, model_name, display_name, is_free,
-            price_input_per_1k_tokens, price_output_per_1k_tokens, description)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
+            price_input_per_1k_tokens, price_output_per_1k_tokens, supports_cache, description)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT (model_name) DO UPDATE SET
            provider    = EXCLUDED.provider,
            display_name = EXCLUDED.display_name,
            is_free     = EXCLUDED.is_free,
            price_input_per_1k_tokens  = EXCLUDED.price_input_per_1k_tokens,
            price_output_per_1k_tokens = EXCLUDED.price_output_per_1k_tokens,
+           supports_cache = EXCLUDED.supports_cache,
            description = EXCLUDED.description,
            is_active   = true
          RETURNING id, provider, model_name, display_name, is_free,
-                   price_input_per_1k_tokens, price_output_per_1k_tokens, is_active`,
-      [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, description || null]
+                   price_input_per_1k_tokens, price_output_per_1k_tokens,
+                   supports_cache, is_active`,
+      [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, !!supportsCache, description || null]
     );
 
     logger.info('Model upserted', { modelName, isFree });
@@ -787,12 +892,13 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
  *
  * Body（任意字段可选）：
  * {
- *   isFree?:      boolean,
- *   priceInput?:  number,
- *   priceOutput?: number,
- *   isActive?:    boolean,
- *   displayName?: string,
- *   description?: string
+ *   isFree?:        boolean,
+ *   priceInput?:    number,
+ *   priceOutput?:   number,
+ *   isActive?:      boolean,
+ *   supportsCache?: boolean,
+ *   displayName?:   string,
+ *   description?:   string
  * }
  */
 app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
@@ -801,7 +907,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: '模型 ID 无效' });
   }
 
-  const { isFree, priceInput, priceOutput, isActive, displayName, description } = req.body ?? {};
+  const { isFree, priceInput, priceOutput, isActive, supportsCache, displayName, description } = req.body ?? {};
   const updates = [];
   const values  = [];
 
@@ -832,6 +938,10 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof isActive === 'boolean') {
     updates.push(`is_active = $${values.length + 1}`);
     values.push(isActive);
+  }
+  if (typeof supportsCache === 'boolean') {
+    updates.push(`supports_cache = $${values.length + 1}`);
+    values.push(supportsCache);
   }
   if (typeof displayName === 'string') {
     if (displayName.trim().length === 0) {
