@@ -99,6 +99,15 @@ const activateLimiter = rateLimit({
   message: { success: false, msg: '激活尝试过于频繁，请 10 分钟后再试' },
 });
 
+// 管理员接口限速：10 次/15 分（PCI-DSS 8.1.4 防暴力破解 ADMIN_TOKEN）
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  max:      10,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { success: false, msg: '管理员接口请求过于频繁，请 15 分钟后再试' },
+});
+
 // ─── 管理员鉴权中间件 ─────────────────────────────────────────
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
@@ -125,6 +134,8 @@ function requireAdmin(req, res, next) {
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   if (!safeCompare(token, ADMIN_TOKEN)) {
+    // PCI-DSS 10.2.5：记录失败的认证尝试
+    logger.warn('Admin auth failed', { ip: req.ip, path: req.path });
     return res.status(401).json({ success: false, msg: '未授权' });
   }
   next();
@@ -133,6 +144,13 @@ function requireAdmin(req, res, next) {
 // ─── 工具函数 ─────────────────────────────────────────────────
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// RFC 5321：邮箱最大长度 254 字符（PCI-DSS 6.5.1 输入验证）
+const MAX_EMAIL_LEN = 254;
+
+/** 验证邮箱格式和长度 */
+function isValidEmail(email) {
+  return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
+}
 
 /** 确保 user_billing 行存在，不存在则自动创建 */
 async function ensureUser(client, userEmail) {
@@ -206,7 +224,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
   if (!cardKey || !userEmail) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 cardKey 和 userEmail' });
   }
-  if (!EMAIL_RE.test(userEmail)) {
+  if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
   if (cardKey.length > 64 || !/^[A-Z0-9-]+$/i.test(cardKey)) {
@@ -292,7 +310,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
  */
 app.get('/billing/balance/:email', async (req, res) => {
   const { email } = req.params;
-  if (!EMAIL_RE.test(email)) {
+  if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
@@ -324,7 +342,7 @@ app.get('/billing/balance/:email', async (req, res) => {
  */
 app.get('/billing/history/:email', async (req, res) => {
   const { email } = req.params;
-  if (!EMAIL_RE.test(email)) {
+  if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
@@ -374,7 +392,7 @@ app.get('/billing/history/:email', async (req, res) => {
 app.post('/billing/check', async (req, res) => {
   const { userEmail, modelName, estimatedInputChars, estimatedOutputChars } = req.body ?? {};
 
-  if (!EMAIL_RE.test(userEmail || '')) {
+  if (!isValidEmail(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
   if (!modelName) {
@@ -475,7 +493,7 @@ app.post('/billing/record', async (req, res) => {
   if (inputChars > 10_000_000 || outputChars > 10_000_000) {
     return res.status(400).json({ success: false, msg: 'inputChars/outputChars 单次上限为 10,000,000 字符' });
   }
-  if (!EMAIL_RE.test(userEmail)) {
+  if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
@@ -617,7 +635,7 @@ app.post('/billing/record', async (req, res) => {
  * GET /admin/models
  * 查看所有模型（含未启用的本地模型）
  */
-app.get('/admin/models', requireAdmin, async (_req, res) => {
+app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT id, provider, model_name, display_name, is_free,
@@ -648,7 +666,7 @@ app.get('/admin/models', requireAdmin, async (_req, res) => {
  *   description: string    // 可选
  * }
  */
-app.post('/admin/models', requireAdmin, async (req, res) => {
+app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   const { provider, modelName, displayName, isFree, priceInput, priceOutput, description } = req.body ?? {};
 
   if (!provider || !modelName || !displayName) {
@@ -716,7 +734,7 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
  *   description?: string
  * }
  */
-app.put('/admin/models/:id', requireAdmin, async (req, res) => {
+app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({ success: false, msg: '模型 ID 无效' });
@@ -798,10 +816,10 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
  *   type: 'recharge' | 'refund' | 'admin_adjust'
  *   amount_fen: 正数 = 增加余额，负数 = 减少余额
  */
-app.post('/admin/adjust', requireAdmin, async (req, res) => {
+app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   const { userEmail, amount_fen, type, description } = req.body ?? {};
 
-  if (!EMAIL_RE.test(userEmail || '')) {
+  if (!isValidEmail(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
   if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0) {
