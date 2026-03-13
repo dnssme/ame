@@ -794,9 +794,9 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
 
     await ensureUser(client, userEmail);
 
-    // 先取当前余额（ensureUser 保证行已存在）
+    // 先取当前余额并加行锁，防并发调整（ensureUser 保证行已存在）
     const prevRes = await client.query(
-      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
+      'SELECT balance_fen FROM user_billing WHERE user_email=$1 FOR UPDATE',
       [userEmail]
     );
     const oldBalance = Number(prevRes.rows[0].balance_fen);
