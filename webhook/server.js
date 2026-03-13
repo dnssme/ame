@@ -156,6 +156,14 @@ function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
 }
 
+/** 解析可选的非负整数（用于 Token 分段字段），非法值返回 undefined */
+function parseOptionalNonNegInt(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  return undefined;
+}
+
 /** 确保 user_billing 行存在，不存在则自动创建 */
 async function ensureUser(client, userEmail) {
   await client.query(
@@ -525,8 +533,8 @@ app.post('/billing/check', async (req, res) => {
   const priceOut = Number(model.price_output_per_1k_tokens);
 
   // 解析可选的 promptTokens / historyTokens 分段（用于缓存感知计费）
-  const promptTk  = (typeof estimatedPromptTokens  === 'number' && Number.isFinite(estimatedPromptTokens)  && estimatedPromptTokens  >= 0) ? estimatedPromptTokens  : undefined;
-  const historyTk = (typeof estimatedHistoryTokens === 'number' && Number.isFinite(estimatedHistoryTokens) && estimatedHistoryTokens >= 0) ? estimatedHistoryTokens : undefined;
+  const promptTk  = parseOptionalNonNegInt(estimatedPromptTokens);
+  const historyTk = parseOptionalNonNegInt(estimatedHistoryTokens);
 
   const estimatedFen = calculateChargedFen({
     inputTokens: inTokens, outputTokens: outTokens,
@@ -657,8 +665,8 @@ app.post('/billing/record', async (req, res) => {
   const priceOut = Number(model.price_output_per_1k_tokens);
 
   // 解析可选的 promptTokens / historyTokens 分段（用于缓存感知计费）
-  const promptTk  = (typeof rawPromptTokens  === 'number' && Number.isFinite(rawPromptTokens)  && Number.isInteger(rawPromptTokens)  && rawPromptTokens  >= 0) ? rawPromptTokens  : undefined;
-  const historyTk = (typeof rawHistoryTokens === 'number' && Number.isFinite(rawHistoryTokens) && Number.isInteger(rawHistoryTokens) && rawHistoryTokens >= 0) ? rawHistoryTokens : undefined;
+  const promptTk  = parseOptionalNonNegInt(rawPromptTokens);
+  const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
   // ── 2. 免费模型：只记录，不扣费 ────────────────────────────
   if (isFree) {
