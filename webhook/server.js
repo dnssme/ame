@@ -527,8 +527,8 @@ app.post('/billing/check', async (req, res) => {
     return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false });
   }
 
-  const inTokens  = Math.max(0, parseInt(estimatedInputTokens  || estimatedInputChars  || '0', 10) || 0);
-  const outTokens = Math.max(0, parseInt(estimatedOutputTokens || estimatedOutputChars || '0', 10) || 0);
+  const inTokens  = Math.max(0, parseInt(estimatedInputTokens  ?? estimatedInputChars  ?? '0', 10) || 0);
+  const outTokens = Math.max(0, parseInt(estimatedOutputTokens ?? estimatedOutputChars ?? '0', 10) || 0);
   const priceIn  = Number(model.price_input_per_1k_tokens);
   const priceOut = Number(model.price_output_per_1k_tokens);
 
@@ -1059,6 +1059,7 @@ app.use((_req, res) => {
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
   logger.error('Unhandled error', { err: err.message, stack: err.stack });
+  if (res.headersSent) return;
   res.status(500).json({ success: false, msg: '服务器内部错误' });
 });
 
@@ -1094,5 +1095,14 @@ const shutdown = (signal) => {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
+
+// PCI-DSS 6.5.5: 确保未捕获的异常被正确记录，然后安全退出
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { err: String(reason) });
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception, shutting down', { err: err.message, stack: err.stack });
+  process.exit(1);
+});
 
 module.exports = app;
