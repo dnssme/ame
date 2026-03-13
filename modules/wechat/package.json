@@ -1,0 +1,19 @@
+{
+  "name": "anima-wechat",
+  "version": "1.0.0",
+  "description": "Anima 灵枢 微信接入模块 — 基于 Wechaty",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "check": "node -c bot.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "wechaty": "^1.20.2",
+    "wechaty-puppet-wechat": "^1.18.4",
+    "undici": "^6.6.2",
+    "winston": "^3.11.0"
+  }
+}

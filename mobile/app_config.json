@@ -1,0 +1,42 @@
+{
+  "appName": "Anima 灵枢",
+  "appId": "com.anima.ai",
+  "version": "1.0.0",
+
+  "_comment_api": "后端 API 配置——替换 <你的域名> 为实际域名",
+  "apiBaseUrl": "https://<你的域名>",
+  "apiEndpoints": {
+    "auth": "/api/auth/login",
+    "register": "/api/auth/register",
+    "chat": "/api/ask",
+    "models": "/api/models",
+    "conversations": "/api/convos",
+    "fileUpload": "/api/files/upload",
+    "activate": "/activate",
+    "balance": "/billing/balance",
+    "whisper": "/whisper/transcribe",
+    "tts": "/tts/api/tts"
+  },
+
+  "_comment_defaults": "默认设置",
+  "defaultModel": "claude-haiku-4-5-20251001",
+  "maxContextMessages": 20,
+  "sessionTimeoutMs": 86400000,
+
+  "_comment_features": "功能开关——对应 modules/modules.yml 中的模块",
+  "features": {
+    "voice": true,
+    "fileUpload": true,
+    "calendar": false,
+    "cloudStorage": false,
+    "webSearch": true,
+    "smartHome": false
+  },
+
+  "_comment_theme": "主题配色",
+  "theme": {
+    "primaryColor": "#6366F1",
+    "accentColor": "#8B5CF6",
+    "darkMode": true
+  }
+}

@@ -1,0 +1,40 @@
+version: '3.8'
+
+# =============================================================
+# Anima 灵枢 · Whisper 语音识别 (STT)
+# 部署节点：CXI4 (172.16.1.5)
+# =============================================================
+
+services:
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: anima-whisper
+    restart: unless-stopped
+
+    mem_limit: 2g
+    mem_reservation: 1g
+    cpus: '2.0'
+
+    security_opt:
+      - no-new-privileges:true
+
+    ports:
+      - "172.16.1.5:8080:9000"
+
+    environment:
+      ASR_MODEL: base
+      ASR_ENGINE: openai_whisper
+      TZ: Asia/Shanghai
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"

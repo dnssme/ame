@@ -1,0 +1,20 @@
+{
+  "name": "anima-email",
+  "version": "1.0.0",
+  "description": "Anima 灵枢 邮件处理模块 — IMAP/SMTP + AI 分析",
+  "main": "processor.js",
+  "scripts": {
+    "start": "node processor.js",
+    "check": "node -c processor.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "imapflow": "^1.0.162",
+    "nodemailer": "^6.9.8",
+    "mailparser": "^3.6.6",
+    "undici": "^6.6.2",
+    "winston": "^3.11.0"
+  }
+}
