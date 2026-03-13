@@ -23,6 +23,9 @@ services:
       - CHOWN
       - SETUID
       - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp
 
     env_file:
       - path: ./.env

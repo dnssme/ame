@@ -193,7 +193,12 @@ bot.on('message', async (msg) => {
 });
 
 // ─── 健康检查 HTTP 服务 ──────────────────────────────────────
-const healthServer = http.createServer((_req, res) => {
+const healthServer = http.createServer((req, res) => {
+  if (req.url !== '/health' || req.method !== 'GET') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not Found' }));
+    return;
+  }
   const isLoggedIn = bot.isLoggedIn;
   res.writeHead(isLoggedIn ? 200 : 503, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ status: isLoggedIn ? 'ok' : 'not_logged_in' }));
@@ -226,3 +231,12 @@ const shutdown = (signal) => {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection, shutting down', { err: String(reason) });
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception, shutting down', { err: err.message, stack: err.stack });
+  process.exit(1);
+});

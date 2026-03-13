@@ -156,7 +156,12 @@ checkNewEmails();
 const timer = setInterval(checkNewEmails, CHECK_INTERVAL);
 
 // ─── 健康检查 ────────────────────────────────────────────────
-const healthServer = http.createServer((_req, res) => {
+const healthServer = http.createServer((req, res) => {
+  if (req.url !== '/health' || req.method !== 'GET') {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not Found' }));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ status: 'ok', lastCheck: lastCheck.toISOString() }));
 });
@@ -175,5 +180,14 @@ const shutdown = (signal) => {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection, shutting down', { err: String(reason) });
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception, shutting down', { err: err.message, stack: err.stack });
+  process.exit(1);
+});
 
 module.exports = { sendEmail };
