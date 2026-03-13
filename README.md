@@ -1,24 +1,136 @@
 # Anima · 灵枢 私有 AI 手机助理
 
-> 完整生产级部署 · 按模型按量计费 · 安全加固
+> 完整生产级部署 · 按模型按量计费 · 模块化功能 · 安全加固
 
 ---
 
 ## 目录
 
-1. [最终用户使用说明](#最终用户使用说明)
-2. [架构概览](#架构概览)
-3. [计费规则](#计费规则)
-4. [前置条件](#前置条件)
-5. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
-6. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
-7. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
-8. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
-9. [第五步：初始化模型定价](#第五步初始化模型定价)
-10. [API 接口完整参考](#api-接口完整参考)
-11. [常用运维 SQL](#常用运维-sql)
-12. [故障排查](#故障排查)
-13. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
+1. [功能矩阵](#功能矩阵)
+2. [模块化架构](#模块化架构)
+3. [手机 APP 使用方案](#手机-app-使用方案)
+4. [最终用户使用说明](#最终用户使用说明)
+5. [架构概览](#架构概览)
+6. [计费规则](#计费规则)
+7. [前置条件](#前置条件)
+8. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
+9. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
+10. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
+11. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
+12. [第五步：初始化模型定价](#第五步初始化模型定价)
+13. [API 接口完整参考](#api-接口完整参考)
+14. [常用运维 SQL](#常用运维-sql)
+15. [故障排查](#故障排查)
+16. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
+
+---
+
+## 功能矩阵
+
+所有功能均为独立模块，可按需启用或禁用。模块配置集中在 [`modules/modules.yml`](modules/modules.yml)。
+
+| 功能 | 状态 | 模块目录 | 说明 |
+|------|------|----------|------|
+| 🤖 日常 AI 对话 | ✅ 已实现 | `librechat/` | LibreChat Web UI，多轮对话 |
+| 🧠 记忆上下文 | ✅ 已实现 | `openclaw/` | PostgreSQL 持久化 + Redis 会话缓存 |
+| 🔀 多模型切换 | ✅ 已实现 | `openclaw/` | Claude / GPT / Mistral / Ollama |
+| 💬 接入微信 | 🆕 新增模块 | [`modules/wechat/`](modules/wechat/) | 基于 Wechaty 框架 |
+| ✈️ 接入 Telegram | 🆕 新增模块 | [`modules/telegram/`](modules/telegram/) | 基于 Telegraf 框架 |
+| 📧 邮件处理 | 🆕 新增模块 | [`modules/email/`](modules/email/) | IMAP 收件 + AI 分析 + SMTP 发件 |
+| 📅 日历管理 | 🆕 新增模块 | [`modules/calendar/`](modules/calendar/) | Nextcloud CalDAV，手机/电脑同步 |
+| 🌐 网页搜索 | ✅ 已实现 | [`modules/web-search/`](modules/web-search/) | DuckDuckGo（OpenClaw 工具） |
+| 📄 文件分析 | ✅ 已实现 | [`modules/file-analysis/`](modules/file-analysis/) | LibreChat 文件上传 + AI 解析 |
+| 🎤 语音交互 | ✅ 已实现 | [`modules/voice/`](modules/voice/) | Whisper STT + Coqui TTS |
+| 🏠 智能家居 | ✅ 已配置 | [`modules/smart-home/`](modules/smart-home/) | Home Assistant REST API |
+| 💰 订阅收费 | ✅ 已实现 | `webhook/` | 按量计费 + 充值卡系统 |
+| ☁️ 用户网盘 | 🆕 新增模块 | [`modules/cloud-storage/`](modules/cloud-storage/) | Nextcloud WebDAV |
+| 📱 手机 APP | 🆕 新增方案 | [`mobile/`](mobile/) | Flutter 开源 APP 适配方案 |
+
+---
+
+## 模块化架构
+
+所有功能以独立模块形式组织，每个模块包含自己的 Docker Compose、环境变量模板和文档。
+启用或禁用模块只需修改 `modules/modules.yml` 并部署/停止对应容器。
+
+### 目录结构
+
+```
+modules/
+├── modules.yml              # 中央模块注册表（启用/禁用控制）
+├── wechat/                  # 微信接入
+│   ├── bot.js               # Wechaty Bot 主程序
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── README.md
+├── telegram/                # Telegram 接入
+│   ├── bot.js               # Telegraf Bot 主程序
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── README.md
+├── email/                   # 邮件处理
+│   ├── processor.js         # IMAP/SMTP 处理器
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── README.md
+├── calendar/                # 日历管理（Nextcloud CalDAV）
+├── cloud-storage/           # 用户网盘（Nextcloud WebDAV）
+├── voice/                   # 语音交互（Whisper + Coqui TTS）
+├── smart-home/              # 智能家居（Home Assistant）
+├── web-search/              # 网页搜索
+└── file-analysis/           # 文件分析
+
+mobile/
+├── README.md                # 手机 APP 完整方案
+└── app_config.json          # APP 后端 API 配置模板
+```
+
+### 启用模块示例
+
+```bash
+# 1. 在 modules.yml 中将目标模块的 enabled 改为 true
+# 2. 进入模块目录，配置并启动
+cd modules/telegram
+cp .env.example .env
+vim .env                     # 填写 Bot Token 等
+docker compose up -d         # 启动模块
+
+# 禁用模块
+docker compose down          # 停止模块
+# 在 modules.yml 中将 enabled 改为 false
+```
+
+---
+
+## 手机 APP 使用方案
+
+详见 [`mobile/README.md`](mobile/README.md)
+
+### 快速总结
+
+| 方案 | 适合场景 | 开发周期 | 技术栈 |
+|------|----------|----------|--------|
+| **PWA（零开发）** | 快速上线 | 立即 | 浏览器添加到主屏幕 |
+| **Maid 适配（推荐）** | 品牌 APP | 1-2 周 | Flutter（MIT 开源） |
+| **Chatbox 适配** | 多平台客户端 | 1-2 周 | React Native |
+| **自建 Flutter APP** | 完全自主 | 1-2 月 | Flutter/Dart |
+
+### PWA 使用（最快方式）
+
+无需任何开发，用手机浏览器打开你的域名：
+
+- **iOS**：Safari → 分享 → "添加到主屏幕"
+- **Android**：Chrome → 菜单 → "添加到主屏幕"
+
+### 独立 APP（推荐 Maid）
+
+[Maid](https://github.com/Mobile-Artificial-Intelligence/maid) 是一个开源 Flutter AI 聊天应用（MIT 协议），支持自定义 API 端点：
+
+1. 克隆 Maid 源码 → 修改品牌和默认 API 地址为你的域名
+2. `flutter build apk --release`（Android）或 `flutter build ios --release`（iOS）
+3. 安装到手机即可使用
+
+APP 后端 API 配置模板见 [`mobile/app_config.json`](mobile/app_config.json)
 
 ---
 
@@ -64,6 +176,9 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | `openclaw/.env.example` | OpenClaw 配置模板 | 必须（填写 API Key） |
 | `openclaw/config.yml` | OpenClaw Agent 配置 | 可选（调整工具和模型） |
 | `openclaw/docker-compose.yml` | OpenClaw 容器定义 | 可选（调整内存限制） |
+| `modules/modules.yml` | 功能模块注册表 | 必须（启用需要的模块） |
+| `modules/*/` | 各功能模块（微信/Telegram/邮件等） | 按需（启用时需配置 .env） |
+| `mobile/` | 手机 APP 方案和配置 | 按需（需要独立 APP 时参考） |
 | `scripts/setup.sh` | CXI4 一键初始化脚本 | 否（直接执行） |
 
 ---
@@ -75,14 +190,22 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
     │ HTTPS
     ▼
 [VPS A] Nginx 反向代理 (172.16.1.1)
-    ├─── /          → [VPS C] LibreChat :3080
-    ├─── /api/agent → [VPS B] OpenClaw  :3000
-    └─── /activate  → [CXI4] Webhook    :3002
+    ├─── /              → [VPS C] LibreChat    :3080
+    ├─── /api/agent     → [VPS B] OpenClaw     :3000
+    ├─── /activate      → [CXI4]  Webhook      :3002
+    ├─── /tts/          → Coqui TTS            :8082  （语音合成）
+    ├─── /whisper/      → [CXI4]  Whisper      :8080  （语音识别）
+    └─── /nextcloud/    → [VPS B] Nextcloud    :8090  （日历/网盘）
 
 [CXI4] (172.16.1.5)
     ├─── Webhook 计费服务  :3002  ←── OpenClaw / LibreChat 自动调用
     ├─── Redis             :6379  ←── LibreChat / OpenClaw 缓存
-    └─── (Whisper STT)     :8080  （可选）
+    ├─── (Whisper STT)     :8080  （语音识别模块）
+    └─── (Email 处理)      :3004  （邮件处理模块）
+
+[VPS B] (172.16.1.2) ── 可选模块
+    ├─── (微信 Bot)        :3001  （微信接入模块）
+    └─── (Telegram Bot)    :3003  （Telegram 接入模块）
 
 [Azure PostgreSQL]
     ├─── librechat  ←── LibreChat 用户数据 + 计费数据
@@ -114,6 +237,20 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── .env.example         # OpenClaw 环境变量模板
 │   ├── config.yml           # OpenClaw Agent 配置
 │   └── docker-compose.yml   # OpenClaw Docker Compose
+├── modules/                 # 功能模块（按需启用）
+│   ├── modules.yml          # 中央模块注册表
+│   ├── wechat/              # 微信接入
+│   ├── telegram/            # Telegram 接入
+│   ├── email/               # 邮件处理
+│   ├── calendar/            # 日历管理
+│   ├── cloud-storage/       # 用户网盘
+│   ├── voice/               # 语音交互（Whisper STT + Coqui TTS）
+│   ├── smart-home/          # 智能家居（Home Assistant）
+│   ├── web-search/          # 网页搜索
+│   └── file-analysis/       # 文件分析
+├── mobile/                  # 手机 APP 方案
+│   ├── README.md            # 完整 APP 方案对比与适配指南
+│   └── app_config.json      # APP 后端 API 配置模板
 └── scripts/
     └── setup.sh             # CXI4 一键初始化脚本
 ```
