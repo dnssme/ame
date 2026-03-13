@@ -2,7 +2,7 @@ version: '3.8'
 
 # =============================================================
 # Anima 灵枢 · 日历管理模块（Nextcloud）
-# 部署节点：VPS-B (172.16.1.2)
+# 部署节点：172.16.1.4（可部署在 VPS-B 或独立节点）
 # =============================================================
 
 services:
@@ -32,7 +32,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_USERNAME:-admin}
       NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_PASSWORD}
-      NEXTCLOUD_TRUSTED_DOMAINS: 172.16.1.4 <你的域名>
+      NEXTCLOUD_TRUSTED_DOMAINS: "172.16.1.4 ${NEXTCLOUD_DOMAIN:-localhost}"
       TZ: Asia/Shanghai
 
     healthcheck:
