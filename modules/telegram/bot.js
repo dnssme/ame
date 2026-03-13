@@ -140,6 +140,9 @@ bot.command('model', (ctx) => {
     const current = userModels.get(ctx.from.id) || DEFAULT_MODEL;
     return ctx.reply(`当前模型：${current}\n\n用法：/model <模型名>`);
   }
+  if (model.length > 128) {
+    return ctx.reply('❌ 模型名称过长（最多 128 字符）');
+  }
   userModels.set(ctx.from.id, model);
   ctx.reply(`✅ 已切换到模型：${model}`);
 });
