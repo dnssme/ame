@@ -68,6 +68,16 @@ const sessionCleanupTimer = setInterval(() => {
 }, SESSION_TTL);
 
 // ─── Agent API 调用 ──────────────────────────────────────────
+
+/** 标记长耗时任务类型（web-search / file-analysis），可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
+const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+function isLongRunningTask(message) {
+  const lower = message.toLowerCase();
+  return LONG_RUNNING_KEYWORDS.some(kw => lower.includes(kw));
+}
+
 async function callAgent(userId, message) {
   const session = getSession(userId);
   session.messages.push({ role: 'user', content: message });
@@ -148,6 +158,22 @@ bot.on('message', async (msg) => {
       if (!text) return;
 
       logger.info('收到文字消息', { userId, text: text.substring(0, 100), isGroup });
+
+      const longRunning = isLongRunningTask(text);
+
+      if (longRunning) {
+        await msg.say('⏳ 任务处理中，完成后会通知你...');
+        callAgent(userId, text)
+          .then(async (reply) => {
+            await msg.say(`✅ 任务完成：\n\n${reply}`);
+          })
+          .catch(async (err) => {
+            logger.error('Long-running task failed', { err: err.message, userId });
+            await msg.say('❌ 任务执行失败，请稍后重试。');
+          });
+        return;
+      }
+
       const reply = await callAgent(userId, text);
       await msg.say(reply);
     }

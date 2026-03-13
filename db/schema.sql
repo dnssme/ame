@@ -1,11 +1,12 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v4
+-- Anima 灵枢 · 数据库 Schema v5
 -- 数据库: librechat (Azure PostgreSQL)
 -- 设计原则：
 --   · 按模型按量计费，无套餐绑定
 --   · 每个 API 模型独立定价（管理员可随时添加/修改价格）
 --   · 标记为 is_free=true 的模型永久免费
 --   · 本地 Ollama 模型保留条目但默认 is_active=false
+--   · v5: 按 Token 计费（Tiktoken），替代按字符计费
 -- =============================================================
 
 -- ─── 启用必要扩展 ──────────────────────────────────────────────
@@ -20,10 +21,11 @@ CREATE TABLE IF NOT EXISTS api_models (
     provider     VARCHAR(32)  NOT NULL,            -- 'anthropic' | 'openai' | 'mistral' | 'ollama' 等
     model_name   VARCHAR(128) NOT NULL UNIQUE,     -- API 中使用的模型标识符
     display_name VARCHAR(128) NOT NULL,            -- 界面显示名称
-    -- 定价（元/1000字）；is_free=true 时忽略这两个字段
-    is_free                   BOOLEAN      NOT NULL DEFAULT false,
-    price_input_per_1k_chars  NUMERIC(10,4) NOT NULL DEFAULT 0 CHECK (price_input_per_1k_chars >= 0),
-    price_output_per_1k_chars NUMERIC(10,4) NOT NULL DEFAULT 0 CHECK (price_output_per_1k_chars >= 0),
+    -- 定价（元/1000 Token）；is_free=true 时忽略这两个字段
+    -- v5: 改为按 Token 计费（对齐上游 API 定价），旧按字符计费列保留兼容
+    is_free                    BOOLEAN      NOT NULL DEFAULT false,
+    price_input_per_1k_tokens  NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_input_per_1k_tokens >= 0),
+    price_output_per_1k_tokens NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_output_per_1k_tokens >= 0),
     -- 是否启用（false = 仅保留接口定义，用户不可选）
     is_active    BOOLEAN      NOT NULL DEFAULT true,
     description  TEXT,                             -- 管理员备注
@@ -37,7 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_api_models_active
 -- 预置模型（管理员可在运行时通过 POST /admin/models 增加更多）
 INSERT INTO api_models
     (provider, model_name, display_name, is_free,
-     price_input_per_1k_chars, price_output_per_1k_chars, is_active, description)
+     price_input_per_1k_tokens, price_output_per_1k_tokens, is_active, description)
 VALUES
     -- ── 免费模型 ──────────────────────────────────────────────
     ('anthropic', 'claude-haiku-4-5-20251001', 'Claude Haiku 4.5',
@@ -45,13 +47,13 @@ VALUES
 
     -- ── 付费模型（价格由管理员自行定义，以下仅为示例占位）─
     ('anthropic', 'claude-sonnet-4-5',         'Claude Sonnet 4.5',
-     false, 0.0300, 0.0600, true, '付费模型，请在部署后按实际成本调整价格'),
+     false, 0.0030, 0.0150, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
     ('openai',    'gpt-4o-mini',               'GPT-4o Mini',
-     false, 0.0015, 0.0030, true, '付费模型，请在部署后按实际成本调整价格'),
+     false, 0.000150, 0.000600, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
     ('openai',    'gpt-4o',                    'GPT-4o',
-     false, 0.0250, 0.0500, true, '付费模型，请在部署后按实际成本调整价格'),
+     false, 0.0025, 0.0100, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
     ('mistral',   'mistral-small-latest',      'Mistral Small',
-     false, 0.0020, 0.0060, true, '付费模型，请在部署后按实际成本调整价格'),
+     false, 0.000200, 0.000600, true, '付费模型，请在部署后按实际成本调整价格（元/1000 Token）'),
 
     -- ── 本地模型（保留接口，默认不启用）─────────────────────
     ('ollama', 'qwen2.5:7b-instruct-q4_K_M', 'Qwen 2.5 7B (本地)',
@@ -119,9 +121,9 @@ CREATE TABLE IF NOT EXISTS api_usage (
     api_provider    VARCHAR(32)   NOT NULL,
     model_name      VARCHAR(128)  NOT NULL,
     is_free         BOOLEAN       NOT NULL, -- 本次调用是否免费
-    -- 字数统计
-    input_chars     INT           NOT NULL DEFAULT 0,
-    output_chars    INT           NOT NULL DEFAULT 0,
+    -- Token 统计（v5: 使用 Tiktoken 计数，对齐上游 API 定价）
+    input_tokens    INT           NOT NULL DEFAULT 0,
+    output_tokens   INT           NOT NULL DEFAULT 0,
     -- 本次计费金额（分），0 = 免费
     charged_fen     NUMERIC(10,4) NOT NULL DEFAULT 0,
     -- 状态
@@ -195,13 +197,51 @@ SELECT
     am.model_name,
     am.display_name,
     COUNT(*)                AS calls_today,
-    SUM(au.input_chars)     AS total_input_chars,
-    SUM(au.output_chars)    AS total_output_chars,
+    SUM(au.input_tokens)    AS total_input_tokens,
+    SUM(au.output_tokens)   AS total_output_tokens,
     SUM(au.charged_fen)     AS total_charged_fen
 FROM api_usage au
 JOIN api_models am ON am.id = au.api_model_id
 WHERE au.created_at >= CURRENT_DATE
 GROUP BY am.provider, am.model_name, am.display_name;
+
+-- =============================================================
+-- 8. 最小权限角色（安全加固：服务专用角色）
+-- =============================================================
+
+-- 8-A. billing_svc：Webhook 计费服务专用角色
+-- 仅可操作计费相关表，不可修改 schema
+-- ⚠️ 部署时请通过 ALTER ROLE billing_svc PASSWORD 'xxx' 替换占位密码
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'billing_svc') THEN
+    CREATE ROLE billing_svc LOGIN PASSWORD 'CHANGE_ME_billing';
+  END IF;
+END
+$$;
+
+GRANT CONNECT ON DATABASE librechat TO billing_svc;
+GRANT USAGE ON SCHEMA public TO billing_svc;
+GRANT SELECT, INSERT, UPDATE ON TABLE user_billing, recharge_cards, api_usage, billing_transactions TO billing_svc;
+GRANT SELECT ON TABLE api_models TO billing_svc;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO billing_svc;
+
+-- 8-B. agent_svc：OpenClaw Agent 服务专用角色
+-- 仅可读取模型列表和写入用量记录，不可操作余额或卡密
+-- ⚠️ 部署时请通过 ALTER ROLE agent_svc PASSWORD 'xxx' 替换占位密码
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'agent_svc') THEN
+    CREATE ROLE agent_svc LOGIN PASSWORD 'CHANGE_ME_agent';
+  END IF;
+END
+$$;
+
+GRANT CONNECT ON DATABASE librechat TO agent_svc;
+GRANT USAGE ON SCHEMA public TO agent_svc;
+GRANT SELECT ON TABLE api_models TO agent_svc;
+GRANT SELECT, INSERT ON TABLE api_usage TO agent_svc;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO agent_svc;
 
 -- =============================================================
 -- 完成
