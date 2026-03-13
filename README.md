@@ -1013,9 +1013,10 @@ tail -100 /var/log/modsecurity/audit.log | grep -A5 '"id"'
 # 3. 重载 Nginx：systemctl reload nginx
 
 # 临时切换为仅检测模式（不拦截）
-sed -i 's/^SecRuleEngine On/SecRuleEngine DetectionOnly/' /etc/modsecurity/modsecurity.conf
+sed -i 's/^SecRuleEngine.*/SecRuleEngine DetectionOnly/' /etc/modsecurity/modsecurity.conf
 systemctl reload nginx
 # 排查完成后记得改回 On
+sed -i 's/^SecRuleEngine.*/SecRuleEngine On/' /etc/modsecurity/modsecurity.conf
 ```
 
 ### 查询 ADMIN_TOKEN
