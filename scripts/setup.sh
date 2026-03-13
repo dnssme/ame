@@ -143,6 +143,7 @@ SERVICE
 systemctl daemon-reload
 systemctl enable --now ai-webhook
 sleep 3
+ok "systemd 服务已创建并启动（ai-webhook）"
 
 # ─── 5. 验证 ──────────────────────────────────────────────────
 echo ""

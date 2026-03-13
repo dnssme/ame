@@ -86,6 +86,7 @@
 - [ ] 所有 VPS 节点已通过 **WireGuard** 组成 `172.16.1.0/24` 内网（各节点互通）
 - [ ] **Azure PostgreSQL** 已创建实例，已建 `librechat` 和 `openclaw` 两个数据库
 - [ ] 已为 `animaapp` 数据库用户分配两个数据库的所有权限
+- [ ] 已为 `animaapp` 用户授予 `azure_pg_admin` 角色（或在 Azure 门户 → 服务器参数中把 `pgcrypto` 和 `pg_stat_statements` 加入 `azure.extensions` 允许列表），否则 Schema 初始化中 `CREATE EXTENSION` 会报权限错误
 - [ ] 所有节点已完成基础安全加固（UFW / fail2ban）
 - [ ] VPS A 已申请域名 SSL 证书（见[第四步](#第四步vps-a--配置-nginx)）
 
@@ -151,7 +152,7 @@ bash scripts/setup.sh '<animaapp数据库密码>' '<Redis密码>' 'anima-db.post
 ✅ .env 已创建（ADMIN_TOKEN 已自动生成并写入）
 ⚠  请保存 ADMIN_TOKEN: a3f9e2b1c5d8...
 ✅ 数据库 Schema 初始化完成
-✅ systemd 服务已启动
+✅ systemd 服务已创建并启动（ai-webhook）
 ✅ Webhook 服务运行正常
 ```
 
@@ -387,7 +388,7 @@ curl -sI https://ai.example.com/ | grep -E "Strict|Content-Security|X-Frame"
 ### 5.1 查看当前所有模型
 
 ```bash
-ADMIN_TOKEN="$(grep ADMIN_TOKEN /opt/ai/webhook/.env | cut -d= -f2)"
+ADMIN_TOKEN="$(grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env | cut -d= -f2)"
 
 curl http://172.16.1.5:3002/admin/models \
   -H "Authorization: Bearer ${ADMIN_TOKEN}"
@@ -830,7 +831,7 @@ nginx -v
 ### 查询 ADMIN_TOKEN
 
 ```bash
-grep ADMIN_TOKEN /opt/ai/webhook/.env
+grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env
 ```
 
 ---

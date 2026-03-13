@@ -441,8 +441,9 @@ app.post('/billing/record', async (req, res) => {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
   }
   if (typeof inputChars !== 'number' || typeof outputChars !== 'number'
+      || !Number.isFinite(inputChars) || !Number.isFinite(outputChars)
       || inputChars < 0 || outputChars < 0) {
-    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为非负数字' });
+    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为有限的非负整数' });
   }
   if (!EMAIL_RE.test(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -626,8 +627,9 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
   if (typeof isFree !== 'boolean') {
     return res.status(400).json({ success: false, msg: 'isFree 必须为布尔值' });
   }
-  if (!isFree && (typeof priceInput !== 'number' || typeof priceOutput !== 'number')) {
-    return res.status(400).json({ success: false, msg: '付费模型必须提供 priceInput 和 priceOutput' });
+  if (!isFree && (typeof priceInput !== 'number' || typeof priceOutput !== 'number'
+        || !Number.isFinite(priceInput) || !Number.isFinite(priceOutput))) {
+    return res.status(400).json({ success: false, msg: '付费模型必须提供有限数值的 priceInput 和 priceOutput' });
   }
   if (!isFree && (priceInput < 0 || priceOutput < 0)) {
     // 应用层提前拦截，与 db/schema.sql 中 CHECK(>= 0) 约束互为防御
@@ -696,15 +698,15 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
     }
   }
   if (!isFree && typeof priceInput === 'number') {
-    if (priceInput < 0) {
-      return res.status(400).json({ success: false, msg: 'priceInput 必须为非负数' });
+    if (!Number.isFinite(priceInput) || priceInput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
     }
     updates.push(`price_input_per_1k_chars = $${values.length + 1}`);
     values.push(priceInput);
   }
   if (!isFree && typeof priceOutput === 'number') {
-    if (priceOutput < 0) {
-      return res.status(400).json({ success: false, msg: 'priceOutput 必须为非负数' });
+    if (!Number.isFinite(priceOutput) || priceOutput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceOutput 必须为有限的非负数' });
     }
     updates.push(`price_output_per_1k_chars = $${values.length + 1}`);
     values.push(priceOutput);
@@ -714,6 +716,9 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
     values.push(isActive);
   }
   if (typeof displayName === 'string') {
+    if (displayName.trim().length === 0) {
+      return res.status(400).json({ success: false, msg: 'displayName 不能为空' });
+    }
     updates.push(`display_name = $${values.length + 1}`);
     values.push(displayName);
   }
@@ -757,8 +762,8 @@ app.post('/admin/adjust', requireAdmin, async (req, res) => {
   if (!EMAIL_RE.test(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
-  if (typeof amount_fen !== 'number' || amount_fen === 0) {
-    return res.status(400).json({ success: false, msg: 'amount_fen 必须为非零数字' });
+  if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0) {
+    return res.status(400).json({ success: false, msg: 'amount_fen 必须为有限的非零数字' });
   }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
