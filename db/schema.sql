@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS user_billing (
     -- 余额（分），预付费模式
     balance_fen       NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (balance_fen >= 0),
     -- 累计消费（分），仅统计用
-    total_charged_fen NUMERIC(12,2) NOT NULL DEFAULT 0,
+    total_charged_fen NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total_charged_fen >= 0),
     -- 账户状态（管理员可暂停）
     is_suspended      BOOLEAN       NOT NULL DEFAULT false,
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS recharge_cards (
     id          BIGSERIAL     PRIMARY KEY,
     key         VARCHAR(64)   NOT NULL UNIQUE,
     -- 充值金额（分）
-    credit_fen  NUMERIC(12,2) NOT NULL,
+    credit_fen  NUMERIC(12,2) NOT NULL CHECK (credit_fen > 0),
     -- 管理员备注（如 "¥20 新用户体验包"）
     label       VARCHAR(128),
     used        BOOLEAN       NOT NULL DEFAULT false,
@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS billing_transactions (
     user_email        VARCHAR(254)  NOT NULL,
     type              VARCHAR(16)   NOT NULL CHECK (type IN ('charge','recharge','refund','admin_adjust')),
     amount_fen        NUMERIC(12,4) NOT NULL,
-    balance_after_fen NUMERIC(12,2) NOT NULL,
+    balance_after_fen NUMERIC(12,2) NOT NULL CHECK (balance_after_fen >= 0),
     description       TEXT,
     ref_id            VARCHAR(128), -- api_usage.id 或 recharge_cards.key
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()

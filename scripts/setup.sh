@@ -29,6 +29,8 @@ USAGE
 fi
 
 PG_PASSWORD="$1"
+# REDIS_PASSWORD 在此接受但 Webhook 服务本身不使用 Redis（Redis 由 LibreChat/OpenClaw 直接连接）。
+# 仍保留此参数以便在同一命令中记录两个密码，方便用户统一管理。
 REDIS_PASSWORD="$2"
 PG_HOST="${3:-anima-db.postgres.database.azure.com}"
 
@@ -104,7 +106,8 @@ PGPASSWORD="${PG_PASSWORD}" PGSSLMODE=require psql \
   -U animaapp \
   -d librechat \
   -f "${REPO_ROOT}/db/schema.sql" \
-  -v ON_ERROR_STOP=1
+  -v ON_ERROR_STOP=1 \
+  || { err "数据库 Schema 初始化失败，请检查 PG_PASSWORD / PG_HOST 及 Azure PostgreSQL 防火墙规则"; exit 1; }
 
 ok "数据库 Schema 初始化完成"
 

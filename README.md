@@ -17,6 +17,7 @@
 9. [API 接口完整参考](#api-接口完整参考)
 10. [常用运维 SQL](#常用运维-sql)
 11. [故障排查](#故障排查)
+12. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
 
 ---
 
@@ -90,6 +91,56 @@
 - [ ] 所有节点已完成基础安全加固（UFW / fail2ban）
 - [ ] VPS A 已申请域名 SSL 证书（见[第四步](#第四步vps-a--配置-nginx)）
 
+### 各节点 UFW 防火墙规则（CIS L1 要求）
+
+每台 VPS 在部署前先配置最小化防火墙规则，仅开放所需端口：
+
+```bash
+# ──────────────────────────────────────────
+# VPS A (172.16.1.1) — Nginx 公网入口
+# ──────────────────────────────────────────
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp       # SSH（若已配置 WireGuard 后可限制为内网 SSH）
+ufw allow 80/tcp       # HTTP（Let's Encrypt ACME 验证）
+ufw allow 443/tcp      # HTTPS
+ufw allow in on wg0    # WireGuard 内网流量全部放行
+ufw enable
+
+# ──────────────────────────────────────────
+# VPS B (172.16.1.2) — OpenClaw（内网专用）
+# ──────────────────────────────────────────
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow in from 172.16.1.0/24 to any port 3000  # 仅内网访问 OpenClaw
+ufw allow in on wg0
+ufw enable
+
+# ──────────────────────────────────────────
+# VPS C (172.16.1.3) — LibreChat（内网专用）
+# ──────────────────────────────────────────
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow in from 172.16.1.0/24 to any port 3080  # 仅内网访问 LibreChat
+ufw allow in on wg0
+ufw enable
+
+# ──────────────────────────────────────────
+# CXI4 (172.16.1.5) — Webhook / Redis（内网专用）
+# ──────────────────────────────────────────
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow in from 172.16.1.0/24 to any port 3002  # Webhook 计费服务
+ufw allow in from 172.16.1.0/24 to any port 6379  # Redis（禁止公网直连）
+ufw allow in on wg0
+ufw enable
+```
+
+> ⚠️ 执行 `ufw enable` 前确认 SSH 端口（22）已在规则中，否则会断开连接。
+
 ### 验证 WireGuard 内网互通
 
 ```bash
@@ -125,8 +176,8 @@ sed -i "s/^# requirepass .*/requirepass ${REDIS_PASS}/" /etc/redis/redis.conf
 systemctl enable --now redis-server
 systemctl restart redis-server
 
-# 验证
-redis-cli -h 172.16.1.5 -a "${REDIS_PASS}" ping
+# 验证（REDISCLI_AUTH 避免密码出现在进程列表 ps aux 中）
+REDISCLI_AUTH="${REDIS_PASS}" redis-cli -h 172.16.1.5 ping
 # 预期输出：PONG
 ```
 
@@ -343,6 +394,10 @@ nginx -t
 # 重载
 systemctl reload nginx
 ```
+
+> **注意**：`nginx/anima.conf` 已包含 `ssl_trusted_certificate /etc/letsencrypt/live/<你的域名>/chain.pem;`  
+> 该文件由 certbot 自动生成（`chain.pem` 为 Let's Encrypt 中间 CA 链），上方 `sed` 替换域名后即可正确指向该文件。  
+> 此指令与 `ssl_stapling_verify on` 配合，使 Nginx 能验证 OCSP 响应的签名（CIS TLS 配置要求）。
 
 ### 4.4 配置证书自动续期
 
@@ -833,6 +888,58 @@ nginx -v
 ```bash
 grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env
 ```
+
+### 轮换 ADMIN_TOKEN（PCI-DSS 8.6.3 建议定期轮换）
+
+```bash
+# 1. 生成新令牌
+NEW_TOKEN="$(openssl rand -hex 32)"
+
+# 2. 写入 .env（原子替换）
+sed -i "s/^ADMIN_TOKEN=.*/ADMIN_TOKEN=${NEW_TOKEN}/" /opt/ai/webhook/.env
+
+# 3. 重启服务使新令牌生效
+systemctl restart ai-webhook
+
+# 4. 验证（输出应为新令牌）
+grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env
+
+# 5. 用新令牌测试管理员接口
+curl http://172.16.1.5:3002/admin/models \
+  -H "Authorization: Bearer ${NEW_TOKEN}"
+```
+
+> ⚠️ 轮换后请同步更新使用该令牌的所有自动化脚本/监控工具。
+
+---
+
+## CIS / PCI-DSS 合规说明
+
+本系统在设计上对齐 CIS Controls v8 和 PCI-DSS v4.0 的核心控制项，下表列出关键映射：
+
+| 控制项 | CIS/PCI-DSS 要求 | 本系统实现 |
+|--------|-----------------|-----------|
+| 网络安全（CIS 12, PCI 1.x） | 最小化暴露面，分段网络 | 所有服务仅监听 WireGuard 内网；Nginx 为唯一公网入口；UFW 白名单规则 |
+| 传输加密（CIS 3, PCI 4.x） | 仅 TLS 1.2/1.3，强密码套件 | Nginx 仅启用 TLSv1.2/1.3；ECDHE 密码套件；HSTS（max-age=63072000） |
+| OCSP Stapling（CIS TLS） | 证书状态验证 | `ssl_stapling on; ssl_stapling_verify on; ssl_trusted_certificate` |
+| 安全配置（CIS 4, PCI 2.x） | 关闭默认服务/版本信息 | `server_tokens off`；`X-Powered-By` 已禁用；helmet 安全响应头 |
+| 访问控制（CIS 6, PCI 7.x） | 最小权限，强认证 | ADMIN_TOKEN 使用 `openssl rand -hex 32` 生成（256 位熵）；接口仅内网可达 |
+| 防暴力破解（PCI 8.3） | 速率限制，账户锁定 | 激活接口 5 次/10 分；全局 60 次/分；Express rate-limit |
+| 令牌安全（PCI 8.3.6, 8.6.3） | 令牌最小长度；定期轮换 | 启动时检查 ADMIN_TOKEN ≥ 32 字符；提供轮换操作步骤 |
+| 防计时攻击（PCI 6.3.2） | 定时安全比较 | `crypto.timingSafeEqual()` 用于 ADMIN_TOKEN 比较 |
+| 输入验证（CIS 16, PCI 6.4） | 拒绝非法输入 | 所有接口校验类型/范围/格式；`Number.isFinite()`；邮箱正则 |
+| SQL 注入防护（PCI 6.4） | 参数化查询 | 全部 DB 操作使用 `$1,$2,...` 参数化查询，无字符串拼接 |
+| 并发安全（PCI 6.4） | 防 TOCTOU/竞态 | 充值激活使用 `SELECT ... FOR UPDATE` 行锁；余额扣减使用事务 |
+| 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | Winston 记录所有关键操作；日志文件 10 MB 自动轮替，保留 5 份 |
+| 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
+| 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
+
+### 已知合规说明（可接受风险）
+
+| 项目 | 说明 |
+|------|------|
+| CSP `'unsafe-inline'` | LibreChat 前端需要内联脚本/样式；已通过其他 CSP 指令（`object-src 'none'`、`base-uri 'self'`）降低风险 |
+| 无 WAF | 内部系统，依赖 UFW + Nginx 速率限制；如需 PCI 合规，建议在公网层增加 WAF（如 Cloudflare） |
 
 ---
 

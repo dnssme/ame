@@ -33,6 +33,7 @@
  *   · 管理员接口通过 ADMIN_TOKEN 环境变量保护
  */
 
+const crypto    = require('crypto');
 const express   = require('express');
 const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -101,13 +102,29 @@ const activateLimiter = rateLimit({
 // ─── 管理员鉴权中间件 ─────────────────────────────────────────
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
+/**
+ * 定时安全的字符串比较，防止计时攻击（PCI-DSS 6.3.2 / CIS）。
+ * 对不同长度的输入补齐后再比较，保持固定时间路径，不泄露任何信息。
+ */
+function safeCompare(a, b) {
+  const aBuf = Buffer.from(typeof a === 'string' ? a : '');
+  const bBuf = Buffer.from(typeof b === 'string' ? b : '');
+  // 补齐到相同长度后比较，确保长度不同时同样走固定时间路径
+  const len = Math.max(aBuf.length, bBuf.length);
+  const paddedA = Buffer.concat([aBuf, Buffer.alloc(len - aBuf.length)]);
+  const paddedB = Buffer.concat([bBuf, Buffer.alloc(len - bBuf.length)]);
+  const equal = crypto.timingSafeEqual(paddedA, paddedB);
+  // 长度不同时即使字节相同（补零填充）也视为不等
+  return equal && aBuf.length === bBuf.length;
+}
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
     return res.status(503).json({ success: false, msg: '管理员接口未启用（未设置 ADMIN_TOKEN）' });
   }
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (token !== ADMIN_TOKEN) {
+  if (!safeCompare(token, ADMIN_TOKEN)) {
     return res.status(401).json({ success: false, msg: '未授权' });
   }
   next();
@@ -442,6 +459,7 @@ app.post('/billing/record', async (req, res) => {
   }
   if (typeof inputChars !== 'number' || typeof outputChars !== 'number'
       || !Number.isFinite(inputChars) || !Number.isFinite(outputChars)
+      || !Number.isInteger(inputChars) || !Number.isInteger(outputChars)
       || inputChars < 0 || outputChars < 0) {
     return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为有限的非负整数' });
   }
@@ -833,6 +851,9 @@ const server = app.listen(PORT, HOST, () => {
   logger.info(`Webhook 服务已启动 http://${HOST}:${PORT}`);
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
+  } else if (ADMIN_TOKEN.length < 32) {
+    // PCI-DSS 8.3.6：令牌长度至少 32 字节（64 个十六进制字符）
+    logger.warn('ADMIN_TOKEN 过短（< 32 字符），建议执行 openssl rand -hex 32 重新生成');
   }
 });
 
