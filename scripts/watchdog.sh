@@ -62,7 +62,7 @@ restart_service() {
 
 # ─── 单次检查模式（适合 cron）─────────────────────────────────
 if [[ "${1:-}" == "--once" ]]; then
-  FAIL_COUNT_FILE="/tmp/anima-watchdog-failures"
+  FAIL_COUNT_FILE="${FAIL_COUNT_FILE:-/var/tmp/anima-watchdog-failures}"
   fail_count=0
   if [[ -f "${FAIL_COUNT_FILE}" ]]; then
     fail_count=$(cat "${FAIL_COUNT_FILE}" 2>/dev/null || echo 0)

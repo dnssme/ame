@@ -219,7 +219,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 ```
 .
 ├── db/
-│   └── schema.sql           # PostgreSQL Schema（v4）
+│   └── schema.sql           # PostgreSQL Schema（v5: 按 Token 计费）
 ├── webhook/
 │   ├── package.json         # Node.js 依赖
 │   └── server.js            # Webhook 计费服务（11 个接口）
@@ -252,7 +252,8 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── README.md            # 完整 APP 方案对比与适配指南
 │   └── app_config.json      # APP 后端 API 配置模板
 └── scripts/
-    └── setup.sh             # CXI4 一键初始化脚本
+    ├── setup.sh             # CXI4 一键初始化脚本
+    └── watchdog.sh          # Webhook 健康检查看门狗
 ```
 
 ---
@@ -263,7 +264,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 |------|------|
 | **按模型独立定价** | 每个 API 模型在 `api_models` 表中单独设定价格，无套餐绑定 |
 | **免费模型** | `is_free=true` 的模型（如 `claude-haiku-4-5-20251001`）永久免费，不扣余额 |
-| **付费模型** | 仅在实际使用时扣费：`⌈(输入字数/1000 × 输入价格) + (输出字数/1000 × 输出价格)⌉` 分 |
+| **付费模型** | 仅在实际使用时按 Token 扣费：`⌈(输入Token/1000 × 输入价格) + (输出Token/1000 × 输出价格)⌉` 分（v5: 基于 Tiktoken 计数，对齐上游 API 定价） |
 | **预付费** | 用户充值后使用；余额不足时系统返回 HTTP 402 拒绝调用 |
 | **本地模型** | Ollama 模型 `is_active=false`，接口定义保留但拒绝所有计费请求 |
 

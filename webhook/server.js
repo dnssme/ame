@@ -164,7 +164,10 @@ async function ensureUser(client, userEmail) {
 }
 
 // ─── Tiktoken 编码器缓存 ──────────────────────────────────────
+// 缓存大小有限：tiktoken 仅有少量编码（cl100k_base, p50k_base, o200k_base 等），
+// 且模型名会映射到这些编码之一，因此缓存不会无限增长。
 const encoderCache = new Map();
+// cl100k_base 覆盖 GPT-4 / GPT-3.5-turbo / Claude 等主流模型族
 const FALLBACK_ENCODING = 'cl100k_base';
 
 /**
@@ -521,8 +524,14 @@ app.post('/billing/record', async (req, res) => {
           inputChars, outputChars } = req.body ?? {};
 
   // v5: 优先使用 inputTokens/outputTokens，向后兼容 inputChars/outputChars
+  // 注意：若调用方仍传 inputChars/outputChars，值会被当作 Token 数使用；
+  // 调用方应尽快迁移到传 Token 数（Tiktoken 计数），以获得准确计费。
   const inputTokens  = rawInputTokens  ?? inputChars  ?? 0;
   const outputTokens = rawOutputTokens ?? outputChars ?? 0;
+
+  if (rawInputTokens == null && inputChars != null) {
+    logger.warn('billing/record: 调用方使用旧版 inputChars 字段，请迁移到 inputTokens', { userEmail, modelName });
+  }
 
   if (!userEmail || !apiProvider || !modelName) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });

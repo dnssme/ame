@@ -63,8 +63,9 @@ const sessionCleanupTimer = setInterval(() => {
 
 // ─── Agent API 调用 ──────────────────────────────────────────
 
-/** 标记长耗时任务类型（web-search / file-analysis） */
-const LONG_RUNNING_KEYWORDS = ['搜索', '搜一下', '查一下', '帮我搜', 'search', '分析文件', '分析一下', '看看这个文件', 'analyze'];
+/** 标记长耗时任务类型（web-search / file-analysis），可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
+const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 function isLongRunningTask(message) {
   const lower = message.toLowerCase();

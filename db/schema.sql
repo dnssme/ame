@@ -211,6 +211,7 @@ GROUP BY am.provider, am.model_name, am.display_name;
 
 -- 8-A. billing_svc：Webhook 计费服务专用角色
 -- 仅可操作计费相关表，不可修改 schema
+-- ⚠️ 部署时请通过 ALTER ROLE billing_svc PASSWORD 'xxx' 替换占位密码
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'billing_svc') THEN
@@ -227,6 +228,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO billing_svc;
 
 -- 8-B. agent_svc：OpenClaw Agent 服务专用角色
 -- 仅可读取模型列表和写入用量记录，不可操作余额或卡密
+-- ⚠️ 部署时请通过 ALTER ROLE agent_svc PASSWORD 'xxx' 替换占位密码
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'agent_svc') THEN
