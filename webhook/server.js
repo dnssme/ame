@@ -472,6 +472,9 @@ app.post('/billing/record', async (req, res) => {
       || inputChars < 0 || outputChars < 0) {
     return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为有限的非负整数' });
   }
+  if (inputChars > 10_000_000 || outputChars > 10_000_000) {
+    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 单次上限为 10,000,000 字符' });
+  }
   if (!EMAIL_RE.test(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
@@ -754,6 +757,9 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
   if (typeof displayName === 'string') {
     if (displayName.trim().length === 0) {
       return res.status(400).json({ success: false, msg: 'displayName 不能为空' });
+    }
+    if (displayName.length > 128) {
+      return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 128 字符' });
     }
     updates.push(`display_name = $${values.length + 1}`);
     values.push(displayName);
