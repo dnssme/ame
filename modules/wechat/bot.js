@@ -53,7 +53,7 @@ function getSession(userId) {
 }
 
 // 定期清理过期会话（防止内存泄漏）
-setInterval(() => {
+const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
     if (now - session.lastActive >= SESSION_TTL) {
@@ -183,6 +183,7 @@ bot.start()
 // ─── 优雅退出 ────────────────────────────────────────────────
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭...`);
+  clearInterval(sessionCleanupTimer);
   bot.stop()
     .then(() => {
       healthServer.close();
