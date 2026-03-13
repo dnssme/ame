@@ -380,6 +380,9 @@ app.post('/billing/check', async (req, res) => {
   if (!modelName) {
     return res.status(400).json({ success: false, msg: '缺少 modelName' });
   }
+  if (typeof modelName !== 'string' || modelName.length > 128) {
+    return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
+  }
 
   // DB 错误单独捕获，避免与"模型不存在"混淆
   let model;
@@ -457,11 +460,20 @@ app.post('/billing/record', async (req, res) => {
   if (!userEmail || !apiProvider || !modelName) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
   }
+  if (typeof apiProvider !== 'string' || apiProvider.length > 32) {
+    return res.status(400).json({ success: false, msg: 'apiProvider 长度不能超过 32 字符' });
+  }
+  if (typeof modelName !== 'string' || modelName.length > 128) {
+    return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
+  }
   if (typeof inputChars !== 'number' || typeof outputChars !== 'number'
       || !Number.isFinite(inputChars) || !Number.isFinite(outputChars)
       || !Number.isInteger(inputChars) || !Number.isInteger(outputChars)
       || inputChars < 0 || outputChars < 0) {
     return res.status(400).json({ success: false, msg: 'inputChars/outputChars 必须为有限的非负整数' });
+  }
+  if (inputChars > 10_000_000 || outputChars > 10_000_000) {
+    return res.status(400).json({ success: false, msg: 'inputChars/outputChars 单次上限为 10,000,000 字符' });
   }
   if (!EMAIL_RE.test(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -642,6 +654,15 @@ app.post('/admin/models', requireAdmin, async (req, res) => {
   if (!provider || !modelName || !displayName) {
     return res.status(400).json({ success: false, msg: '缺少必填字段：provider、modelName、displayName' });
   }
+  if (typeof provider !== 'string' || provider.length > 32) {
+    return res.status(400).json({ success: false, msg: 'provider 长度不能超过 32 字符' });
+  }
+  if (typeof modelName !== 'string' || modelName.length > 128) {
+    return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
+  }
+  if (typeof displayName !== 'string' || displayName.length > 128) {
+    return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 128 字符' });
+  }
   if (typeof isFree !== 'boolean') {
     return res.status(400).json({ success: false, msg: 'isFree 必须为布尔值' });
   }
@@ -736,6 +757,9 @@ app.put('/admin/models/:id', requireAdmin, async (req, res) => {
   if (typeof displayName === 'string') {
     if (displayName.trim().length === 0) {
       return res.status(400).json({ success: false, msg: 'displayName 不能为空' });
+    }
+    if (displayName.length > 128) {
+      return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 128 字符' });
     }
     updates.push(`display_name = $${values.length + 1}`);
     values.push(displayName);

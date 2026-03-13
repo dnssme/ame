@@ -91,9 +91,23 @@
 - [ ] 所有节点已完成基础安全加固（UFW / fail2ban）
 - [ ] VPS A 已申请域名 SSL 证书（见[第四步](#第四步vps-a--配置-nginx)）
 
+### 硬件规格与资源分配
+
+| 节点 | 角色 | CPU | 内存 | 存储 | 容器/服务内存 | 系统预留 |
+|------|------|-----|------|------|--------------|---------|
+| **VPS A** (172.16.1.1) | Nginx 反向代理 | 2 核 | 1 GB | — | Nginx ~50 MB | ~950 MB 系统 |
+| **VPS B** (172.16.1.2) | OpenClaw Agent | 2 核 | 1 GB | — | 容器 ≤600 MB | ~400 MB 系统 |
+| **VPS C** (172.16.1.3) | LibreChat | 2 核 | 1 GB | — | 容器 ≤768 MB | ~256 MB 系统 |
+| **VPS D** (172.16.1.4) | Nextcloud（可选） | 2 核 | 1 GB | — | — | — |
+| **CXI4** (172.16.1.5) | Webhook + Redis + Whisper | 4 核 8 线程 (i5-10610U) | 8 GB | 500 GB | Webhook ~256 MB / Redis ≤1 GB / Whisper ~2 GB | ~4 GB 系统 |
+
+> ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 768m、OpenClaw 设为 600m，均已在 `docker-compose.yml` 中配置。
+
 ### 各节点 UFW 防火墙规则（CIS L1 要求）
 
 每台 VPS 在部署前先配置最小化防火墙规则，仅开放所需端口：
+
+> ⚠️ 每台节点还需开放 WireGuard 监听的 UDP 端口（默认 51820）：`ufw allow 51820/udp`，否则 `default deny incoming` 会阻断 VPN 隧道。
 
 ```bash
 # ──────────────────────────────────────────
@@ -180,6 +194,15 @@ systemctl restart redis-server
 REDISCLI_AUTH="${REDIS_PASS}" redis-cli -h 172.16.1.5 ping
 # 预期输出：PONG
 ```
+
+> ⚠️ **Redis 内存限制（CXI4 共 8 GB，需为 Webhook / Whisper 预留内存）**：
+> ```bash
+> # 设置 Redis 最大内存为 1 GB，超出后按 LRU 策略淘汰
+> echo 'maxmemory 1gb' >> /etc/redis/redis.conf
+> echo 'maxmemory-policy allkeys-lru' >> /etc/redis/redis.conf
+> systemctl restart redis-server
+> ```
+> 未设置 `maxmemory` 时，Redis 可能占满全部可用内存导致系统 OOM Kill。
 
 ### 1.2 克隆仓库
 
@@ -377,6 +400,14 @@ ls /etc/letsencrypt/live/${DOMAIN}/
 ```
 
 ### 4.3 部署 Nginx 配置
+
+> ⚠️ **Worker 进程数**：VPS A 为双核 CPU，请确认 `/etc/nginx/nginx.conf` 主配置中设置了 `worker_processes auto;`（默认值为 1，会浪费一个 CPU 核心）：
+> ```bash
+> # 确认或修改（该指令在 main 上下文，不在 http{} 中）
+> grep -n 'worker_processes' /etc/nginx/nginx.conf
+> # 如显示 "worker_processes 1;"，则改为：
+> sed -i 's/^worker_processes.*/worker_processes auto;/' /etc/nginx/nginx.conf
+> ```
 
 ```bash
 DOMAIN="ai.example.com"   # 与上面相同
@@ -927,13 +958,14 @@ curl http://172.16.1.5:3002/admin/models \
 | 防暴力破解（PCI 8.3） | 速率限制，账户锁定 | 激活接口 5 次/10 分；全局 60 次/分；Express rate-limit |
 | 令牌安全（PCI 8.3.6, 8.6.3） | 令牌最小长度；定期轮换 | 启动时检查 ADMIN_TOKEN ≥ 32 字符；提供轮换操作步骤 |
 | 防计时攻击（PCI 6.3.2） | 定时安全比较 | `crypto.timingSafeEqual()` 用于 ADMIN_TOKEN 比较 |
-| 输入验证（CIS 16, PCI 6.4） | 拒绝非法输入 | 所有接口校验类型/范围/格式；`Number.isFinite()`；邮箱正则 |
+| 输入验证（CIS 16, PCI 6.4） | 拒绝非法输入 | 所有接口校验类型/范围/格式；字符串长度匹配 DB VARCHAR 约束；字符数上限 10M；`Number.isFinite()`；邮箱正则 |
 | SQL 注入防护（PCI 6.4） | 参数化查询 | 全部 DB 操作使用 `$1,$2,...` 参数化查询，无字符串拼接 |
 | 并发安全（PCI 6.4） | 防 TOCTOU/竞态 | 充值激活使用 `SELECT ... FOR UPDATE` 行锁；余额扣减及管理员调整均使用事务 + 行锁 |
 | 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | Winston 记录所有关键操作；日志文件 10 MB 自动轮替，保留 5 份 |
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
-| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制；JSON 日志轮替 |
+| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 600m）；JSON 日志轮替 |
+| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配 1 GB VPS；Redis `maxmemory 1gb` + LRU 淘汰策略；Nginx `worker_processes auto` |
 | 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | Nginx 显式阻断 `/health`、`/billing`、`/admin` 路径；内部端口不暴露公网 |
 
 ### 已知合规说明（可接受风险）

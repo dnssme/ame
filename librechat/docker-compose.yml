@@ -11,9 +11,9 @@ services:
     container_name: librechat
     restart: unless-stopped
 
-    # 内存限制（VPS C 专用 LibreChat，预留系统 512 MB）
-    mem_limit: 1g
-    mem_reservation: 512m
+    # 内存限制（VPS C 双核 1 GB RAM，需预留 ~256 MB 给 Linux 内核及系统服务）
+    mem_limit: 768m
+    mem_reservation: 384m
 
     # 安全加固
     security_opt:
