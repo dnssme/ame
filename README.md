@@ -13,15 +13,16 @@
 5. [架构概览](#架构概览)
 6. [计费规则](#计费规则)
 7. [前置条件](#前置条件)
-8. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
-9. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
-10. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
-11. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
-12. [第五步：初始化模型定价](#第五步初始化模型定价)
-13. [API 接口完整参考](#api-接口完整参考)
-14. [常用运维 SQL](#常用运维-sql)
-15. [故障排查](#故障排查)
-16. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
+8. [各服务器详细部署教程](#各服务器详细部署教程)
+9. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
+10. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
+11. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
+12. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
+13. [第五步：初始化模型定价](#第五步初始化模型定价)
+14. [API 接口完整参考](#api-接口完整参考)
+15. [常用运维 SQL](#常用运维-sql)
+16. [故障排查](#故障排查)
+17. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
 
 ---
 
@@ -1256,6 +1257,21 @@ curl http://172.16.1.5:3002/admin/models \
 |------|------|
 | CSP `'unsafe-inline'` | LibreChat 前端需要内联脚本/样式；已通过其他 CSP 指令（`object-src 'none'`、`base-uri 'self'`）降低风险 |
 | AI 对话内容 WAF 排除 | AI 聊天的用户输入文本字段（text/content/message）排除了 SQLi/XSS/RCE 检测，因用户可能合法讨论代码；请求 URL 和 Header 仍受完整保护 |
+
+---
+
+## 各服务器详细部署教程
+
+每台服务器均提供独立的详细部署文档，涵盖 **OS 基线加固（CIS L1）、服务安装、CIS 合规核查清单、PCI-DSS 合规核查清单以及逐项功能测试**：
+
+| 节点 | 角色 | 详细文档 |
+|------|------|---------|
+| **VPS A** (172.16.1.1) | Nginx 反向代理 + ModSecurity WAF | [docs/deploy-vpsa.md](docs/deploy-vpsa.md) |
+| **VPS B** (172.16.1.2) | OpenClaw Agent + 可选 Bot 模块 | [docs/deploy-vpsb.md](docs/deploy-vpsb.md) |
+| **VPS C** (172.16.1.3) | LibreChat Web UI | [docs/deploy-vpsc.md](docs/deploy-vpsc.md) |
+| **CXI4** (172.16.1.5) | Webhook 计费 + Redis + 可选 Whisper | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
+
+**推荐部署顺序：** CXI4 → VPS C → VPS B → VPS A
 
 ---
 
