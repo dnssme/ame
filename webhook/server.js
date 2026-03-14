@@ -82,7 +82,6 @@ db.on('error', (err) => logger.error('DB pool error', { err: err.message }));
 const app = express();
 
 app.use(helmet());
-app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
 // 全局限速：60 次/分
