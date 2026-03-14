@@ -103,9 +103,7 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 # 忽略伪造错误包
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-# 禁用 IPv6（如不需要）
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
+# CXI4 有公网 IPv6，保留 IPv6 支持（不禁用）
 
 # ── 内核加固 (CIS 1.x) ──────────────────────────────────
 # 防止 core dump 泄露（CIS 1.6.1）
@@ -178,11 +176,14 @@ chmod 640 /var/log/auth.log
 # 安装 UFW
 apt-get install -y ufw
 
+# CXI4 有公网 IPv6，确保 UFW 同时管理 IPv4 和 IPv6 规则
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+
 # 默认拒绝入站，允许出站
 ufw default deny incoming
 ufw default allow outgoing
 
-# 允许 SSH
+# 允许 SSH（IPv4 + IPv6）
 ufw allow 22/tcp
 
 # 允许 WireGuard UDP
@@ -219,27 +220,29 @@ chmod 600 /etc/wireguard/privatekey
 cat /etc/wireguard/publickey   # 记录此公钥，需与其他节点配置
 
 # 创建 WireGuard 配置（替换 <私钥> 和各节点 <公钥>/<端点>）
+# 注意：CXI4 公网 IP 为动态 IP，因此 CXI4 必须主动连接到固定 IP 的对端节点。
+# 其他节点的配置中不设置 CXI4 的 Endpoint，由 CXI4 通过 PersistentKeepalive 主动维持隧道。
 cat > /etc/wireguard/wg0.conf <<'EOF'
 [Interface]
 PrivateKey = <CXI4私钥>
 Address    = 172.16.1.5/24
 ListenPort = 51820
 
-# VPS A (172.16.1.1)
+# VPS A (172.16.1.1) — 固定公网 IP，CXI4 主动连接
 [Peer]
 PublicKey  = <VPS A 公钥>
 AllowedIPs = 172.16.1.1/32
 Endpoint   = <VPS A 公网IP>:51820
 PersistentKeepalive = 25
 
-# VPS B (172.16.1.2)
+# VPS B (172.16.1.2) — 固定公网 IP，CXI4 主动连接
 [Peer]
 PublicKey  = <VPS B 公钥>
 AllowedIPs = 172.16.1.2/32
 Endpoint   = <VPS B 公网IP>:51820
 PersistentKeepalive = 25
 
-# VPS C (172.16.1.3)
+# VPS C (172.16.1.3) — 固定公网 IP，CXI4 主动连接
 [Peer]
 PublicKey  = <VPS C 公钥>
 AllowedIPs = 172.16.1.3/32

@@ -77,8 +77,7 @@ net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
+# VPS B 有公网 IPv6，保留 IPv6 支持（不禁用）
 fs.suid_dumpable = 0
 kernel.randomize_va_space = 2
 kernel.dmesg_restrict = 1
@@ -121,10 +120,13 @@ systemctl enable --now fail2ban
 ```bash
 apt-get install -y ufw
 
+# VPS B 有公网 IPv6，确保 UFW 同时管理 IPv4 和 IPv6 规则
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+
 ufw default deny incoming
 ufw default allow outgoing
 
-# SSH
+# SSH（IPv4 + IPv6）
 ufw allow 22/tcp
 # WireGuard
 ufw allow 51820/udp
@@ -167,9 +169,10 @@ PersistentKeepalive = 25
 
 [Peer]
 # CXI4 (172.16.1.5) — Webhook 计费 + Redis
+# 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
+# CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
 PublicKey  = <CXI4 公钥>
 AllowedIPs = 172.16.1.5/32
-Endpoint   = <CXI4 公网IP>:51820
 PersistentKeepalive = 25
 EOF
 

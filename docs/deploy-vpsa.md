@@ -87,9 +87,7 @@ net.ipv4.conf.default.rp_filter = 1
 # SYN Flood 防护
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
-# 禁用 IPv6（如不使用）
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
+# VPS A 有公网 IPv6，保留 IPv6 支持（不禁用）
 # 内核加固
 fs.suid_dumpable = 0
 kernel.randomize_va_space = 2
@@ -142,16 +140,19 @@ fail2ban-client status
 ```bash
 apt-get install -y ufw
 
+# VPS A 有公网 IPv6，确保 UFW 同时管理 IPv4 和 IPv6 规则
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+
 ufw default deny incoming
 ufw default allow outgoing
 
-# SSH
+# SSH（IPv4 + IPv6）
 ufw allow 22/tcp
 # WireGuard
 ufw allow 51820/udp
-# HTTP（Let's Encrypt ACME 验证 + HTTP→HTTPS 跳转）
+# HTTP（Let's Encrypt ACME 验证 + HTTP→HTTPS 跳转，IPv4 + IPv6）
 ufw allow 80/tcp
-# HTTPS（用户访问入口）
+# HTTPS（用户访问入口，IPv4 + IPv6）
 ufw allow 443/tcp
 # Coqui TTS（如在 VPS A 本机运行语音合成服务，按需开启）
 # ufw allow in from 172.16.1.0/24 to any port 8082
@@ -195,9 +196,10 @@ PersistentKeepalive = 25
 
 [Peer]
 # CXI4 (172.16.1.5) — Webhook + Redis
+# 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
+# CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
 PublicKey  = <CXI4 公钥>
 AllowedIPs = 172.16.1.5/32
-Endpoint   = <CXI4 公网IP>:51820
 PersistentKeepalive = 25
 EOF
 
