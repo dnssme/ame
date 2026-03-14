@@ -5,8 +5,6 @@
 #   轻量启动：docker compose --profile lightweight up -d
 #     轻量 profile 限制核心服务总内存 ≤ 768 MB（适合 1 GB VPS）
 # =============================================================
-version: '3.8'
-
 services:
   # ─── LibreChat Web UI ──────────────────────────────────────
   librechat:
