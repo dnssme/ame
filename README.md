@@ -403,13 +403,26 @@ git clone https://github.com/dnssme/ame.git /opt/ai/repo
 
 ```bash
 # 检查是否已安装 Node.js 20
-node --version 2>/dev/null | grep -q '^v20' && echo "Node.js 20 已安装，跳过" || {
-  apt-get update -qq
+if node --version 2>/dev/null | grep -q '^v20'; then
+  echo "Node.js 20 已安装，跳过"
+else
+  # 手动添加 NodeSource 官方软件源（不执行管道脚本 — CIS 2.1.x / PCI-DSS 6.3.x 合规）
   apt-get install -y ca-certificates curl gnupg
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  mkdir -p /etc/apt/keyrings
+
+  # 导入 NodeSource GPG 签名密钥（验证软件包完整性）
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  chmod 644 /etc/apt/keyrings/nodesource.gpg
+
+  # 添加软件源（使用 signed-by 确保每个包都经 GPG 验证）
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list
+
+  apt-get update
   apt-get install -y nodejs
   echo "Node.js $(node --version) 安装完成"
-}
+fi
 ```
 
 ### 1.4 部署 Webhook 服务目录
@@ -649,24 +662,96 @@ curl -sf http://172.16.1.2:3000/health
 
 ### 4.1 安装 Nginx + ModSecurity + OWASP CRS
 
-使用自动安装脚本（编译安装 Nginx + ModSecurity v3 + OWASP CRS v4）：
+手动编译安装 Nginx + ModSecurity v3 + OWASP CRS v4（不执行第三方脚本 — CIS 2.1.x / PCI-DSS 6.3.x 合规），安装路径：`/opt/nginx/`、`/opt/owasp/owasp-rules/`。
+
+> ⏱️ 编译耗时约 10–20 分钟
+
+#### 安装编译依赖
 
 ```bash
-# 下载并执行 Nginx 安装脚本
-# 该脚本将安装至以下路径：
-#   · Nginx:        /opt/nginx/
-#   · ModSecurity:  /opt/nginx/src/ModSecurity/
-#   · OWASP CRS:    /opt/owasp/owasp-rules/
-#   · WAF 入口配置: /opt/owasp/conf/main.conf
-wget -O /tmp/nginx-install.sh \
-  https://raw.githubusercontent.com/mzwrt/system_script/refs/heads/main/nginx/nginx-install.sh
-chmod +x /tmp/nginx-install.sh
-bash /tmp/nginx-install.sh
+apt-get install -y \
+  build-essential git automake autoconf libtool pkg-config \
+  libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev \
+  libxml2-dev libxslt1-dev libyajl-dev libgeoip-dev \
+  libgd-dev liblmdb-dev libcurl4-openssl-dev
+```
 
-# 创建 WAF 审计日志目录
+#### 编译 ModSecurity v3
+
+```bash
+mkdir -p /opt/nginx/src
+git clone --depth 1 -b v3/master \
+  https://github.com/SpiderLabs/ModSecurity.git \
+  /opt/nginx/src/ModSecurity
+cd /opt/nginx/src/ModSecurity
+git submodule init && git submodule update
+./build.sh && ./configure
+make -j"$(nproc)" && make install
+```
+
+#### 下载 ModSecurity-nginx 连接器
+
+```bash
+git clone --depth 1 \
+  https://github.com/SpiderLabs/ModSecurity-nginx.git \
+  /opt/nginx/src/ModSecurity-nginx
+```
+
+#### 编译 Nginx（带 ModSecurity 模块）
+
+```bash
+NGINX_VER="1.26.3"
+cd /tmp
+curl -fsSL "https://nginx.org/download/nginx-${NGINX_VER}.tar.gz" \
+  -o "nginx-${NGINX_VER}.tar.gz"
+tar xzf "nginx-${NGINX_VER}.tar.gz"
+cd "nginx-${NGINX_VER}"
+./configure \
+  --prefix=/opt/nginx \
+  --sbin-path=/opt/nginx/sbin/nginx \
+  --conf-path=/opt/nginx/conf/nginx.conf \
+  --pid-path=/opt/nginx/logs/nginx.pid \
+  --error-log-path=/opt/nginx/logs/error.log \
+  --http-log-path=/opt/nginx/logs/access.log \
+  --with-http_ssl_module \
+  --with-http_v2_module \
+  --with-http_realip_module \
+  --with-http_gzip_static_module \
+  --with-http_stub_status_module \
+  --add-module=/opt/nginx/src/ModSecurity-nginx
+make -j"$(nproc)" && make install
+# 确认 Worker 进程数为 auto（双核以上推荐）
+sed -i 's/^worker_processes.*/worker_processes auto;/' /opt/nginx/conf/nginx.conf
+```
+
+#### 下载 OWASP CRS v4
+
+```bash
+CRS_VER="4.8.0"
+mkdir -p /opt/owasp
+cd /opt/owasp
+curl -fsSL \
+  "https://github.com/coreruleset/coreruleset/archive/refs/tags/v${CRS_VER}.tar.gz" \
+  -o "coreruleset-${CRS_VER}.tar.gz"
+tar xzf "coreruleset-${CRS_VER}.tar.gz"
+mv "coreruleset-${CRS_VER}" owasp-rules
+cp /opt/owasp/owasp-rules/crs-setup.conf.example \
+   /opt/owasp/owasp-rules/crs-setup.conf
+```
+
+#### 创建目录结构并验证
+
+```bash
+mkdir -p /opt/owasp/conf /opt/nginx/conf/conf.d /var/www/certbot
 mkdir -p /www/wwwlogs/owasp
 chown root:root /www/wwwlogs/owasp
 chmod 700 /www/wwwlogs/owasp
+
+# 验证安装
+/opt/nginx/sbin/nginx -v
+# 预期：nginx version: nginx/1.26.3
+/opt/nginx/sbin/nginx -V 2>&1 | grep -o 'ModSecurity\|ngx_http_modsecurity'
+# 预期：含 ModSecurity 字样
 ```
 
 ### 4.2 申请 SSL 证书（Let's Encrypt）

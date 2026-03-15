@@ -371,13 +371,26 @@ chmod 750 /opt/ai/repo
 
 ```bash
 # 检查是否已安装 Node.js 20
-node --version 2>/dev/null | grep -q '^v20' && echo "Node.js 20 已安装，跳过" || {
-  apt-get update -qq
+if node --version 2>/dev/null | grep -q '^v20'; then
+  echo "Node.js 20 已安装，跳过"
+else
+  # 手动添加 NodeSource 官方软件源（不执行管道脚本 — CIS 2.1.x / PCI-DSS 6.3.x 合规）
   apt-get install -y ca-certificates curl gnupg
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  mkdir -p /etc/apt/keyrings
+
+  # 导入 NodeSource GPG 签名密钥（验证软件包完整性）
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  chmod 644 /etc/apt/keyrings/nodesource.gpg
+
+  # 添加软件源（使用 signed-by 确保每个包都经 GPG 验证）
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list
+
+  apt-get update
   apt-get install -y nodejs
   echo "Node.js $(node --version) 安装完成"
-}
+fi
 ```
 
 ### 6.3 部署 Webhook 服务目录
