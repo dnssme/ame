@@ -38,6 +38,7 @@ if (!BOT_TOKEN) {
 // ─── 会话上下文 ──────────────────────────────────────────────
 const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 const userModels = new Map(); // userId → model name
 
 function getSession(userId) {
@@ -45,6 +46,18 @@ function getSession(userId) {
   if (session && Date.now() - session.lastActive < SESSION_TTL) {
     session.lastActive = Date.now();
     return session;
+  }
+  // LRU 淘汰：超过上限时删除最久未活跃的会话
+  if (sessions.size >= MAX_SESSIONS) {
+    let oldest = null;
+    let oldestKey = null;
+    for (const [key, s] of sessions) {
+      if (!oldest || s.lastActive < oldest.lastActive) {
+        oldest = s;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) sessions.delete(oldestKey);
   }
   const newSession = { messages: [], lastActive: Date.now() };
   sessions.set(userId, newSession);

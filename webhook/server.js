@@ -70,10 +70,12 @@ const db = new Pool({
   password: process.env.PG_PASSWORD,           // 必须通过环境变量注入，不得硬编码
   database: process.env.PG_DATABASE || 'librechat',
   ssl:      { rejectUnauthorized: true },
-  max:      10,
+  max:      parseInt(process.env.PG_POOL_MAX || '15', 10),   // CXI4 8GB 可用更大连接池
   idleTimeoutMillis:   30_000,
   connectionTimeoutMillis: 5_000,
   statement_timeout:  10_000, // 10s 查询超时
+  keepAlive:          true,   // TCP keepalive 减少空闲连接断开
+  keepAliveInitialDelayMillis: 10_000,
 });
 
 db.on('error', (err) => logger.error('DB pool error', { err: err.message }));
@@ -100,6 +102,15 @@ const activateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders:   false,
   message: { success: false, msg: '激活尝试过于频繁，请 10 分钟后再试' },
+});
+
+// 只读查询限速：20 次/分（防信息枚举）
+const readLimiter = rateLimit({
+  windowMs: 60_000,
+  max:      20,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { success: false, msg: '查询过于频繁，请稍后再试' },
 });
 
 // 管理员接口限速：10 次/15 分（PCI-DSS 8.1.4 防暴力破解 ADMIN_TOKEN）
@@ -155,9 +166,17 @@ function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
 }
 
-/** 解析可选的非负整数（用于 Token 分段字段），非法值返回 undefined */
+/** 统一邮箱格式：小写化（数据库 UNIQUE 约束区分大小写，需要应用层归一化） */
+function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
+/** Token 分段字段允许的最大值（1000 万 tokens，防止恶意超大值） */
+const MAX_TOKEN_VALUE = 10_000_000;
+
+/** 解析可选的非负整数（用于 Token 分段字段），非法值或超限值返回 undefined */
 function parseOptionalNonNegInt(value) {
-  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0) {
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= MAX_TOKEN_VALUE) {
     return value;
   }
   return undefined;
@@ -230,7 +249,14 @@ const CACHE_THRESHOLD_TOKENS = 2000;
 const CACHE_DISCOUNT = 0.1;  // 超出阈值部分按 10% 的价格计费
 
 // 单次请求安全熔断阈值（分），默认 1000 分 = 10 元
-const MAX_SINGLE_REQUEST_FEN = parseInt(process.env.MAX_SINGLE_REQUEST_FEN || '1000', 10);
+const MAX_SINGLE_REQUEST_FEN = (() => {
+  const v = parseInt(process.env.MAX_SINGLE_REQUEST_FEN || '1000', 10);
+  if (!Number.isFinite(v) || v <= 0) {
+    logger.warn('MAX_SINGLE_REQUEST_FEN 非法，使用默认值 1000');
+    return 1000;
+  }
+  return v;
+})();
 
 /**
  * 计算输入 Token 的费用（分），支持缓存感知分层定价。
@@ -294,7 +320,7 @@ app.get('/health', async (_req, res) => {
  * GET /models
  * 返回所有已启用模型及其定价，供用户选择
  */
-app.get('/models', async (_req, res) => {
+app.get('/models', readLimiter, async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT provider, model_name, display_name, is_free,
@@ -318,7 +344,7 @@ app.get('/models', async (_req, res) => {
  * Body: { cardKey: string, userEmail: string }
  */
 app.post('/activate', activateLimiter, async (req, res) => {
-  const { cardKey, userEmail } = req.body ?? {};
+  let { cardKey, userEmail } = req.body ?? {};
 
   if (!cardKey || !userEmail) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 cardKey 和 userEmail' });
@@ -326,6 +352,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
   if (typeof cardKey !== 'string') {
     return res.status(400).json({ success: false, msg: 'cardKey 必须为字符串' });
   }
+  userEmail = normalizeEmail(userEmail);
   if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
@@ -355,13 +382,15 @@ app.post('/activate', activateLimiter, async (req, res) => {
     // 确保用户存在
     await ensureUser(client, userEmail);
 
-    // 充值
-    await client.query(
+    // 充值（RETURNING 避免额外 SELECT 往返）
+    const rechargeRes = await client.query(
       `UPDATE user_billing
           SET balance_fen = balance_fen + $1
-        WHERE user_email = $2`,
+        WHERE user_email = $2
+        RETURNING balance_fen`,
       [card.credit_fen, userEmail]
     );
+    const newBalance = Number(rechargeRes.rows[0].balance_fen);
 
     // 标记卡密已使用
     await client.query(
@@ -370,13 +399,6 @@ app.post('/activate', activateLimiter, async (req, res) => {
         WHERE id=$2`,
       [userEmail, card.id]
     );
-
-    // 获取充值后余额
-    const balRes = await client.query(
-      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
-      [userEmail]
-    );
-    const newBalance = Number(balRes.rows[0].balance_fen);
 
     // 记录充值流水
     await client.query(
@@ -410,8 +432,8 @@ app.post('/activate', activateLimiter, async (req, res) => {
  * GET /billing/balance/:email
  * 查询用户余额及账户状态
  */
-app.get('/billing/balance/:email', async (req, res) => {
-  const { email } = req.params;
+app.get('/billing/balance/:email', readLimiter, async (req, res) => {
+  const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
@@ -442,8 +464,8 @@ app.get('/billing/balance/:email', async (req, res) => {
  * GET /billing/history/:email?limit=20&offset=0
  * 查询用户消费/充值历史
  */
-app.get('/billing/history/:email', async (req, res) => {
-  const { email } = req.params;
+app.get('/billing/history/:email', readLimiter, async (req, res) => {
+  const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
@@ -491,12 +513,13 @@ app.get('/billing/history/:email', async (req, res) => {
  *   is_suspended:  boolean
  * }
  */
-app.post('/billing/check', async (req, res) => {
-  const { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
+app.post('/billing/check', readLimiter, async (req, res) => {
+  let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
           estimatedInputChars, estimatedOutputChars,
           estimatedPromptTokens, estimatedHistoryTokens } = req.body ?? {};
 
-  if (!isValidEmail(userEmail || '')) {
+  userEmail = normalizeEmail(userEmail || '');
+  if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
   if (!modelName) {
@@ -601,7 +624,7 @@ app.post('/billing/check', async (req, res) => {
  * }
  */
 app.post('/billing/record', async (req, res) => {
-  const { userEmail, apiProvider, modelName,
+  let { userEmail, apiProvider, modelName,
           inputTokens: rawInputTokens, outputTokens: rawOutputTokens,
           inputChars, outputChars,
           promptTokens: rawPromptTokens, historyTokens: rawHistoryTokens } = req.body ?? {};
@@ -619,6 +642,7 @@ app.post('/billing/record', async (req, res) => {
   if (!userEmail || !apiProvider || !modelName) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
   }
+  userEmail = normalizeEmail(userEmail);
   if (typeof apiProvider !== 'string' || apiProvider.length > 32) {
     return res.status(400).json({ success: false, msg: 'apiProvider 长度不能超过 32 字符' });
   }
@@ -732,21 +756,16 @@ app.post('/billing/record', async (req, res) => {
       });
     }
 
-    // 扣除余额
-    await client.query(
+    // 扣除余额（RETURNING 避免额外 SELECT 往返）
+    const deductRes = await client.query(
       `UPDATE user_billing
           SET balance_fen       = balance_fen - $1,
               total_charged_fen = total_charged_fen + $1
-        WHERE user_email = $2`,
+        WHERE user_email = $2
+        RETURNING balance_fen`,
       [chargedFen, userEmail]
     );
-
-    // 获取扣费后余额
-    const balRes = await client.query(
-      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
-      [userEmail]
-    );
-    const newBalance = Number(balRes.rows[0].balance_fen);
+    const newBalance = Number(deductRes.rows[0].balance_fen);
 
     // 记录调用日志
     const usageRes = await client.query(
@@ -990,13 +1009,14 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
  *   amount_fen: 正数 = 增加余额，负数 = 减少余额
  */
 app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
-  const { userEmail, amount_fen, type, description } = req.body ?? {};
+  let { userEmail, amount_fen, type, description } = req.body ?? {};
 
-  if (!isValidEmail(userEmail || '')) {
+  userEmail = normalizeEmail(userEmail || '');
+  if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
-  if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0) {
-    return res.status(400).json({ success: false, msg: 'amount_fen 必须为有限的非零数字' });
+  if (typeof amount_fen !== 'number' || !Number.isInteger(amount_fen) || amount_fen === 0) {
+    return res.status(400).json({ success: false, msg: 'amount_fen 必须为非零整数' });
   }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
