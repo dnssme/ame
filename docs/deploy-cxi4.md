@@ -367,31 +367,135 @@ git clone https://github.com/dnssme/ame.git /opt/ai/repo
 chmod 750 /opt/ai/repo
 ```
 
-### 6.2 运行一键初始化脚本
+### 6.2 安装 Node.js 20
 
 ```bash
-cd /opt/ai/repo
-bash scripts/setup.sh \
-  '<animaapp数据库密码>' \
-  "${REDIS_PASS}" \
-  'anima-db.postgres.database.azure.com'
+# 检查是否已安装 Node.js 20
+node --version 2>/dev/null | grep -q '^v20' && echo "Node.js 20 已安装，跳过" || {
+  apt-get update -qq
+  apt-get install -y ca-certificates curl gnupg
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+  echo "Node.js $(node --version) 安装完成"
+}
 ```
 
-**脚本完成后输出示例（正常）：**
+### 6.3 部署 Webhook 服务目录
 
+```bash
+# 创建目录并复制文件
+WEBHOOK_DIR="/opt/ai/webhook"
+mkdir -p "${WEBHOOK_DIR}"
+cp /opt/ai/repo/webhook/server.js    "${WEBHOOK_DIR}/server.js"
+cp /opt/ai/repo/webhook/package.json "${WEBHOOK_DIR}/package.json"
+
+# 安装依赖（仅生产依赖）
+cd "${WEBHOOK_DIR}"
+npm install --omit=dev
 ```
-✅ Node.js 20 已安装，跳过
-✅ Webhook 依赖安装完成
-✅ .env 已创建（ADMIN_TOKEN 已自动生成并写入）
-⚠  请保存 ADMIN_TOKEN: a3f9e2b1c5d8...（64字符十六进制）
-✅ 数据库 Schema 初始化完成
-✅ systemd 服务已创建并启动（ai-webhook）
-✅ Webhook 服务运行正常
+
+### 6.4 创建 .env 配置文件
+
+```bash
+# 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
+ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
+
+cat > /opt/ai/webhook/.env <<EOF
+PG_HOST=anima-db.postgres.database.azure.com
+PG_PORT=5432
+PG_USER=animaapp
+PG_PASSWORD=<animaapp数据库密码>
+PG_DATABASE=librechat
+PORT=3002
+HOST=172.16.1.5
+LOG_LEVEL=info
+# 管理员接口令牌（已自动生成，请妥善保管）
+ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
+EOF
+
+chmod 600 /opt/ai/webhook/.env
+echo "ADMIN_TOKEN: ${ADMIN_TOKEN_VAL}"
 ```
 
 > ⚠️ **立即保存 `ADMIN_TOKEN`**，后续所有管理员 API 操作均需此令牌。
 
-### 6.3 加固 .env 权限及内容核查
+### 6.5 初始化数据库 Schema
+
+```bash
+# 安装 PostgreSQL 客户端（如未安装）
+apt-get install -y postgresql-client
+
+# 执行 Schema SQL
+PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
+  --quiet \
+  -h anima-db.postgres.database.azure.com \
+  -U animaapp \
+  -d librechat \
+  -f /opt/ai/repo/db/schema.sql \
+  -v ON_ERROR_STOP=1
+
+echo "数据库 Schema 初始化完成"
+```
+
+> 若出现 `ERROR` 提示，请检查 `PG_PASSWORD`、`PG_HOST` 及 Azure PostgreSQL 防火墙规则（需将 `172.16.1.5` 加入允许列表）。
+
+### 6.6 创建 systemd 服务
+
+```bash
+cat > /etc/systemd/system/ai-webhook.service <<'SERVICE'
+[Unit]
+Description=Anima 灵枢 Webhook 计费服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai/webhook
+EnvironmentFile=/opt/ai/webhook/.env
+ExecStart=/usr/bin/node /opt/ai/webhook/server.js
+Environment=NODE_OPTIONS=--max-old-space-size=256
+Restart=on-failure
+RestartSec=10
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-webhook
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now ai-webhook
+sleep 3
+echo "systemd 服务已创建并启动（ai-webhook）"
+```
+
+### 6.7 验证服务
+
+```bash
+# 健康检查
+if curl -sf http://172.16.1.5:3002/health | grep -q '"db":"ok"'; then
+  echo "✅ Webhook 服务运行正常"
+else
+  echo "⚠  Webhook 服务可能未完全启动，查看日志："
+  journalctl -u ai-webhook -n 30 --no-pager
+fi
+
+# 常用运维命令
+echo "  状态：systemctl status ai-webhook"
+echo "  日志：journalctl -u ai-webhook -f"
+echo "  测试：curl http://172.16.1.5:3002/health"
+```
+
+### 6.8 加固 .env 权限及内容核查
 
 ```bash
 # 确认权限为 600（仅 root 可读写，PCI-DSS 3.x）
@@ -402,7 +506,7 @@ ls -la /opt/ai/webhook/.env
 grep -E '^(PG_HOST|PG_USER|PG_DATABASE|PORT|HOST|ADMIN_TOKEN)=' /opt/ai/webhook/.env
 ```
 
-### 6.4 配置日志轮替
+### 6.9 配置日志轮替
 
 ```bash
 cat > /etc/logrotate.d/ai-webhook <<'EOF'
@@ -418,7 +522,7 @@ cat > /etc/logrotate.d/ai-webhook <<'EOF'
 EOF
 ```
 
-### 6.5 配置看门狗（可选）
+### 6.10 配置看门狗（可选）
 
 ```bash
 # 安装看门狗脚本

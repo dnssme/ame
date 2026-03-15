@@ -180,7 +180,6 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | `modules/modules.yml` | 功能模块注册表 | 必须（启用需要的模块） |
 | `modules/*/` | 各功能模块（微信/Telegram/邮件等） | 按需（启用时需配置 .env） |
 | `mobile/` | 手机 APP 方案和配置 | 按需（需要独立 APP 时参考） |
-| `scripts/setup.sh` | CXI4 一键初始化脚本 | 否（直接执行） |
 
 ---
 
@@ -253,7 +252,6 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── README.md            # 完整 APP 方案对比与适配指南
 │   └── app_config.json      # APP 后端 API 配置模板
 └── scripts/
-    ├── setup.sh             # CXI4 一键初始化脚本
     └── watchdog.sh          # Webhook 健康检查看门狗
 ```
 
@@ -401,29 +399,112 @@ REDISCLI_AUTH="${REDIS_PASS}" redis-cli -h 172.16.1.5 ping
 git clone https://github.com/dnssme/ame.git /opt/ai/repo
 ```
 
-### 1.3 运行初始化脚本
-
-> 脚本会完成：安装 Node.js 20 → 部署文件 → 初始化 DB Schema → 生成 systemd 服务 → 自动写入 `.env` 并生成 `ADMIN_TOKEN`
+### 1.3 安装 Node.js 20
 
 ```bash
-cd /opt/ai/repo
-bash scripts/setup.sh '<animaapp数据库密码>' '<Redis密码>' 'anima-db.postgres.database.azure.com'
+# 检查是否已安装 Node.js 20
+node --version 2>/dev/null | grep -q '^v20' && echo "Node.js 20 已安装，跳过" || {
+  apt-get update -qq
+  apt-get install -y ca-certificates curl gnupg
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+  echo "Node.js $(node --version) 安装完成"
+}
 ```
 
-**输出示例（正常）：**
-```
-✅ Node.js 20 已安装，跳过
-✅ Webhook 依赖安装完成
-✅ .env 已创建（ADMIN_TOKEN 已自动生成并写入）
-⚠  请保存 ADMIN_TOKEN: a3f9e2b1c5d8...
-✅ 数据库 Schema 初始化完成
-✅ systemd 服务已创建并启动（ai-webhook）
-✅ Webhook 服务运行正常
+### 1.4 部署 Webhook 服务目录
+
+```bash
+# 创建目录并复制文件
+WEBHOOK_DIR="/opt/ai/webhook"
+mkdir -p "${WEBHOOK_DIR}"
+cp /opt/ai/repo/webhook/server.js    "${WEBHOOK_DIR}/server.js"
+cp /opt/ai/repo/webhook/package.json "${WEBHOOK_DIR}/package.json"
+
+# 安装依赖（仅生产依赖）
+cd "${WEBHOOK_DIR}"
+npm install --omit=dev
 ```
 
-> ⚠️ **请立即保存脚本输出中的 `ADMIN_TOKEN`**，后续模型管理接口需要用到。
+### 1.5 创建 .env 配置文件
 
-### 1.4 验证 Webhook 服务
+```bash
+# 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
+ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
+
+cat > /opt/ai/webhook/.env <<EOF
+PG_HOST=anima-db.postgres.database.azure.com
+PG_PORT=5432
+PG_USER=animaapp
+PG_PASSWORD=<animaapp数据库密码>
+PG_DATABASE=librechat
+PORT=3002
+HOST=172.16.1.5
+LOG_LEVEL=info
+ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
+EOF
+
+chmod 600 /opt/ai/webhook/.env
+echo "ADMIN_TOKEN: ${ADMIN_TOKEN_VAL}"
+```
+
+> ⚠️ **请立即保存 `ADMIN_TOKEN`**，后续模型管理接口需要用到。
+
+### 1.6 初始化数据库 Schema
+
+```bash
+# 安装 PostgreSQL 客户端（如未安装）
+apt-get install -y postgresql-client
+
+# 执行 Schema SQL
+PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
+  --quiet \
+  -h anima-db.postgres.database.azure.com \
+  -U animaapp \
+  -d librechat \
+  -f /opt/ai/repo/db/schema.sql \
+  -v ON_ERROR_STOP=1
+```
+
+### 1.7 创建 systemd 服务并启动
+
+```bash
+cat > /etc/systemd/system/ai-webhook.service <<'SERVICE'
+[Unit]
+Description=Anima 灵枢 Webhook 计费服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai/webhook
+EnvironmentFile=/opt/ai/webhook/.env
+ExecStart=/usr/bin/node /opt/ai/webhook/server.js
+Environment=NODE_OPTIONS=--max-old-space-size=256
+Restart=on-failure
+RestartSec=10
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-webhook
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now ai-webhook
+sleep 3
+```
+
+### 1.8 验证 Webhook 服务
 
 ```bash
 # 健康检查
