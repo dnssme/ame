@@ -9,6 +9,15 @@
 #   4. 禁用模块时 docker compose down 或停止对应服务即可
 # =============================================================
 
+# ─── 基础设施模块（必选，所有功能的底层依赖）──────────────────
+infrastructure:
+  nextcloud:
+    enabled: true
+    required: true
+    description: "私有云平台（日历 CalDAV + 网盘 WebDAV 的底层，calendar/cloud-storage 必须先部署此模块）"
+    node: VPS-B
+    path: ./nextcloud/
+
 # ─── 核心模块（默认已部署）──────────────────────────────────
 core:
   chat:
@@ -80,7 +89,7 @@ tools:
     description: "日历管理（Nextcloud CalDAV 同步手机/Web）"
     node: VPS-B
     path: ./calendar/
-    depends_on: [agent]
+    depends_on: [nextcloud, agent]
 
   smart_home:
     enabled: false
@@ -94,7 +103,7 @@ tools:
     description: "用户网盘（Nextcloud WebDAV）"
     node: VPS-B
     path: ./cloud-storage/
-    depends_on: [agent]
+    depends_on: [nextcloud, agent]
 
 # ─── 客户端模块 ──────────────────────────────────────────────
 clients:

@@ -5,6 +5,10 @@
 # 此文件挂载到容器内 /app/librechat.yaml
 # docker-compose volumes 中添加：
 #   - ./librechat.yaml:/app/librechat.yaml:ro
+#
+# ★ 默认免费模型：glm-4-flash（智谱，官方免费，0 成本）★
+#   · 在 db/schema.sql 中标记为 is_free=true，用户不消耗余额
+#   · 速度快（~1s），支持 128k 上下文
 # =============================================================
 
 version: 1.2.1
@@ -19,10 +23,255 @@ endpoints:
   # ── 全局默认参数 ─────────────────────────────────────────────
   # 控制上下文窗口大小，降低单次请求消耗，配合 webhook 计费安全阈值
   openAI:
-    titleModel: "gpt-4o-mini"
+    titleModel: "gpt-4.1-mini"
     maxContextTokens: 4000
     messageWindowSize: 12
 
   anthropic:
     maxContextTokens: 4000
     messageWindowSize: 12
+
+  # ── Google Gemini ─────────────────────────────────────────────
+  # 需在 librechat/.env 中设置 GOOGLE_KEY=<你的 Google API Key>
+  # 申请：https://aistudio.google.com/apikey
+  google:
+    maxContextTokens: 4000
+    messageWindowSize: 12
+
+  # ── 自定义提供商（OpenAI 兼容接口）────────────────────────────
+  # 按需取消注释，并在 librechat/.env 中填写对应 API Key
+  custom:
+
+    # ══════════════════════════════════════════════════════════
+    # 全球 Top 10 提供商
+    # ══════════════════════════════════════════════════════════
+
+    # ── DeepSeek（深度求索）──────────────────────────────────
+    # 申请：https://platform.deepseek.com/
+    # 价格极低：约 ¥0.001/1K 输入，¥0.002/1K 输出
+    # .env 中设置：DEEPSEEK_API_KEY=<你的 Key>
+    - name: "DeepSeek"
+      apiKey: "${DEEPSEEK_API_KEY}"
+      baseURL: "https://api.deepseek.com/v1"
+      models:
+        default:
+          - deepseek-chat       # DeepSeek-V3，综合最强，价格极低
+          - deepseek-reasoner   # DeepSeek-R1，深度推理
+        fetch: false
+      titleConvo: true
+      titleModel: "deepseek-chat"
+      modelDisplayLabel: "DeepSeek"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── xAI / Grok ────────────────────────────────────────────
+    # 申请：https://console.x.ai/
+    # .env 中设置：XAI_API_KEY=<你的 Key>
+    - name: "xAI"
+      apiKey: "${XAI_API_KEY}"
+      baseURL: "https://api.x.ai/v1"
+      models:
+        default:
+          - grok-3              # 旗舰模型
+          - grok-3-mini         # 轻量推理
+          - grok-3-fast         # 快速响应
+          - grok-2-latest       # 上一代稳定版
+        fetch: false
+      titleConvo: true
+      titleModel: "grok-3-fast"
+      modelDisplayLabel: "Grok"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Mistral AI ────────────────────────────────────────────
+    # 申请：https://console.mistral.ai/
+    # .env 中设置：MISTRAL_API_KEY=<你的 Key>
+    - name: "Mistral"
+      apiKey: "${MISTRAL_API_KEY}"
+      baseURL: "https://api.mistral.ai/v1"
+      models:
+        default:
+          - mistral-large-latest    # 旗舰
+          - mistral-medium-latest   # 均衡
+          - mistral-small-latest    # 轻量高效
+          - codestral-latest        # 代码专用
+          - open-mistral-7b        # 开源 7B
+        fetch: false
+      titleConvo: true
+      titleModel: "mistral-small-latest"
+      modelDisplayLabel: "Mistral"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Cohere ────────────────────────────────────────────────
+    # 申请：https://dashboard.cohere.com/
+    # .env 中设置：COHERE_API_KEY=<你的 Key>
+    - name: "Cohere"
+      apiKey: "${COHERE_API_KEY}"
+      baseURL: "https://api.cohere.com/compatibility/openai"
+      models:
+        default:
+          - command-r-plus-08-2024  # 旗舰 RAG 模型
+          - command-r-08-2024       # 均衡 RAG
+          - command-r7b-12-2024     # 轻量快速
+        fetch: false
+      titleConvo: true
+      titleModel: "command-r-08-2024"
+      modelDisplayLabel: "Cohere"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Groq（超高速推理，有免费层）─────────────────────────
+    # 申请：https://console.groq.com/
+    # .env 中设置：GROQ_API_KEY=<你的 Key>
+    - name: "Groq"
+      apiKey: "${GROQ_API_KEY}"
+      baseURL: "https://api.groq.com/openai/v1"
+      models:
+        default:
+          # Meta Llama 4 系列（2025）
+          - meta-llama/llama-4-scout-17b-16e-instruct
+          - meta-llama/llama-4-maverick-17b-128e-instruct-fp8
+          # Llama 3.x
+          - llama-3.3-70b-versatile
+          - llama-3.1-8b-instant
+          # 其他开源
+          - mixtral-8x7b-32768
+          - gemma2-9b-it
+        fetch: false
+      titleConvo: true
+      titleModel: "llama-3.1-8b-instant"
+      modelDisplayLabel: "Groq"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Perplexity（联网搜索增强）─────────────────────────────
+    # 申请：https://www.perplexity.ai/settings/api
+    # .env 中设置：PERPLEXITY_API_KEY=<你的 Key>
+    - name: "Perplexity"
+      apiKey: "${PERPLEXITY_API_KEY}"
+      baseURL: "https://api.perplexity.ai"
+      models:
+        default:
+          - sonar-pro               # 联网搜索旗舰
+          - sonar                   # 联网搜索标准
+          - sonar-reasoning-pro     # 推理+搜索旗舰
+          - sonar-reasoning         # 推理+搜索标准
+        fetch: false
+      titleConvo: true
+      titleModel: "sonar"
+      modelDisplayLabel: "Perplexity"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ══════════════════════════════════════════════════════════
+    # 中国 Top 5 提供商
+    # ══════════════════════════════════════════════════════════
+
+    # ── Qwen 通义千问（阿里云灵积）────────────────────────────
+    # 申请：https://dashscope.aliyuncs.com/
+    # .env 中设置：QWEN_API_KEY=<你的 Key>
+    - name: "Qwen"
+      apiKey: "${QWEN_API_KEY}"
+      baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      models:
+        default:
+          # Qwen3 系列（2025）
+          - qwen3-235b-a22b         # Qwen3 旗舰 MoE
+          - qwen3-32b               # Qwen3 Dense 旗舰
+          - qwen3-14b               # Qwen3 均衡
+          - qwq-32b                 # 推理专用（类 o1）
+          # Qwen2.5 稳定版
+          - qwen-max
+          - qwen-max-0428
+          - qwen-plus
+          - qwen-turbo
+          - qwen-long
+          - qwen-coder-plus
+        fetch: false
+      titleConvo: true
+      titleModel: "qwen-turbo"
+      modelDisplayLabel: "通义千问"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Moonshot / Kimi（月之暗面）────────────────────────────
+    # 申请：https://platform.moonshot.cn/
+    # .env 中设置：MOONSHOT_API_KEY=<你的 Key>
+    - name: "Moonshot"
+      apiKey: "${MOONSHOT_API_KEY}"
+      baseURL: "https://api.moonshot.cn/v1"
+      models:
+        default:
+          - kimi-latest             # 自动跟踪最新
+          - moonshot-v1-8k
+          - moonshot-v1-32k
+          - moonshot-v1-128k
+        fetch: false
+      titleConvo: true
+      titleModel: "moonshot-v1-8k"
+      modelDisplayLabel: "Kimi"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Zhipu AI / GLM（智谱清言）────────────────────────────
+    # 申请：https://open.bigmodel.cn/
+    # .env 中设置：ZHIPU_API_KEY=<你的 Key>
+    # ★ glm-4-flash 为系统默认免费模型（is_free=true）★
+    - name: "Zhipu"
+      apiKey: "${ZHIPU_API_KEY}"
+      baseURL: "https://open.bigmodel.cn/api/paas/v4"
+      models:
+        default:
+          # GLM Z1 推理系列
+          - glm-z1-plus             # 推理旗舰
+          - glm-z1-flash            # 推理轻量
+          # GLM 4 系列
+          - glm-4-plus              # 对话旗舰
+          - glm-4-air               # 高性价比
+          - glm-4-flash             # ★ 官方免费，系统默认模型 ★
+          - glm-4-long              # 超长上下文
+        fetch: false
+      titleConvo: true
+      titleModel: "glm-4-flash"
+      modelDisplayLabel: "智谱 GLM"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── ByteDance / 豆包（字节跳动火山方舟）──────────────────
+    # 申请：https://console.volcengine.com/ark
+    # .env 中设置：DOUBAO_API_KEY=<你的 Key>
+    - name: "Doubao"
+      apiKey: "${DOUBAO_API_KEY}"
+      baseURL: "https://ark.cn-beijing.volces.com/api/v3"
+      models:
+        default:
+          - doubao-pro-32k          # 旗舰 32k
+          - doubao-pro-128k         # 旗舰长上下文
+          - doubao-lite-32k         # 轻量低成本
+          - doubao-lite-128k        # 轻量长上下文
+        fetch: false
+      titleConvo: true
+      titleModel: "doubao-lite-32k"
+      modelDisplayLabel: "豆包"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Baidu / ERNIE 文心一言（百度千帆）────────────────────
+    # 申请：https://console.bce.baidu.com/qianfan/
+    # .env 中设置：BAIDU_API_KEY=<你的 Key>
+    - name: "ERNIE"
+      apiKey: "${BAIDU_API_KEY}"
+      baseURL: "https://qianfan.baidubce.com/v2"
+      models:
+        default:
+          - ernie-4.5-turbo-preview # ERNIE 4.5 旗舰
+          - ernie-4.0-turbo-8k      # ERNIE 4.0 稳定版
+          - ernie-speed-pro-128k    # 长上下文速度版
+          - ernie-lite-8k           # 轻量低成本
+        fetch: false
+      titleConvo: true
+      titleModel: "ernie-speed-pro-128k"
+      modelDisplayLabel: "文心一言"
+      maxContextTokens: 4000
+      messageWindowSize: 12
