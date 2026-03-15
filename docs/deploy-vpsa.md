@@ -223,23 +223,101 @@ curl -sf http://172.16.1.5:3002/health && echo "✅ Webhook"   || echo "❌ Webh
 
 ## 5. 安装 Nginx + ModSecurity + OWASP CRS
 
-使用自动安装脚本（编译安装 Nginx + ModSecurity v3 + OWASP CRS v4）：
+手动编译安装 Nginx + ModSecurity v3 + OWASP CRS v4，安装至以下路径：
+
+- **Nginx 主程序**：`/opt/nginx/`
+- **ModSecurity 源码**：`/opt/nginx/src/ModSecurity/`
+- **OWASP CRS 规则集**：`/opt/owasp/owasp-rules/`
+- **WAF 入口配置**：`/opt/owasp/conf/main.conf`
+
+> ⏱️ 编译耗时约 10–20 分钟（取决于 CPU 核心数）
+
+### 5.1 安装编译依赖
 
 ```bash
-# 安装路径说明：
-#   · Nginx 主程序:         /opt/nginx/
-#   · ModSecurity 源码:     /opt/nginx/src/ModSecurity/
-#   · OWASP CRS 规则集:     /opt/owasp/owasp-rules/
-#   · WAF 入口配置:         /opt/owasp/conf/main.conf
-# 安装耗时约 5-15 分钟（编译过程）
-
-wget -O /tmp/nginx-install.sh \
-  https://raw.githubusercontent.com/mzwrt/system_script/refs/heads/main/nginx/nginx-install.sh
-chmod +x /tmp/nginx-install.sh
-bash /tmp/nginx-install.sh
+apt-get install -y \
+  build-essential git automake autoconf libtool pkg-config \
+  libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev \
+  libxml2-dev libxslt1-dev libyajl-dev libgeoip-dev \
+  libgd-dev liblmdb-dev libcurl4-openssl-dev
 ```
 
-**安装完成后验证：**
+### 5.2 编译 ModSecurity v3
+
+```bash
+mkdir -p /opt/nginx/src
+git clone --depth 1 -b v3/master \
+  https://github.com/SpiderLabs/ModSecurity.git \
+  /opt/nginx/src/ModSecurity
+cd /opt/nginx/src/ModSecurity
+git submodule init && git submodule update
+./build.sh
+./configure
+make -j"$(nproc)"
+make install
+```
+
+### 5.3 下载 ModSecurity-nginx 连接器
+
+```bash
+git clone --depth 1 \
+  https://github.com/SpiderLabs/ModSecurity-nginx.git \
+  /opt/nginx/src/ModSecurity-nginx
+```
+
+### 5.4 编译 Nginx（带 ModSecurity 模块）
+
+```bash
+NGINX_VER="1.26.3"
+cd /tmp
+curl -fsSL "https://nginx.org/download/nginx-${NGINX_VER}.tar.gz" \
+  -o "nginx-${NGINX_VER}.tar.gz"
+tar xzf "nginx-${NGINX_VER}.tar.gz"
+cd "nginx-${NGINX_VER}"
+./configure \
+  --prefix=/opt/nginx \
+  --sbin-path=/opt/nginx/sbin/nginx \
+  --conf-path=/opt/nginx/conf/nginx.conf \
+  --pid-path=/opt/nginx/logs/nginx.pid \
+  --error-log-path=/opt/nginx/logs/error.log \
+  --http-log-path=/opt/nginx/logs/access.log \
+  --with-http_ssl_module \
+  --with-http_v2_module \
+  --with-http_realip_module \
+  --with-http_gzip_static_module \
+  --with-http_stub_status_module \
+  --add-module=/opt/nginx/src/ModSecurity-nginx
+make -j"$(nproc)"
+make install
+```
+
+### 5.5 下载 OWASP CRS v4
+
+```bash
+CRS_VER="4.8.0"
+mkdir -p /opt/owasp
+cd /opt/owasp
+curl -fsSL \
+  "https://github.com/coreruleset/coreruleset/archive/refs/tags/v${CRS_VER}.tar.gz" \
+  -o "coreruleset-${CRS_VER}.tar.gz"
+tar xzf "coreruleset-${CRS_VER}.tar.gz"
+mv "coreruleset-${CRS_VER}" owasp-rules
+cp /opt/owasp/owasp-rules/crs-setup.conf.example \
+   /opt/owasp/owasp-rules/crs-setup.conf
+```
+
+### 5.6 创建目录结构
+
+```bash
+mkdir -p /opt/owasp/conf
+mkdir -p /opt/nginx/conf/conf.d
+mkdir -p /www/wwwlogs/owasp
+chown root:root /www/wwwlogs/owasp
+chmod 700 /www/wwwlogs/owasp
+mkdir -p /var/www/certbot
+```
+
+### 5.7 编译安装验证
 
 ```bash
 # Nginx 版本
@@ -254,14 +332,6 @@ bash /tmp/nginx-install.sh
 grep -n 'worker_processes' /opt/nginx/conf/nginx.conf
 # 若显示 "worker_processes 1;"，修改为 auto
 sed -i 's/^worker_processes.*/worker_processes auto;/' /opt/nginx/conf/nginx.conf
-
-# 创建 WAF 审计日志目录
-mkdir -p /www/wwwlogs/owasp
-chown root:root /www/wwwlogs/owasp
-chmod 700 /www/wwwlogs/owasp
-
-# 创建 ACME 验证目录（Let's Encrypt Standalone 续期需要）
-mkdir -p /var/www/certbot
 ```
 
 ---

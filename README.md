@@ -180,7 +180,6 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | `modules/modules.yml` | 功能模块注册表 | 必须（启用需要的模块） |
 | `modules/*/` | 各功能模块（微信/Telegram/邮件等） | 按需（启用时需配置 .env） |
 | `mobile/` | 手机 APP 方案和配置 | 按需（需要独立 APP 时参考） |
-| `scripts/setup.sh` | CXI4 一键初始化脚本 | 否（直接执行） |
 
 ---
 
@@ -253,7 +252,6 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── README.md            # 完整 APP 方案对比与适配指南
 │   └── app_config.json      # APP 后端 API 配置模板
 └── scripts/
-    ├── setup.sh             # CXI4 一键初始化脚本
     └── watchdog.sh          # Webhook 健康检查看门狗
 ```
 
@@ -401,29 +399,125 @@ REDISCLI_AUTH="${REDIS_PASS}" redis-cli -h 172.16.1.5 ping
 git clone https://github.com/dnssme/ame.git /opt/ai/repo
 ```
 
-### 1.3 运行初始化脚本
-
-> 脚本会完成：安装 Node.js 20 → 部署文件 → 初始化 DB Schema → 生成 systemd 服务 → 自动写入 `.env` 并生成 `ADMIN_TOKEN`
+### 1.3 安装 Node.js 20
 
 ```bash
-cd /opt/ai/repo
-bash scripts/setup.sh '<animaapp数据库密码>' '<Redis密码>' 'anima-db.postgres.database.azure.com'
+# 检查是否已安装 Node.js 20
+if node --version 2>/dev/null | grep -q '^v20'; then
+  echo "Node.js 20 已安装，跳过"
+else
+  # 手动添加 NodeSource 官方软件源（不执行管道脚本 — CIS 2.1.x / PCI-DSS 6.3.x 合规）
+  apt-get install -y ca-certificates curl gnupg
+  mkdir -p /etc/apt/keyrings
+
+  # 导入 NodeSource GPG 签名密钥（验证软件包完整性）
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  chmod 644 /etc/apt/keyrings/nodesource.gpg
+
+  # 添加软件源（使用 signed-by 确保每个包都经 GPG 验证）
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list
+
+  apt-get update
+  apt-get install -y nodejs
+  echo "Node.js $(node --version) 安装完成"
+fi
 ```
 
-**输出示例（正常）：**
-```
-✅ Node.js 20 已安装，跳过
-✅ Webhook 依赖安装完成
-✅ .env 已创建（ADMIN_TOKEN 已自动生成并写入）
-⚠  请保存 ADMIN_TOKEN: a3f9e2b1c5d8...
-✅ 数据库 Schema 初始化完成
-✅ systemd 服务已创建并启动（ai-webhook）
-✅ Webhook 服务运行正常
+### 1.4 部署 Webhook 服务目录
+
+```bash
+# 创建目录并复制文件
+WEBHOOK_DIR="/opt/ai/webhook"
+mkdir -p "${WEBHOOK_DIR}"
+cp /opt/ai/repo/webhook/server.js    "${WEBHOOK_DIR}/server.js"
+cp /opt/ai/repo/webhook/package.json "${WEBHOOK_DIR}/package.json"
+
+# 安装依赖（仅生产依赖）
+cd "${WEBHOOK_DIR}"
+npm install --omit=dev
 ```
 
-> ⚠️ **请立即保存脚本输出中的 `ADMIN_TOKEN`**，后续模型管理接口需要用到。
+### 1.5 创建 .env 配置文件
 
-### 1.4 验证 Webhook 服务
+```bash
+# 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
+ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
+
+cat > /opt/ai/webhook/.env <<EOF
+PG_HOST=anima-db.postgres.database.azure.com
+PG_PORT=5432
+PG_USER=animaapp
+PG_PASSWORD=<animaapp数据库密码>
+PG_DATABASE=librechat
+PORT=3002
+HOST=172.16.1.5
+LOG_LEVEL=info
+ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
+EOF
+
+chmod 600 /opt/ai/webhook/.env
+echo "ADMIN_TOKEN: ${ADMIN_TOKEN_VAL}"
+```
+
+> ⚠️ **请立即保存 `ADMIN_TOKEN`**，后续模型管理接口需要用到。
+
+### 1.6 初始化数据库 Schema
+
+```bash
+# 安装 PostgreSQL 客户端（如未安装）
+apt-get install -y postgresql-client
+
+# 执行 Schema SQL
+PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
+  --quiet \
+  -h anima-db.postgres.database.azure.com \
+  -U animaapp \
+  -d librechat \
+  -f /opt/ai/repo/db/schema.sql \
+  -v ON_ERROR_STOP=1
+```
+
+### 1.7 创建 systemd 服务并启动
+
+```bash
+cat > /etc/systemd/system/ai-webhook.service <<'SERVICE'
+[Unit]
+Description=Anima 灵枢 Webhook 计费服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai/webhook
+EnvironmentFile=/opt/ai/webhook/.env
+ExecStart=/usr/bin/node /opt/ai/webhook/server.js
+Environment=NODE_OPTIONS=--max-old-space-size=256
+Restart=on-failure
+RestartSec=10
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-webhook
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now ai-webhook
+sleep 3
+```
+
+### 1.8 验证 Webhook 服务
 
 ```bash
 # 健康检查
@@ -568,24 +662,96 @@ curl -sf http://172.16.1.2:3000/health
 
 ### 4.1 安装 Nginx + ModSecurity + OWASP CRS
 
-使用自动安装脚本（编译安装 Nginx + ModSecurity v3 + OWASP CRS v4）：
+手动编译安装 Nginx + ModSecurity v3 + OWASP CRS v4（不执行第三方脚本 — CIS 2.1.x / PCI-DSS 6.3.x 合规），安装路径：`/opt/nginx/`、`/opt/owasp/owasp-rules/`。
+
+> ⏱️ 编译耗时约 10–20 分钟
+
+#### 安装编译依赖
 
 ```bash
-# 下载并执行 Nginx 安装脚本
-# 该脚本将安装至以下路径：
-#   · Nginx:        /opt/nginx/
-#   · ModSecurity:  /opt/nginx/src/ModSecurity/
-#   · OWASP CRS:    /opt/owasp/owasp-rules/
-#   · WAF 入口配置: /opt/owasp/conf/main.conf
-wget -O /tmp/nginx-install.sh \
-  https://raw.githubusercontent.com/mzwrt/system_script/refs/heads/main/nginx/nginx-install.sh
-chmod +x /tmp/nginx-install.sh
-bash /tmp/nginx-install.sh
+apt-get install -y \
+  build-essential git automake autoconf libtool pkg-config \
+  libpcre2-dev libpcre3-dev libssl-dev zlib1g-dev \
+  libxml2-dev libxslt1-dev libyajl-dev libgeoip-dev \
+  libgd-dev liblmdb-dev libcurl4-openssl-dev
+```
 
-# 创建 WAF 审计日志目录
+#### 编译 ModSecurity v3
+
+```bash
+mkdir -p /opt/nginx/src
+git clone --depth 1 -b v3/master \
+  https://github.com/SpiderLabs/ModSecurity.git \
+  /opt/nginx/src/ModSecurity
+cd /opt/nginx/src/ModSecurity
+git submodule init && git submodule update
+./build.sh && ./configure
+make -j"$(nproc)" && make install
+```
+
+#### 下载 ModSecurity-nginx 连接器
+
+```bash
+git clone --depth 1 \
+  https://github.com/SpiderLabs/ModSecurity-nginx.git \
+  /opt/nginx/src/ModSecurity-nginx
+```
+
+#### 编译 Nginx（带 ModSecurity 模块）
+
+```bash
+NGINX_VER="1.26.3"
+cd /tmp
+curl -fsSL "https://nginx.org/download/nginx-${NGINX_VER}.tar.gz" \
+  -o "nginx-${NGINX_VER}.tar.gz"
+tar xzf "nginx-${NGINX_VER}.tar.gz"
+cd "nginx-${NGINX_VER}"
+./configure \
+  --prefix=/opt/nginx \
+  --sbin-path=/opt/nginx/sbin/nginx \
+  --conf-path=/opt/nginx/conf/nginx.conf \
+  --pid-path=/opt/nginx/logs/nginx.pid \
+  --error-log-path=/opt/nginx/logs/error.log \
+  --http-log-path=/opt/nginx/logs/access.log \
+  --with-http_ssl_module \
+  --with-http_v2_module \
+  --with-http_realip_module \
+  --with-http_gzip_static_module \
+  --with-http_stub_status_module \
+  --add-module=/opt/nginx/src/ModSecurity-nginx
+make -j"$(nproc)" && make install
+# 确认 Worker 进程数为 auto（双核以上推荐）
+sed -i 's/^worker_processes.*/worker_processes auto;/' /opt/nginx/conf/nginx.conf
+```
+
+#### 下载 OWASP CRS v4
+
+```bash
+CRS_VER="4.8.0"
+mkdir -p /opt/owasp
+cd /opt/owasp
+curl -fsSL \
+  "https://github.com/coreruleset/coreruleset/archive/refs/tags/v${CRS_VER}.tar.gz" \
+  -o "coreruleset-${CRS_VER}.tar.gz"
+tar xzf "coreruleset-${CRS_VER}.tar.gz"
+mv "coreruleset-${CRS_VER}" owasp-rules
+cp /opt/owasp/owasp-rules/crs-setup.conf.example \
+   /opt/owasp/owasp-rules/crs-setup.conf
+```
+
+#### 创建目录结构并验证
+
+```bash
+mkdir -p /opt/owasp/conf /opt/nginx/conf/conf.d /var/www/certbot
 mkdir -p /www/wwwlogs/owasp
 chown root:root /www/wwwlogs/owasp
 chmod 700 /www/wwwlogs/owasp
+
+# 验证安装
+/opt/nginx/sbin/nginx -v
+# 预期：nginx version: nginx/1.26.3
+/opt/nginx/sbin/nginx -V 2>&1 | grep -o 'ModSecurity\|ngx_http_modsecurity'
+# 预期：含 ModSecurity 字样
 ```
 
 ### 4.2 申请 SSL 证书（Let's Encrypt）
