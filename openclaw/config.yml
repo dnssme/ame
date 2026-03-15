@@ -31,6 +31,94 @@ llm:
       models:
         - gpt-4o-mini
         - gpt-4o
+        - o1-mini
+        - o3-mini
+      timeout: 30
+      maxRetries: 2
+
+    # ── Google Gemini ─────────────────────────────────────────
+    # 申请 API Key：https://aistudio.google.com/apikey
+    - name: google
+      apiKey: ${GOOGLE_API_KEY}
+      baseUrl: https://generativelanguage.googleapis.com/v1beta/openai
+      models:
+        - gemini-2.5-pro-preview-05-06
+        - gemini-2.0-flash
+        - gemini-1.5-pro
+        - gemini-1.5-flash
+      timeout: 60
+      maxRetries: 2
+
+    # ── DeepSeek（深度求索）────────────────────────────────────
+    # 申请 API Key：https://platform.deepseek.com/
+    - name: deepseek
+      apiKey: ${DEEPSEEK_API_KEY}
+      baseUrl: https://api.deepseek.com/v1
+      models:
+        - deepseek-chat       # DeepSeek-V3，综合能力强，价格低
+        - deepseek-reasoner   # DeepSeek-R1，推理模型
+      timeout: 60
+      maxRetries: 2
+
+    # ── Qwen 通义千问（阿里云）────────────────────────────────
+    # 申请 API Key：https://dashscope.aliyuncs.com/
+    - name: qwen
+      apiKey: ${QWEN_API_KEY}
+      baseUrl: https://dashscope.aliyuncs.com/compatible-mode/v1
+      models:
+        - qwen-max            # 旗舰模型
+        - qwen-plus           # 均衡型
+        - qwen-turbo          # 速度最快，价格最低
+        - qwen-long           # 超长上下文（1M tokens）
+      timeout: 30
+      maxRetries: 2
+
+    # ── Moonshot / Kimi（月之暗面）────────────────────────────
+    # 申请 API Key：https://platform.moonshot.cn/
+    - name: moonshot
+      apiKey: ${MOONSHOT_API_KEY}
+      baseUrl: https://api.moonshot.cn/v1
+      models:
+        - moonshot-v1-8k
+        - moonshot-v1-32k
+        - moonshot-v1-128k
+      timeout: 30
+      maxRetries: 2
+
+    # ── Zhipu AI / GLM（智谱清言）────────────────────────────
+    # 申请 API Key：https://open.bigmodel.cn/
+    - name: zhipu
+      apiKey: ${ZHIPU_API_KEY}
+      baseUrl: https://open.bigmodel.cn/api/paas/v4
+      models:
+        - glm-4-plus          # 旗舰模型
+        - glm-4-flash         # 免费模型，速度快
+        - glm-4-air           # 高性价比
+      timeout: 30
+      maxRetries: 2
+
+    # ── xAI / Grok ────────────────────────────────────────────
+    # 申请 API Key：https://console.x.ai/
+    - name: xai
+      apiKey: ${XAI_API_KEY}
+      baseUrl: https://api.x.ai/v1
+      models:
+        - grok-3
+        - grok-3-fast
+        - grok-2-latest
+      timeout: 30
+      maxRetries: 2
+
+    # ── Groq（快速推理，免费层）──────────────────────────────
+    # 申请 API Key：https://console.groq.com/
+    - name: groq
+      apiKey: ${GROQ_API_KEY}
+      baseUrl: https://api.groq.com/openai/v1
+      models:
+        - llama-3.3-70b-versatile
+        - llama-3.1-8b-instant
+        - mixtral-8x7b-32768
+        - gemma2-9b-it
       timeout: 30
       maxRetries: 2
 

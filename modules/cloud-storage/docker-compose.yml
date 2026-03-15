@@ -1,52 +1,20 @@
 # =============================================================
-# Anima 灵枢 · 用户网盘模块（Nextcloud）
-# 说明：如已通过 calendar 模块部署了 Nextcloud，无需重复部署
-#       本文件用于独立部署场景
+# Anima 灵枢 · 用户网盘模块（WebDAV）
 # 部署节点：VPS-B (172.16.1.4)
+#
+# ⚠️  本模块不包含独立服务。
+#     网盘 WebDAV 功能由 modules/nextcloud/ 的 Nextcloud 实例提供。
+#     如已通过 calendar 模块或 nextcloud 模块部署了 Nextcloud，无需重复部署。
+#
+# 部署步骤：
+#   1. 先部署 modules/nextcloud/（必须在本模块之前）
+#      cd ../nextcloud && docker compose up -d
+#   2. 通过 https://<域名>/nextcloud/ 登录 Nextcloud 即可使用网盘
+#   3. 本模块无需额外 docker compose 操作
 # =============================================================
 
-services:
-  nextcloud:
-    image: nextcloud:29-apache
-    container_name: anima-nextcloud
-    restart: unless-stopped
+# WebDAV 由 modules/nextcloud/ 提供，Nextcloud 29 内置 WebDAV，无需单独部署。
+# 使用 include 引用共享 Nextcloud 模块
+include:
+  - path: ../nextcloud/docker-compose.yml
 
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: '1.0'
-
-    security_opt:
-      - no-new-privileges:true
-
-    ports:
-      - "172.16.1.4:8090:80"
-
-    volumes:
-      - nextcloud_data:/var/www/html
-      - nextcloud_files:/var/www/html/data  # 用户文件存储
-
-    environment:
-      POSTGRES_HOST: anima-db.postgres.database.azure.com
-      POSTGRES_DB: nextcloud
-      POSTGRES_USER: animaapp
-      POSTGRES_PASSWORD: ${PG_PASSWORD}
-      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_USERNAME:-admin}
-      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_PASSWORD}
-      TZ: Asia/Shanghai
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/status.php"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "3"
-
-volumes:
-  nextcloud_data:
-  nextcloud_files:

@@ -26,3 +26,122 @@ endpoints:
   anthropic:
     maxContextTokens: 4000
     messageWindowSize: 12
+
+  # ── Google Gemini ─────────────────────────────────────────────
+  # 需在 librechat/.env 中设置 GOOGLE_KEY=<你的 Google API Key>
+  # 申请：https://aistudio.google.com/apikey
+  google:
+    maxContextTokens: 4000
+    messageWindowSize: 12
+
+  # ── 自定义提供商（OpenAI 兼容接口）────────────────────────────
+  # 按需取消注释，并在 librechat/.env 中填写对应 API Key
+  custom:
+    # ── DeepSeek（深度求索）──────────────────────────────────
+    # 申请：https://platform.deepseek.com/
+    # .env 中设置：DEEPSEEK_API_KEY=<你的 Key>
+    - name: "DeepSeek"
+      apiKey: "${DEEPSEEK_API_KEY}"
+      baseURL: "https://api.deepseek.com/v1"
+      models:
+        default:
+          - deepseek-chat       # DeepSeek-V3，综合能力强
+          - deepseek-reasoner   # DeepSeek-R1，推理模型
+        fetch: false
+      titleConvo: true
+      titleModel: "deepseek-chat"
+      modelDisplayLabel: "DeepSeek"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Qwen 通义千问（阿里云）────────────────────────────────
+    # 申请：https://dashscope.aliyuncs.com/
+    # .env 中设置：QWEN_API_KEY=<你的 Key>
+    - name: "Qwen"
+      apiKey: "${QWEN_API_KEY}"
+      baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      models:
+        default:
+          - qwen-max
+          - qwen-plus
+          - qwen-turbo
+          - qwen-long
+        fetch: false
+      titleConvo: true
+      titleModel: "qwen-turbo"
+      modelDisplayLabel: "通义千问"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Moonshot / Kimi（月之暗面）────────────────────────────
+    # 申请：https://platform.moonshot.cn/
+    # .env 中设置：MOONSHOT_API_KEY=<你的 Key>
+    - name: "Moonshot"
+      apiKey: "${MOONSHOT_API_KEY}"
+      baseURL: "https://api.moonshot.cn/v1"
+      models:
+        default:
+          - moonshot-v1-8k
+          - moonshot-v1-32k
+          - moonshot-v1-128k
+        fetch: false
+      titleConvo: true
+      titleModel: "moonshot-v1-8k"
+      modelDisplayLabel: "Kimi"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Zhipu AI / GLM（智谱清言）────────────────────────────
+    # 申请：https://open.bigmodel.cn/
+    # .env 中设置：ZHIPU_API_KEY=<你的 Key>
+    - name: "Zhipu"
+      apiKey: "${ZHIPU_API_KEY}"
+      baseURL: "https://open.bigmodel.cn/api/paas/v4"
+      models:
+        default:
+          - glm-4-plus
+          - glm-4-flash
+          - glm-4-air
+        fetch: false
+      titleConvo: true
+      titleModel: "glm-4-flash"
+      modelDisplayLabel: "智谱 GLM"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── xAI / Grok ────────────────────────────────────────────
+    # 申请：https://console.x.ai/
+    # .env 中设置：XAI_API_KEY=<你的 Key>
+    - name: "xAI"
+      apiKey: "${XAI_API_KEY}"
+      baseURL: "https://api.x.ai/v1"
+      models:
+        default:
+          - grok-3
+          - grok-3-fast
+          - grok-2-latest
+        fetch: false
+      titleConvo: true
+      titleModel: "grok-3-fast"
+      modelDisplayLabel: "Grok"
+      maxContextTokens: 4000
+      messageWindowSize: 12
+
+    # ── Groq（快速推理，有免费层）─────────────────────────────
+    # 申请：https://console.groq.com/
+    # .env 中设置：GROQ_API_KEY=<你的 Key>
+    - name: "Groq"
+      apiKey: "${GROQ_API_KEY}"
+      baseURL: "https://api.groq.com/openai/v1"
+      models:
+        default:
+          - llama-3.3-70b-versatile
+          - llama-3.1-8b-instant
+          - mixtral-8x7b-32768
+          - gemma2-9b-it
+        fetch: false
+      titleConvo: true
+      titleModel: "llama-3.1-8b-instant"
+      modelDisplayLabel: "Groq"
+      maxContextTokens: 4000
+      messageWindowSize: 12

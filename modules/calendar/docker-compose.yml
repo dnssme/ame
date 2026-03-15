@@ -1,50 +1,20 @@
 # =============================================================
-# Anima 灵枢 · 日历管理模块（Nextcloud）
-# 部署节点：172.16.1.4（可部署在 VPS-B 或独立节点）
+# Anima 灵枢 · 日历管理模块（CalDAV）
+# 部署节点：VPS-B (172.16.1.4)
+#
+# ⚠️  本模块不包含独立服务。
+#     日历 CalDAV 功能由 modules/nextcloud/ 的 Nextcloud 实例提供。
+#
+# 部署步骤：
+#   1. 先部署 modules/nextcloud/（必须在本模块之前）
+#      cd ../nextcloud && docker compose up -d
+#   2. 在 openclaw/config.yml 中确认 tools.calendar 配置指向 Nextcloud：
+#      url: http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
+#   3. 本模块无需额外 docker compose 操作
 # =============================================================
 
-services:
-  nextcloud:
-    image: nextcloud:29-apache
-    container_name: anima-nextcloud
-    restart: unless-stopped
+# CalDAV 由 modules/nextcloud/ 提供，Nextcloud 29 内置 CalDAV，无需单独部署。
+# 使用 include 引用共享 Nextcloud 模块
+include:
+  - path: ../nextcloud/docker-compose.yml
 
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: '1.0'
-
-    security_opt:
-      - no-new-privileges:true
-
-    ports:
-      - "172.16.1.4:8090:80"
-
-    volumes:
-      - nextcloud_data:/var/www/html
-      - ./config:/var/www/html/config
-
-    environment:
-      POSTGRES_HOST: anima-db.postgres.database.azure.com
-      POSTGRES_DB: nextcloud
-      POSTGRES_USER: animaapp
-      POSTGRES_PASSWORD: ${PG_PASSWORD}
-      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_USERNAME:-admin}
-      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_PASSWORD}
-      NEXTCLOUD_TRUSTED_DOMAINS: "172.16.1.4 ${NEXTCLOUD_DOMAIN:-localhost}"
-      TZ: Asia/Shanghai
-
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/status.php"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "3"
-
-volumes:
-  nextcloud_data:
