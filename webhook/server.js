@@ -102,6 +102,15 @@ const activateLimiter = rateLimit({
   message: { success: false, msg: '激活尝试过于频繁，请 10 分钟后再试' },
 });
 
+// 只读查询限速：20 次/分（防信息枚举）
+const readLimiter = rateLimit({
+  windowMs: 60_000,
+  max:      20,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { success: false, msg: '查询过于频繁，请稍后再试' },
+});
+
 // 管理员接口限速：10 次/15 分（PCI-DSS 8.1.4 防暴力破解 ADMIN_TOKEN）
 const adminLimiter = rateLimit({
   windowMs: 15 * 60_000,
@@ -294,7 +303,7 @@ app.get('/health', async (_req, res) => {
  * GET /models
  * 返回所有已启用模型及其定价，供用户选择
  */
-app.get('/models', async (_req, res) => {
+app.get('/models', readLimiter, async (_req, res) => {
   try {
     const result = await db.query(
       `SELECT provider, model_name, display_name, is_free,
@@ -355,13 +364,15 @@ app.post('/activate', activateLimiter, async (req, res) => {
     // 确保用户存在
     await ensureUser(client, userEmail);
 
-    // 充值
-    await client.query(
+    // 充值（RETURNING 避免额外 SELECT 往返）
+    const rechargeRes = await client.query(
       `UPDATE user_billing
           SET balance_fen = balance_fen + $1
-        WHERE user_email = $2`,
+        WHERE user_email = $2
+        RETURNING balance_fen`,
       [card.credit_fen, userEmail]
     );
+    const newBalance = Number(rechargeRes.rows[0].balance_fen);
 
     // 标记卡密已使用
     await client.query(
@@ -370,13 +381,6 @@ app.post('/activate', activateLimiter, async (req, res) => {
         WHERE id=$2`,
       [userEmail, card.id]
     );
-
-    // 获取充值后余额
-    const balRes = await client.query(
-      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
-      [userEmail]
-    );
-    const newBalance = Number(balRes.rows[0].balance_fen);
 
     // 记录充值流水
     await client.query(
@@ -410,7 +414,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
  * GET /billing/balance/:email
  * 查询用户余额及账户状态
  */
-app.get('/billing/balance/:email', async (req, res) => {
+app.get('/billing/balance/:email', readLimiter, async (req, res) => {
   const { email } = req.params;
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -442,7 +446,7 @@ app.get('/billing/balance/:email', async (req, res) => {
  * GET /billing/history/:email?limit=20&offset=0
  * 查询用户消费/充值历史
  */
-app.get('/billing/history/:email', async (req, res) => {
+app.get('/billing/history/:email', readLimiter, async (req, res) => {
   const { email } = req.params;
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -732,21 +736,16 @@ app.post('/billing/record', async (req, res) => {
       });
     }
 
-    // 扣除余额
-    await client.query(
+    // 扣除余额（RETURNING 避免额外 SELECT 往返）
+    const deductRes = await client.query(
       `UPDATE user_billing
           SET balance_fen       = balance_fen - $1,
               total_charged_fen = total_charged_fen + $1
-        WHERE user_email = $2`,
+        WHERE user_email = $2
+        RETURNING balance_fen`,
       [chargedFen, userEmail]
     );
-
-    // 获取扣费后余额
-    const balRes = await client.query(
-      'SELECT balance_fen FROM user_billing WHERE user_email=$1',
-      [userEmail]
-    );
-    const newBalance = Number(balRes.rows[0].balance_fen);
+    const newBalance = Number(deductRes.rows[0].balance_fen);
 
     // 记录调用日志
     const usageRes = await client.query(
@@ -995,8 +994,8 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   if (!isValidEmail(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
-  if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0) {
-    return res.status(400).json({ success: false, msg: 'amount_fen 必须为有限的非零数字' });
+  if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0 || !Number.isInteger(amount_fen)) {
+    return res.status(400).json({ success: false, msg: 'amount_fen 必须为有限的非零整数' });
   }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {

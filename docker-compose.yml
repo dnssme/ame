@@ -219,6 +219,9 @@ services:
       - CHOWN
       - SETUID
       - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp
 
     ports:
       - "172.16.1.5:3002:3002"
