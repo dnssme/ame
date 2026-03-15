@@ -1,6 +1,6 @@
 # =============================================================
 # Anima 灵枢 · 邮件处理模块
-# 部署节点：CXI4 (172.16.1.5)
+# 部署节点：CXI4 (172.16.1.5) · i5-10610U 8 GB RAM
 # =============================================================
 
 services:
@@ -9,9 +9,11 @@ services:
     container_name: anima-email
     restart: unless-stopped
 
-    mem_limit: 256m
+    # CXI4 8GB：邮件处理模块是后台轮询，无需大量资源
+    mem_limit: 192m
     mem_reservation: 64m
     cpus: '0.5'
+    pids_limit: 50
 
     security_opt:
       - no-new-privileges:true
@@ -31,7 +33,7 @@ services:
 
     environment:
       NODE_ENV: production
-      NODE_OPTIONS: "--max-old-space-size=192"
+      NODE_OPTIONS: "--max-old-space-size=128"
       TZ: Asia/Shanghai
 
     healthcheck:

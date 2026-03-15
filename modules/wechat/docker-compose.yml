@@ -1,6 +1,7 @@
 # =============================================================
 # Anima 灵枢 · 微信接入模块
-# 部署节点：VPS-B (172.16.1.2)
+# 部署节点：VPS-B (172.16.1.2) · 双核 1 GB RAM
+# 与 OpenClaw + Telegram Bot 共享节点
 # =============================================================
 
 services:
@@ -9,9 +10,11 @@ services:
     container_name: anima-wechat
     restart: unless-stopped
 
-    mem_limit: 512m
-    mem_reservation: 128m
-    cpus: '1.0'
+    # VPS B 1GB 共享：WeChat 192m（Wechaty 需要较多内存用于 Puppet）
+    mem_limit: 192m
+    mem_reservation: 80m
+    cpus: '0.5'
+    pids_limit: 80
 
     security_opt:
       - no-new-privileges:true
@@ -31,7 +34,7 @@ services:
 
     environment:
       NODE_ENV: production
-      NODE_OPTIONS: "--max-old-space-size=384"
+      NODE_OPTIONS: "--max-old-space-size=128"
       TZ: Asia/Shanghai
 
     volumes:

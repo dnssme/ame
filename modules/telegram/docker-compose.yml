@@ -1,6 +1,7 @@
 # =============================================================
 # Anima 灵枢 · Telegram 接入模块
-# 部署节点：VPS-B (172.16.1.2)
+# 部署节点：VPS-B (172.16.1.2) · 双核 1 GB RAM
+# 与 OpenClaw + WeChat Bot 共享节点
 # =============================================================
 
 services:
@@ -9,9 +10,11 @@ services:
     container_name: anima-telegram
     restart: unless-stopped
 
-    mem_limit: 256m
-    mem_reservation: 64m
+    # VPS B 1GB 共享：Telegram 仅需 128m（轻量消息桥接）
+    mem_limit: 128m
+    mem_reservation: 48m
     cpus: '0.5'
+    pids_limit: 50
 
     security_opt:
       - no-new-privileges:true
@@ -31,7 +34,7 @@ services:
 
     environment:
       NODE_ENV: production
-      NODE_OPTIONS: "--max-old-space-size=192"
+      NODE_OPTIONS: "--max-old-space-size=96"
       TZ: Asia/Shanghai
 
     healthcheck:
