@@ -994,8 +994,8 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   if (!isValidEmail(userEmail || '')) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
-  if (typeof amount_fen !== 'number' || !Number.isFinite(amount_fen) || amount_fen === 0 || !Number.isInteger(amount_fen)) {
-    return res.status(400).json({ success: false, msg: 'amount_fen 必须为有限的非零整数' });
+  if (typeof amount_fen !== 'number' || !Number.isInteger(amount_fen) || amount_fen === 0) {
+    return res.status(400).json({ success: false, msg: 'amount_fen 必须为非零整数' });
   }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
