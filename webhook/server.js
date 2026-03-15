@@ -171,9 +171,12 @@ function normalizeEmail(email) {
   return typeof email === 'string' ? email.trim().toLowerCase() : '';
 }
 
+/** Token 分段字段允许的最大值（1000 万 tokens，防止恶意超大值） */
+const MAX_TOKEN_VALUE = 10_000_000;
+
 /** 解析可选的非负整数（用于 Token 分段字段），非法值或超限值返回 undefined */
 function parseOptionalNonNegInt(value) {
-  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= 10_000_000) {
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= MAX_TOKEN_VALUE) {
     return value;
   }
   return undefined;
