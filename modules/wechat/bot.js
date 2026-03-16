@@ -9,6 +9,7 @@ const http       = require('http');
 const { WechatyBuilder } = require('wechaty');
 const { request } = require('undici');
 const winston    = require('winston');
+const Redis      = require('ioredis');
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -36,6 +37,22 @@ const BOT_NAME        = process.env.BOT_NAME || 'Anima';
 const VOICE_ENABLED   = process.env.VOICE_ENABLED === 'true';
 const WHISPER_URL     = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transcribe';
 const TTS_URL         = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
+const BILLING_ENABLED = process.env.BILLING_ENABLED === 'true';
+const REDIS_URL       = process.env.REDIS_URL;
+
+// ─── Redis（用户邮箱绑定持久化）──────────────────────────────
+const redis = REDIS_URL
+  ? new Redis(REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: true })
+  : null;
+
+if (redis) {
+  redis.connect().catch((err) => {
+    logger.error('Redis 连接失败（用户绑定将不可用）', { err: err.message });
+  });
+  redis.on('error', (err) => {
+    logger.error('Redis 连接错误', { err: err.message });
+  });
+}
 
 /** 转义正则特殊字符，防止 new RegExp() 注入 */
 function escapeRegExp(s) {
@@ -47,9 +64,27 @@ const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
-/** userId → email 绑定表（持久化需重启后重新绑定，生产建议存 DB/Redis）
- * TODO: 实现持久化存储（写入 PostgreSQL user_billing 或 Redis），避免重启后用户需重新绑定 */
-const userEmailMap = new Map();
+/** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
+const REDIS_EMAIL_KEY = 'anima:user_emails';
+
+async function getUserEmail(userId) {
+  if (!redis) return undefined;
+  try {
+    return await redis.hget(REDIS_EMAIL_KEY, String(userId)) || undefined;
+  } catch (err) {
+    logger.error('Redis hget 失败', { err: err.message, userId });
+    return undefined;
+  }
+}
+
+async function setUserEmail(userId, email) {
+  if (!redis) return;
+  try {
+    await redis.hset(REDIS_EMAIL_KEY, String(userId), email);
+  } catch (err) {
+    logger.error('Redis hset 失败', { err: err.message, userId });
+  }
+}
 
 function getSession(userId) {
   const session = sessions.get(userId);
@@ -112,7 +147,7 @@ async function callAgent(userId, message) {
         model: DEFAULT_MODEL,
         messages: session.messages,
         userId: userId,
-        userEmail: userEmailMap.get(userId) || undefined,
+        userEmail: await getUserEmail(userId),
       }),
     });
     const data = await body.json();
@@ -183,7 +218,7 @@ bot.on('message', async (msg) => {
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
           await msg.say('❌ 邮箱格式不正确，请重新输入。\n示例：/bind yourname@example.com');
         } else {
-          userEmailMap.set(userId, email);
+          await setUserEmail(userId, email);
           logger.info('用户绑定邮箱', { userId, email });
           await msg.say(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
         }
@@ -251,6 +286,7 @@ bot.start()
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭...`);
   clearInterval(sessionCleanupTimer);
+  if (redis) redis.disconnect();
   bot.stop()
     .then(() => {
       healthServer.close();

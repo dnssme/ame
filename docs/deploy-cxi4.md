@@ -941,17 +941,11 @@ curl -s -o /dev/null -w "%{http_code}" \
 ### 数据库备份
 
 ```bash
-# 手动备份（每日凌晨由 cron 执行）
-BACKUP_FILE="/opt/ai/backup/librechat_$(date +%Y%m%d_%H%M%S).sql.gz"
-mkdir -p /opt/ai/backup
-PGPASSWORD="<animaapp密码>" PGSSLMODE=require pg_dump \
-  -h anima-db.postgres.database.azure.com \
-  -U animaapp -d librechat \
-  | gzip > "${BACKUP_FILE}"
-echo "备份完成: ${BACKUP_FILE}"
+# 手动备份（使用 backup-pg.sh 脚本，自动备份 librechat + openclaw 双库）
+/opt/ai/scripts/backup-pg.sh
 
-# 配置每日自动备份
-(crontab -l 2>/dev/null; echo "0 2 * * * PGPASSWORD='<密码>' PGSSLMODE=require pg_dump -h anima-db.postgres.database.azure.com -U animaapp -d librechat | gzip > /opt/ai/backup/librechat_\$(date +\%Y\%m\%d).sql.gz") | crontab -
+# 配置每日自动备份（凌晨 2 点执行，含错误处理、自动清理、双库备份）
+(crontab -l 2>/dev/null; echo "0 2 * * * /opt/ai/scripts/backup-pg.sh >> /var/log/anima-backup.log 2>&1") | crontab -
 ```
 
 ---
