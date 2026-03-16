@@ -1176,6 +1176,10 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof amount_fen !== 'number' || !Number.isInteger(amount_fen) || amount_fen === 0) {
     return res.status(400).json({ success: false, msg: 'amount_fen 必须为非零整数' });
   }
+  // 应用层幅度限制：单次调整上限 ¥100,000（10,000,000 分），防止误操作
+  if (Math.abs(amount_fen) > 10_000_000) {
+    return res.status(400).json({ success: false, msg: '单次调整金额不能超过 ¥100,000（10,000,000 分）' });
+  }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
     return res.status(400).json({ success: false, msg: `type 必须是 ${validTypes.join('/')} 之一` });
