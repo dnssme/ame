@@ -19,6 +19,12 @@ const logger = winston.createLogger({
   ),
   transports: [
     new winston.transports.Console(),
+    new winston.transports.File({
+      filename: '/app/data/telegram-bot.log',
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 3,
+      tailable: true,
+    }),
   ],
 });
 
@@ -40,6 +46,10 @@ const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 const userModels = new Map(); // userId → model name
+
+/** userId → email 绑定表（持久化需重启后重新绑定，生产建议存 DB/Redis）
+ * TODO: 实现持久化存储（写入 PostgreSQL user_billing 或 Redis），避免重启后用户需重新绑定 */
+const userEmailMap = new Map();
 
 function getSession(userId) {
   const session = sessions.get(userId);
@@ -103,6 +113,7 @@ async function callAgent(userId, message) {
         model,
         messages: session.messages,
         userId: String(userId),
+        userEmail: userEmailMap.get(userId) || undefined,
       }),
     });
     const data = await body.json();
@@ -139,6 +150,7 @@ bot.start((ctx) => {
     '直接发送消息即可与 AI 对话。\n\n' +
     '可用命令：\n' +
     '/model <模型名> — 切换 AI 模型\n' +
+    '/bind <邮箱> — 绑定计费邮箱（首次使用必须绑定）\n' +
     '/balance <邮箱> — 查询余额\n' +
     '/clear — 清除对话上下文\n' +
     '/help — 查看帮助'
@@ -150,10 +162,28 @@ bot.help((ctx) => {
   ctx.reply(
     '📖 Anima 灵枢 命令列表：\n\n' +
     '/model <模型名> — 切换模型（如 claude-sonnet-4-5）\n' +
+    '/bind <邮箱> — 绑定计费邮箱，用于计费归因\n' +
     '/balance <邮箱> — 查询账户余额\n' +
     '/clear — 清除当前对话上下文\n' +
     '/help — 显示此帮助'
   );
+});
+
+// /bind 绑定计费邮箱
+bot.command('bind', (ctx) => {
+  const email = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
+  if (!email) {
+    const current = userEmailMap.get(ctx.from.id);
+    return ctx.reply(current
+      ? `当前绑定邮箱：${current}\n\n用法：/bind <邮箱>`
+      : '尚未绑定邮箱。\n\n用法：/bind <邮箱>\n示例：/bind yourname@example.com');
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    return ctx.reply('❌ 邮箱格式不正确，请重新输入。\n示例：/bind yourname@example.com');
+  }
+  userEmailMap.set(ctx.from.id, email);
+  logger.info('用户绑定邮箱', { userId: ctx.from.id, email });
+  ctx.reply(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
 });
 
 // /model 切换模型

@@ -416,6 +416,8 @@ npm install --omit=dev
 ```bash
 # 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
 ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
+# 生成随机 SERVICE_TOKEN（用于 /billing/record 和 /billing/check 内部服务鉴权）
+SERVICE_TOKEN_VAL="$(openssl rand -hex 32)"
 
 cat > /opt/ai/webhook/.env <<EOF
 PG_HOST=anima-db.postgres.database.azure.com
@@ -428,13 +430,17 @@ HOST=172.16.1.5
 LOG_LEVEL=info
 # 管理员接口令牌（已自动生成，请妥善保管）
 ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
+# 内部服务鉴权令牌（OpenClaw 调用 /billing/record 时携带，防止内网未授权访问）
+SERVICE_TOKEN=${SERVICE_TOKEN_VAL}
 EOF
 
 chmod 600 /opt/ai/webhook/.env
 echo "ADMIN_TOKEN: ${ADMIN_TOKEN_VAL}"
+echo "SERVICE_TOKEN: ${SERVICE_TOKEN_VAL}"
 ```
 
-> ⚠️ **立即保存 `ADMIN_TOKEN`**，后续所有管理员 API 操作均需此令牌。
+> ⚠️ **立即保存 `ADMIN_TOKEN` 和 `SERVICE_TOKEN`**，后续所有管理员 API 操作均需 ADMIN_TOKEN；
+> OpenClaw 的 `openclaw/.env` 需将 `SERVICE_TOKEN` 填入 `SERVICE_TOKEN` 字段。
 
 ### 6.5 初始化数据库 Schema
 

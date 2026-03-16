@@ -276,6 +276,10 @@ grep 'url:' /opt/ai/repo/openclaw/config.yml | grep redis
 # 确认数据库地址
 grep 'database:' /opt/ai/repo/openclaw/config.yml
 # 预期：...anima-db.postgres.database.azure.com...
+
+# 限制 config.yml 权限（含有 API Key 等敏感变量引用，最小权限原则）
+chmod 600 /opt/ai/repo/openclaw/config.yml
+chown root:root /opt/ai/repo/openclaw/config.yml
 ```
 
 ### 6.4 创建数据目录并启动

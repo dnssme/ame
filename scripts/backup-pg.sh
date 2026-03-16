@@ -13,7 +13,7 @@
 #   # 手动执行
 #   bash scripts/backup-pg.sh
 #
-#   # 配置 cron 每日凌晨 2 点自动执行
+#   # 配置 cron 每日凌晨 2 点自动执行（脚本会自动从 /opt/ai/webhook/.env 加载 PGPASSWORD）
 #   0 2 * * * /opt/ai/scripts/backup-pg.sh >> /var/log/anima-backup.log 2>&1
 #
 # 环境变量：
@@ -36,8 +36,39 @@ DATABASES="${DATABASES:-librechat openclaw}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # ─── 检查必要条件 ───────────────────────────────────────────
+# PGPASSWORD 未设置时尝试从 webhook/.env 自动加载（cron 环境无 shell 变量）
 if [ -z "${PGPASSWORD:-}" ]; then
-  echo "[ERROR] $(date '+%F %T') PGPASSWORD 环境变量未设置" >&2
+  ENV_FILE="${ENV_FILE:-/opt/ai/webhook/.env}"
+  if [ -f "${ENV_FILE}" ]; then
+    # 使用 Python 解析 .env（比 grep+cut 更安全，正确处理引号和等号）
+    PGPASSWORD="$(python3 -c "
+import re, sys
+with open('${ENV_FILE}') as f:
+    for line in f:
+        m = re.match(r'^PGPASSWORD=(.*)$', line.rstrip())
+        if m:
+            v = m.group(1).strip().strip(\"'\").strip('\"')
+            print(v, end='')
+            sys.exit(0)
+" 2>/dev/null || true)"
+    if [ -z "${PGPASSWORD:-}" ]; then
+      PGPASSWORD="$(python3 -c "
+import re, sys
+with open('${ENV_FILE}') as f:
+    for line in f:
+        m = re.match(r'^PG_PASSWORD=(.*)$', line.rstrip())
+        if m:
+            v = m.group(1).strip().strip(\"'\").strip('\"')
+            print(v, end='')
+            sys.exit(0)
+" 2>/dev/null || true)"
+    fi
+    [ -n "${PGPASSWORD:-}" ] && export PGPASSWORD
+  fi
+fi
+
+if [ -z "${PGPASSWORD:-}" ]; then
+  echo "[ERROR] $(date '+%F %T') PGPASSWORD 环境变量未设置，且无法从 ${ENV_FILE:-/opt/ai/webhook/.env} 加载" >&2
   exit 1
 fi
 

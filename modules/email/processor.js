@@ -26,6 +26,7 @@ const logger = winston.createLogger({
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'claude-haiku-4-5-20251001';
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
+const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER;
 
 // ─── IMAP 客户端 ─────────────────────────────────────────────
 function createImapClient() {
@@ -110,6 +111,23 @@ async function checkNewEmails() {
         // AI 分析
         const analysis = await analyzeEmail(subject, from, textBody);
         logger.info('邮件分析完成', { subject, analysis: analysis.substring(0, 200) });
+
+        // 将分析结果发送到通知邮箱
+        if (NOTIFY_EMAIL) {
+          await sendEmail(
+            NOTIFY_EMAIL,
+            `[Anima 邮件摘要] ${subject}`,
+            [
+              `发件人：${from}`,
+              `主题：${subject}`,
+              '',
+              '── AI 分析结果 ──',
+              analysis,
+            ].join('\n')
+          );
+        } else {
+          logger.warn('NOTIFY_EMAIL 未配置，分析结果仅写入日志');
+        }
 
         count++;
       }

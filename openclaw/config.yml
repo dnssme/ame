@@ -286,6 +286,9 @@ ollama:
 billing:
   enabled: true
   webhookUrl: http://172.16.1.5:3002/billing/record
+  # 内部服务鉴权 Token（对应 webhook SERVICE_TOKEN 环境变量）
+  # 用于 /billing/record 和 /billing/check 的来源鉴权，防止内网未授权进程伪造计费
+  serviceToken: ${SERVICE_TOKEN}
   # 调用 /models 接口获取最新定价列表，每 5 分钟缓存一次
   modelsCacheUrl: http://172.16.1.5:3002/models
   modelsCacheTtl: 300
