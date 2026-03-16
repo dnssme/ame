@@ -47,6 +47,9 @@ const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
+/** userId → email 绑定表（持久化需重启后重新绑定，生产建议存 DB/Redis） */
+const userEmailMap = new Map();
+
 function getSession(userId) {
   const session = sessions.get(userId);
   if (session && Date.now() - session.lastActive < SESSION_TTL) {
@@ -108,6 +111,7 @@ async function callAgent(userId, message) {
         model: DEFAULT_MODEL,
         messages: session.messages,
         userId: userId,
+        userEmail: userEmailMap.get(userId) || undefined,
       }),
     });
     const data = await body.json();
@@ -171,6 +175,19 @@ bot.on('message', async (msg) => {
       if (!text) return;
 
       logger.info('收到文字消息', { userId, text: text.substring(0, 100), isGroup });
+
+      // /bind <email> — 绑定计费邮箱，用于计费归因
+      if (text.startsWith('/bind ')) {
+        const email = text.slice(6).trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+          await msg.say('❌ 邮箱格式不正确，请重新输入。\n示例：/bind yourname@example.com');
+        } else {
+          userEmailMap.set(userId, email);
+          logger.info('用户绑定邮箱', { userId, email });
+          await msg.say(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
+        }
+        return;
+      }
 
       const longRunning = isLongRunningTask(text);
 

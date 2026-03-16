@@ -314,6 +314,11 @@ mkdir -p /www/wwwlogs/owasp
 chown root:root /www/wwwlogs/owasp
 chmod 700 /www/wwwlogs/owasp
 mkdir -p /var/www/certbot
+
+# 创建 IP 黑白名单占位文件（main.conf 的 Include 指令必须能找到这两个文件）
+touch /opt/owasp/conf/hosts.allow /opt/owasp/conf/hosts.deny
+chmod 600 /opt/owasp/conf/hosts.allow /opt/owasp/conf/hosts.deny
+chown root:root /opt/owasp/conf/hosts.allow /opt/owasp/conf/hosts.deny
 ```
 
 ### 5.7 编译安装验证
@@ -410,6 +415,10 @@ chown root:root /opt/nginx/src/ModSecurity/modsecurity.conf \
 > sed -i 's/^SecRuleEngine.*/SecRuleEngine On/' \
 >   /opt/nginx/src/ModSecurity/modsecurity.conf
 > ```
+>
+> > 🔴 **PCI-DSS 6.4.1 强制要求**：上线前必须将 `SecRuleEngine` 改回 `On`（主动拦截模式）。
+> > DetectionOnly 模式仅记录不拦截，WAF 形同虚设，不满足合规要求。
+> > 部署检查清单第 ✅ 项中已包含此验证步骤，请务必确认通过后再投入生产。
 
 ---
 

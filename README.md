@@ -41,7 +41,7 @@
 | 二、语音能力 | 🎤 语音输入 (ASR) | ✅ 已部署 | [`modules/voice/`](modules/voice/) | Whisper Small CPU int8，中文优先，10s 音频 ≈ 3s 识别 |
 | | 🔊 语音输出 (TTS) | ✅ 已部署 | [`modules/voice/`](modules/voice/) | Coqui TTS 中文 Baker 模型，延迟 <100ms |
 | 三、AI 工具调用 | 🌐 网页搜索 | ✅ 已部署 | [`modules/web-search/`](modules/web-search/) | DuckDuckGo，无需 API Key |
-| | 📧 邮件处理 | ✅ 已部署 | [`modules/email/`](modules/email/) | AI 自动起草、分类、回复邮件（IMAP/SMTP） |
+| | 📧 邮件处理 | ✅ 已部署 | [`modules/email/`](modules/email/) | AI 自动分类、摘要邮件并推送到通知邮箱（IMAP/SMTP）；自动起草回复需配置 NOTIFY_EMAIL 后生效 |
 | | 📄 文件分析 | ✅ 已部署 | [`modules/file-analysis/`](modules/file-analysis/) | 上传 PDF / 图片 / 文档，AI 解析 |
 | | 🧠 持久记忆 | ✅ 已部署 | `openclaw/` | 用户偏好、历史上下文存入数据库 |
 | 四、智能家居 | 🏠 设备控制 | ✅ 已部署 | [`modules/smart-home/`](modules/smart-home/) | HA Core on CXI4，Zigbee/WiFi/Matter，语音控制 |

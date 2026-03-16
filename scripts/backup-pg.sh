@@ -13,7 +13,7 @@
 #   # 手动执行
 #   bash scripts/backup-pg.sh
 #
-#   # 配置 cron 每日凌晨 2 点自动执行
+#   # 配置 cron 每日凌晨 2 点自动执行（脚本会自动从 /opt/ai/webhook/.env 加载 PGPASSWORD）
 #   0 2 * * * /opt/ai/scripts/backup-pg.sh >> /var/log/anima-backup.log 2>&1
 #
 # 环境变量：
@@ -36,8 +36,21 @@ DATABASES="${DATABASES:-librechat openclaw}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # ─── 检查必要条件 ───────────────────────────────────────────
+# PGPASSWORD 未设置时尝试从 webhook/.env 自动加载（cron 环境无 shell 变量）
 if [ -z "${PGPASSWORD:-}" ]; then
-  echo "[ERROR] $(date '+%F %T') PGPASSWORD 环境变量未设置" >&2
+  ENV_FILE="${ENV_FILE:-/opt/ai/webhook/.env}"
+  if [ -f "${ENV_FILE}" ]; then
+    PGPASSWORD="$(grep -E '^PGPASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+    if [ -z "${PGPASSWORD:-}" ]; then
+      # 兼容 PG_PASSWORD 别名
+      PGPASSWORD="$(grep -E '^PG_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+    fi
+    [ -n "${PGPASSWORD:-}" ] && export PGPASSWORD
+  fi
+fi
+
+if [ -z "${PGPASSWORD:-}" ]; then
+  echo "[ERROR] $(date '+%F %T') PGPASSWORD 环境变量未设置，且无法从 ${ENV_FILE:-/opt/ai/webhook/.env} 加载" >&2
   exit 1
 fi
 

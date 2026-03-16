@@ -197,6 +197,10 @@ const adminLimiter = rateLimit({
 // ─── 管理员鉴权中间件 ─────────────────────────────────────────
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
+// 内部服务 Token（用于 /billing/record 和 /billing/check 的来源鉴权）
+// 通过 SERVICE_TOKEN 环境变量配置，防止内网其他进程伪造计费记录（CIS 网络分段 + PCI-DSS 7.x）
+const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
+
 /**
  * 定时安全的字符串比较，防止计时攻击（PCI-DSS 6.3.2 / CIS）。
  * 对不同长度的输入补齐后再比较，保持固定时间路径，不泄露任何信息。
@@ -223,6 +227,25 @@ function requireAdmin(req, res, next) {
     // PCI-DSS 10.2.5：记录失败的认证尝试
     logger.warn('Admin auth failed', { ip: req.ip, path: req.path });
     return res.status(401).json({ success: false, msg: '未授权' });
+  }
+  next();
+}
+
+/**
+ * 内部服务鉴权中间件（用于 /billing/record、/billing/check）。
+ * 验证 X-Service-Token 请求头，防止内网未授权进程触发计费。
+ * 若未配置 SERVICE_TOKEN 环境变量，接口仍可访问（降级兼容），
+ * 但会在日志中发出警告提醒管理员配置。
+ */
+function requireServiceToken(req, res, next) {
+  if (!SERVICE_TOKEN) {
+    logger.warn('SERVICE_TOKEN 未配置，/billing 写入接口无内部服务鉴权（建议设置）', { path: req.path });
+    return next();
+  }
+  const token = req.headers['x-service-token'] || '';
+  if (!safeCompare(token, SERVICE_TOKEN)) {
+    logger.warn('Service token auth failed', { ip: req.ip, path: req.path });
+    return res.status(401).json({ success: false, msg: '内部服务鉴权失败' });
   }
   next();
 }
@@ -331,15 +354,16 @@ const MAX_SINGLE_REQUEST_FEN = (() => {
 })();
 
 // USD → CNY 汇率（用于将 USD 定价模型换算为人民币分计费）
-// 默认值 7.2；可通过 USD_TO_CNY_RATE 环境变量覆盖，管理员应定期更新
-const USD_TO_CNY_RATE = (() => {
+// 每次计费时从环境变量实时读取，管理员更新环境变量后无需重启服务即可生效。
+// 默认值 7.2；可通过 USD_TO_CNY_RATE 环境变量在运行时热更新。
+function getUsdToCnyRate() {
   const v = parseFloat(process.env.USD_TO_CNY_RATE || '7.2');
   if (!Number.isFinite(v) || v <= 0) {
     logger.warn('USD_TO_CNY_RATE 非法，使用默认值 7.2');
     return 7.2;
   }
   return v;
-})();
+}
 
 /**
  * 计算输入 Token 的费用（分），支持缓存感知分层定价。
@@ -365,8 +389,8 @@ const USD_TO_CNY_RATE = (() => {
  * @returns {number} 费用（分），向上取整
  */
 function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, currency, supportsCache, promptTokens, historyTokens }) {
-  // 若定价为 USD，换算为 CNY
-  const fxRate = (currency === 'USD') ? USD_TO_CNY_RATE : 1;
+  // 若定价为 USD，换算为 CNY（每次计费时实时读取汇率，管理员可热更新）
+  const fxRate = (currency === 'USD') ? getUsdToCnyRate() : 1;
   const cnyPriceIn  = priceIn  * fxRate;
   const cnyPriceOut = priceOut * fxRate;
 
@@ -604,7 +628,7 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
  *   is_suspended:  boolean
  * }
  */
-app.post('/billing/check', readLimiter, async (req, res) => {
+app.post('/billing/check', readLimiter, requireServiceToken, async (req, res) => {
   let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
           estimatedInputChars, estimatedOutputChars,
           estimatedPromptTokens, estimatedHistoryTokens } = req.body ?? {};
@@ -724,7 +748,7 @@ app.post('/billing/check', readLimiter, async (req, res) => {
  *   balance_fen: number   // 扣费后余额
  * }
  */
-app.post('/billing/record', async (req, res) => {
+app.post('/billing/record', requireServiceToken, async (req, res) => {
   let { userEmail, apiProvider, modelName,
           inputTokens: rawInputTokens, outputTokens: rawOutputTokens,
           inputChars, outputChars,
