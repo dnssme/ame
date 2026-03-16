@@ -64,7 +64,7 @@ const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
 /** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
-const REDIS_EMAIL_KEY = 'anima:user_emails';
+const REDIS_EMAIL_KEY = 'anima:wechat_emails';
 
 async function getUserEmail(userId) {
   if (!redis) return undefined;
@@ -229,6 +229,14 @@ bot.on('message', async (msg) => {
       }
 
       logger.info('收到文字消息', { userId, text: text.substring(0, 100), isGroup });
+
+      // /clear — 清除对话上下文
+      if (text === '/clear') {
+        sessions.delete(userId);
+        logger.info('用户清除对话上下文', { userId });
+        await msg.say('🗑 对话上下文已清除。');
+        return;
+      }
 
       // /bind <email> — 绑定计费邮箱，用于计费归因
       if (text.startsWith('/bind ')) {
