@@ -32,7 +32,7 @@ const logger = winston.createLogger({
 // ─── 配置 ────────────────────────────────────────────────────
 const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
-const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'claude-haiku-4-5-20251001';
+const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const BILLING_URL   = process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.5:3002';
 const REDIS_URL     = process.env.REDIS_URL;
 const ALLOWED_IDS   = (process.env.ALLOWED_USER_IDS || '')

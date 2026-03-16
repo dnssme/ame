@@ -32,7 +32,7 @@ if (missingEnvVars.length > 0) {
 
 // ─── 配置 ────────────────────────────────────────────────────
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
-const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'claude-haiku-4-5-20251001';
+const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER;
 
