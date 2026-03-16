@@ -64,7 +64,7 @@ services:
 
   # ─── OpenClaw Agent ────────────────────────────────────────
   openclaw:
-    image: openclaw/openclaw:latest
+    build: ./openclaw
     container_name: openclaw
     restart: unless-stopped
     profiles: ["default"]
@@ -165,7 +165,7 @@ services:
 
   # ─── OpenClaw Agent 轻量版 ─────────────────────────────────
   openclaw-light:
-    image: openclaw/openclaw:latest
+    build: ./openclaw
     container_name: openclaw
     restart: unless-stopped
     profiles: ["lightweight"]

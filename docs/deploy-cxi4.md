@@ -464,6 +464,8 @@ echo "数据库 Schema 初始化完成"
 
 ### 6.6 创建 systemd 服务
 
+> ⚠️ **二选一**：本节使用 systemd 直接运行 Webhook。如果你使用根目录 `docker-compose.yml` 中的 `webhook` 服务（容器化部署），请跳过本节，**不要同时启用两套部署方式**，否则会产生端口冲突（两者都监听 `172.16.1.5:3002`）。
+
 ```bash
 cat > /etc/systemd/system/ai-webhook.service <<'SERVICE'
 [Unit]

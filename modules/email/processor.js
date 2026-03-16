@@ -35,6 +35,7 @@ const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER;
+const MAX_EMAILS_PER_CHECK = parseInt(process.env.MAX_EMAILS_PER_CHECK || '20', 10);
 
 // ─── IMAP 客户端 ─────────────────────────────────────────────
 function createImapClient() {
@@ -138,6 +139,10 @@ async function checkNewEmails() {
         }
 
         count++;
+        if (count >= MAX_EMAILS_PER_CHECK) {
+          logger.info(`已达到单次检查上限（${MAX_EMAILS_PER_CHECK} 封），剩余邮件下次处理`);
+          break;
+        }
       }
 
       if (count > 0) {

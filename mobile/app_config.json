@@ -9,7 +9,7 @@
     "auth": "/api/auth/login",
     "register": "/api/auth/register",
     "chat": "/api/ask",
-    "models": "/api/models",
+    "models": "/models",
     "conversations": "/api/convos",
     "fileUpload": "/api/files/upload",
     "activate": "/activate",
@@ -19,7 +19,7 @@
   },
 
   "_comment_defaults": "默认设置",
-  "defaultModel": "claude-haiku-4-5-20251001",
+  "defaultModel": "glm-4-flash",
   "maxContextMessages": 20,
   "sessionTimeoutMs": 86400000,
 

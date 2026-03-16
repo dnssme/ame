@@ -42,7 +42,6 @@ const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Pool }  = require('pg');
 const winston   = require('winston');
-const { encoding_for_model, get_encoding } = require('tiktoken');
 const Redis     = require('ioredis');
 
 // ─── 日志 ────────────────────────────────────────────────────
@@ -164,6 +163,9 @@ async function incrFreeDailyUsage(userEmail) {
 
 // ─── Express 应用 ─────────────────────────────────────────────
 const app = express();
+
+// Webhook 运行在 Nginx 反向代理后面，启用 trust proxy 以正确获取客户端真实 IP
+app.set('trust proxy', '172.16.1.1');
 
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
@@ -294,44 +296,6 @@ async function ensureUser(client, userEmail) {
      ON CONFLICT (user_email) DO NOTHING`,
     [userEmail]
   );
-}
-
-// ─── Tiktoken 编码器缓存 ──────────────────────────────────────
-// 缓存大小有限：tiktoken 仅有少量编码（cl100k_base, p50k_base, o200k_base 等），
-// 且模型名会映射到这些编码之一，因此缓存不会无限增长。
-const encoderCache = new Map();
-// cl100k_base 覆盖 GPT-4 / GPT-3.5-turbo / Claude 等主流模型族
-const FALLBACK_ENCODING = 'cl100k_base';
-
-/**
- * 获取指定模型的 Tiktoken 编码器（带缓存）。
- * 若模型未识别则回退到 cl100k_base（覆盖 GPT-4 / Claude 等主流模型）。
- */
-function getEncoder(modelName) {
-  if (encoderCache.has(modelName)) return encoderCache.get(modelName);
-  try {
-    const enc = encoding_for_model(modelName);
-    encoderCache.set(modelName, enc);
-    return enc;
-  } catch {
-    // 模型未识别，使用通用编码
-    if (!encoderCache.has(FALLBACK_ENCODING)) {
-      encoderCache.set(FALLBACK_ENCODING, get_encoding(FALLBACK_ENCODING));
-    }
-    return encoderCache.get(FALLBACK_ENCODING);
-  }
-}
-
-/**
- * 使用 Tiktoken 计算文本的 Token 数量。
- * @param {string} text - 输入文本
- * @param {string} modelName - 模型名称（用于选择编码器）
- * @returns {number} Token 数量
- */
-function countTokens(text, modelName) {
-  if (!text || typeof text !== 'string') return 0;
-  const enc = getEncoder(modelName);
-  return enc.encode(text).length;
 }
 
 /**

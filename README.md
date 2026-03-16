@@ -355,7 +355,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | **VPS D** (172.16.1.4) | Nextcloud（日历/网盘） | 2 核 | 1 GB | — | 容器 ≤512 MB | ~488 MB 系统 |
 | **CXI4** (172.16.1.5) | Webhook + Redis + Whisper + TTS + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB | Webhook 256m + Redis ≤1g + Whisper 2g + TTS 768m ≈ 4g | ~4 GB 系统 |
 
-> ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 768m、OpenClaw 设为 600m，均已在 `docker-compose.yml` 中配置。
+> ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 768m、OpenClaw 设为 450m，均已在 `docker-compose.yml` 中配置。
 
 ### 各节点 UFW 防火墙规则（CIS L1 要求）
 
@@ -1512,7 +1512,7 @@ curl http://172.16.1.5:3002/admin/models \
 | 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | 双层日志：Winston 应用日志（10 MB × 5 轮替）+ ModSecurity 审计日志（`/www/wwwlogs/owasp/modsec_audit.log`，并发模式） |
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
-| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 600m）；JSON 日志轮替 |
+| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 450m）；JSON 日志轮替 |
 | 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配 1 GB VPS；Redis `maxmemory 1gb` + LRU 淘汰策略；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
 | 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | UFW 防火墙 → Nginx 限速/路径拦截 → ModSecurity WAF → 应用层校验 → DB 约束（五层纵深防御） |
 

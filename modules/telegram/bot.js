@@ -61,10 +61,11 @@ if (redis) {
 const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
-const userModels = new Map(); // userId → model name
 
 /** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
 const REDIS_EMAIL_KEY = 'anima:user_emails';
+/** userId → model 选择（通过 Redis 持久化，重启不丢失）*/
+const REDIS_MODELS_KEY = 'anima:user_models';
 
 async function getUserEmail(userId) {
   if (!redis) return undefined;
@@ -82,6 +83,25 @@ async function setUserEmail(userId, email) {
     await redis.hset(REDIS_EMAIL_KEY, String(userId), email);
   } catch (err) {
     logger.error('Redis hset 失败', { err: err.message, userId });
+  }
+}
+
+async function getUserModel(userId) {
+  if (!redis) return undefined;
+  try {
+    return await redis.hget(REDIS_MODELS_KEY, String(userId)) || undefined;
+  } catch (err) {
+    logger.error('Redis hget 失败（user_models）', { err: err.message, userId });
+    return undefined;
+  }
+}
+
+async function setUserModel(userId, model) {
+  if (!redis) return;
+  try {
+    await redis.hset(REDIS_MODELS_KEY, String(userId), model);
+  } catch (err) {
+    logger.error('Redis hset 失败（user_models）', { err: err.message, userId });
   }
 }
 
@@ -137,7 +157,7 @@ async function callAgent(userId, message) {
     session.messages = session.messages.slice(-20);
   }
 
-  const model = userModels.get(userId) || DEFAULT_MODEL;
+  const model = (await getUserModel(userId)) || DEFAULT_MODEL;
 
   try {
     const { body } = await request(`${AGENT_API_URL}/chat`, {
@@ -221,16 +241,16 @@ bot.command('bind', async (ctx) => {
 });
 
 // /model 切换模型
-bot.command('model', (ctx) => {
+bot.command('model', async (ctx) => {
   const model = ctx.message.text.split(' ').slice(1).join(' ').trim();
   if (!model) {
-    const current = userModels.get(ctx.from.id) || DEFAULT_MODEL;
+    const current = (await getUserModel(ctx.from.id)) || DEFAULT_MODEL;
     return ctx.reply(`当前模型：${current}\n\n用法：/model <模型名>`);
   }
   if (model.length > 128) {
     return ctx.reply('❌ 模型名称过长（最多 128 字符）');
   }
-  userModels.set(ctx.from.id, model);
+  await setUserModel(ctx.from.id, model);
   ctx.reply(`✅ 已切换到模型：${model}`);
 });
 
