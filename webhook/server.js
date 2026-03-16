@@ -307,7 +307,7 @@ function countTokens(text, modelName) {
  */
 async function lookupModel(modelName) {
   const res = await db.query(
-    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens, is_active, supports_cache
+    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens, currency, is_active, supports_cache
        FROM api_models WHERE model_name = $1`,
     [modelName]
   );
@@ -330,6 +330,17 @@ const MAX_SINGLE_REQUEST_FEN = (() => {
   return v;
 })();
 
+// USD → CNY 汇率（用于将 USD 定价模型换算为人民币分计费）
+// 默认值 7.2；可通过 USD_TO_CNY_RATE 环境变量覆盖，管理员应定期更新
+const USD_TO_CNY_RATE = (() => {
+  const v = parseFloat(process.env.USD_TO_CNY_RATE || '7.2');
+  if (!Number.isFinite(v) || v <= 0) {
+    logger.warn('USD_TO_CNY_RATE 非法，使用默认值 7.2');
+    return 7.2;
+  }
+  return v;
+})();
+
 /**
  * 计算输入 Token 的费用（分），支持缓存感知分层定价。
  *
@@ -340,17 +351,25 @@ const MAX_SINGLE_REQUEST_FEN = (() => {
  *
  * 否则按标准定价：所有 inputTokens * 全价
  *
+ * 若 currency='USD'，价格先乘以 USD_TO_CNY_RATE 换算为人民币再计费。
+ *
  * @param {object} params
  * @param {number} params.inputTokens    - 总输入 Token 数
  * @param {number} params.outputTokens   - 总输出 Token 数
- * @param {number} params.priceIn        - 输入价格（元/1000 Token）
- * @param {number} params.priceOut       - 输出价格（元/1000 Token）
+ * @param {number} params.priceIn        - 输入价格（原始货币/1000 Token）
+ * @param {number} params.priceOut       - 输出价格（原始货币/1000 Token）
+ * @param {string} [params.currency]     - 定价货币（'USD' 或 'CNY'，默认 'CNY'）
  * @param {boolean} params.supportsCache - 模型是否支持缓存
  * @param {number} [params.promptTokens]  - 新输入 Token 数（可选）
  * @param {number} [params.historyTokens] - 历史上下文 Token 数（可选）
  * @returns {number} 费用（分），向上取整
  */
-function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, supportsCache, promptTokens, historyTokens }) {
+function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, currency, supportsCache, promptTokens, historyTokens }) {
+  // 若定价为 USD，换算为 CNY
+  const fxRate = (currency === 'USD') ? USD_TO_CNY_RATE : 1;
+  const cnyPriceIn  = priceIn  * fxRate;
+  const cnyPriceOut = priceOut * fxRate;
+
   let inputCostYuan;
   const hasPartition = typeof promptTokens === 'number' && typeof historyTokens === 'number';
 
@@ -358,14 +377,14 @@ function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, sup
     // 分层计费：新输入 + 阈值内历史全价，阈值外历史打折
     const fullPriceTokens = promptTokens + CACHE_THRESHOLD_TOKENS;
     const discountedTokens = historyTokens - CACHE_THRESHOLD_TOKENS;
-    inputCostYuan = (fullPriceTokens / 1000) * priceIn
-                  + (discountedTokens / 1000) * priceIn * CACHE_DISCOUNT;
+    inputCostYuan = (fullPriceTokens / 1000) * cnyPriceIn
+                  + (discountedTokens / 1000) * cnyPriceIn * CACHE_DISCOUNT;
   } else {
     // 标准计费：所有输入 Token 全价
-    inputCostYuan = (inputTokens / 1000) * priceIn;
+    inputCostYuan = (inputTokens / 1000) * cnyPriceIn;
   }
 
-  const outputCostYuan = (outputTokens / 1000) * priceOut;
+  const outputCostYuan = (outputTokens / 1000) * cnyPriceOut;
   // 转换为分并向上取整
   return Math.ceil((inputCostYuan + outputCostYuan) * 100);
 }
@@ -397,7 +416,7 @@ app.get('/models', readLimiter, async (_req, res) => {
     const result = await db.query(
       `SELECT provider, model_name, display_name, is_free,
               price_input_per_1k_tokens, price_output_per_1k_tokens,
-              supports_cache, description
+              currency, supports_cache, description
          FROM api_models
         WHERE is_active = true
         ORDER BY provider, model_name`
@@ -642,6 +661,7 @@ app.post('/billing/check', readLimiter, async (req, res) => {
   const estimatedFen = calculateChargedFen({
     inputTokens: inTokens, outputTokens: outTokens,
     priceIn, priceOut,
+    currency: model.currency || 'CNY',
     supportsCache: !!model.supports_cache,
     promptTokens: promptTk, historyTokens: historyTk,
   });
@@ -820,6 +840,7 @@ app.post('/billing/record', async (req, res) => {
     const chargedFen = calculateChargedFen({
       inputTokens, outputTokens,
       priceIn, priceOut,
+      currency: model.currency || 'CNY',
       supportsCache: !!model.supports_cache,
       promptTokens: promptTk, historyTokens: historyTk,
     });
@@ -907,7 +928,7 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
     const result = await db.query(
       `SELECT id, provider, model_name, display_name, is_free,
               price_input_per_1k_tokens, price_output_per_1k_tokens,
-              is_active, supports_cache, description, created_at, updated_at
+              currency, is_active, supports_cache, description, created_at, updated_at
          FROM api_models
          ORDER BY provider, model_name`
     );
@@ -928,14 +949,15 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
  *   modelName:     string,
  *   displayName:   string,
  *   isFree:        boolean,
- *   priceInput:    number,   // 元/1000 Token
+ *   priceInput:    number,   // 元/1000 Token（货币单位见 currency）
  *   priceOutput:   number,
+ *   currency:      string,   // 可选，'USD' 或 'CNY'，默认 'CNY'
  *   supportsCache: boolean,  // 可选，是否支持 Prompt Caching
  *   description:   string    // 可选
  * }
  */
 app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
-  const { provider, modelName, displayName, isFree, priceInput, priceOutput, supportsCache, description } = req.body ?? {};
+  const { provider, modelName, displayName, isFree, priceInput, priceOutput, currency, supportsCache, description } = req.body ?? {};
 
   if (!provider || !modelName || !displayName) {
     return res.status(400).json({ success: false, msg: '缺少必填字段：provider、modelName、displayName' });
@@ -960,6 +982,10 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     // 应用层提前拦截，与 db/schema.sql 中 CHECK(>= 0) 约束互为防御
     return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
   }
+  const currencyVal = currency ?? 'CNY';
+  if (!['USD', 'CNY'].includes(currencyVal)) {
+    return res.status(400).json({ success: false, msg: 'currency 必须为 USD 或 CNY' });
+  }
   if (description != null && (typeof description !== 'string' || description.length > 1000)) {
     return res.status(400).json({ success: false, msg: 'description 长度不能超过 1000 字符' });
   }
@@ -968,21 +994,22 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     const result = await db.query(
       `INSERT INTO api_models
            (provider, model_name, display_name, is_free,
-            price_input_per_1k_tokens, price_output_per_1k_tokens, supports_cache, description)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            price_input_per_1k_tokens, price_output_per_1k_tokens, currency, supports_cache, description)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (model_name) DO UPDATE SET
            provider    = EXCLUDED.provider,
            display_name = EXCLUDED.display_name,
            is_free     = EXCLUDED.is_free,
            price_input_per_1k_tokens  = EXCLUDED.price_input_per_1k_tokens,
            price_output_per_1k_tokens = EXCLUDED.price_output_per_1k_tokens,
+           currency    = EXCLUDED.currency,
            supports_cache = EXCLUDED.supports_cache,
            description = EXCLUDED.description,
            is_active   = true
          RETURNING id, provider, model_name, display_name, is_free,
                    price_input_per_1k_tokens, price_output_per_1k_tokens,
-                   supports_cache, is_active`,
-      [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, !!supportsCache, description || null]
+                   currency, supports_cache, is_active`,
+      [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, currencyVal, !!supportsCache, description || null]
     );
 
     logger.info('Model upserted', { modelName, isFree });
@@ -1002,6 +1029,7 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
  *   isFree?:        boolean,
  *   priceInput?:    number,
  *   priceOutput?:   number,
+ *   currency?:      string,   // 'USD' 或 'CNY'
  *   isActive?:      boolean,
  *   supportsCache?: boolean,
  *   displayName?:   string,
@@ -1014,7 +1042,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: '模型 ID 无效' });
   }
 
-  const { isFree, priceInput, priceOutput, isActive, supportsCache, displayName, description } = req.body ?? {};
+  const { isFree, priceInput, priceOutput, currency, isActive, supportsCache, displayName, description } = req.body ?? {};
   const updates = [];
   const values  = [];
 
@@ -1049,6 +1077,13 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof supportsCache === 'boolean') {
     updates.push(`supports_cache = $${values.length + 1}`);
     values.push(supportsCache);
+  }
+  if (currency !== undefined) {
+    if (!['USD', 'CNY'].includes(currency)) {
+      return res.status(400).json({ success: false, msg: 'currency 必须为 USD 或 CNY' });
+    }
+    updates.push(`currency = $${values.length + 1}`);
+    values.push(currency);
   }
   if (typeof displayName === 'string') {
     if (displayName.trim().length === 0) {
