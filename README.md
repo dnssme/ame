@@ -15,11 +15,11 @@
 7. [计费规则](#计费规则)
 8. [前置条件](#前置条件)
 9. [各服务器详细部署教程](#各服务器详细部署教程)
-10. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
+10. [第一步：VPS E — 初始化 Webhook 计费服务](#第一步vps-e--初始化-webhook-计费服务)
 11. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
 12. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
 13. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
-14. [第五步：CXI4 — 部署 Nextcloud](#第五步cxi4--部署-nextcloud)
+14. [第五步：VPS D — 部署 Nextcloud](#第五步vps-d--部署-nextcloud)
 15. [第六步：初始化模型定价](#第六步初始化模型定价)
 16. [API 接口完整参考](#api-接口完整参考)
 17. [常用运维 SQL](#常用运维-sql)
@@ -244,17 +244,23 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 [VPS A] Nginx 反向代理 (172.16.1.1)
     ├─── /              → [VPS C] LibreChat    :3080
     ├─── /api/agent     → [VPS B] OpenClaw     :3000
-    ├─── /activate      → [CXI4]  Webhook      :3002
+    ├─── /activate      → [VPS E] Webhook      :3002
+    ├─── /billing/*     → [VPS E] Webhook      :3002
+    ├─── /models        → [VPS E] Webhook      :3002
     ├─── /tts/          → [CXI4]  Coqui TTS    :8082  （语音合成，中文 Baker）
     ├─── /whisper/      → [CXI4]  Whisper      :8080  （语音识别，Small 中文优先）
-    └─── /nextcloud/    → [CXI4]  Nextcloud    :8090  （日历/网盘）
+    └─── /nextcloud/    → [VPS D] Nextcloud    :8090  （日历/网盘）
 
-[CXI4] (172.16.1.5, i7-10610U / 8GB / 500GB SSD)
-    ├─── Nextcloud         :8090  ←── 日历 CalDAV + 网盘 WebDAV（500GB SSD）
+[VPS D] (172.16.1.4) — Nextcloud（香港 Azure，重新激活）
+    └─── Nextcloud         :8090  ←── 日历 CalDAV + 网盘 WebDAV
+
+[VPS E] (172.16.1.6) — Webhook + Redis（香港 Azure，新增）
     ├─── Webhook 计费服务  :3002  ←── OpenClaw / LibreChat 自动调用
-    ├─── Redis             :6379  ←── 会话缓存 + 免费用户每日限额
-    ├─── Coqui TTS         :8082  （中文 Baker 模型，延迟 <100ms）
+    └─── Redis             :6379  ←── 会话缓存 + 免费用户每日限额
+
+[CXI4] (172.16.1.5, i7-10610U / 8GB / 500GB SSD) — 青岛，ML 推理专用
     ├─── Whisper STT       :8080  （Small 模型，中文优先，10s≈3s）
+    ├─── Coqui TTS         :8082  （中文 Baker 模型，延迟 <100ms）
     ├─── (Email 处理)      :3004  （邮件处理模块）
     └─── (Home Assistant)  :8123  （智能家居 Zigbee/WiFi/Matter）
 
@@ -267,7 +273,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
     └─── openclaw   ←── OpenClaw 记忆数据库
 ```
 
-所有节点通过 **WireGuard 内网（172.16.1.0/24）** 互通，Webhook 服务和数据库完全不暴露公网。
+所有节点通过 **WireGuard 内网（172.16.1.0/24）** 互通，Webhook 服务和数据库完全不暴露公网。5× 双核 1 GB VPS（香港 Azure）+ CXI4（青岛）共 6 节点企业架构——DB 依赖服务（Nextcloud、Webhook）部署在香港，与 Azure PostgreSQL 同机房，消除跨境延迟；CXI4 仅承担 ML 推理负载。
 
 ### 目录结构
 
@@ -311,8 +317,9 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── deploy-vpsa.md       # VPS A — Nginx + WAF
 │   ├── deploy-vpsb.md       # VPS B — OpenClaw Agent
 │   ├── deploy-vpsc.md       # VPS C — LibreChat
-│   ├── deploy-vpsd.md       # VPS D — 已释放（Nextcloud 已迁移至 CXI4）
-│   ├── deploy-cxi4.md       # CXI4 — Nextcloud + Webhook + Redis + Voice + HA
+│   ├── deploy-vpsd.md       # VPS D — Nextcloud（CalDAV + WebDAV）
+│   ├── deploy-vpse.md       # VPS E — Webhook 计费 + Redis
+│   ├── deploy-cxi4.md       # CXI4 — Whisper + TTS + Email + HA（ML 推理专用）
 │   └── cloudflare-tunnel.md # Cloudflare Tunnel 配置
 └── scripts/
     ├── watchdog.sh          # Webhook 健康检查看门狗
@@ -353,11 +360,13 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | **VPS A** (172.16.1.1) | Nginx 反向代理 | 2 核 | 1 GB | — | Nginx ~50 MB | ~950 MB 系统 |
 | **VPS B** (172.16.1.2) | OpenClaw Agent | 2 核 | 1 GB | — | 容器 ≤600 MB | ~400 MB 系统 |
 | **VPS C** (172.16.1.3) | LibreChat | 2 核 | 1 GB | — | 容器 ≤768 MB | ~256 MB 系统 |
-| **CXI4** (172.16.1.5) | Nextcloud + Webhook + Redis + Whisper + TTS + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB SSD | Nextcloud 768m + Webhook 384m + Redis ≤1g + Whisper 2g + TTS 768m + Email 192m + HA 512m ≈ 5.6g | ~2.4 GB 系统 |
+| **VPS D** (172.16.1.4) | Nextcloud | 2 核 | 1 GB | — | 容器 ≤512 MB | ~500 MB 系统 |
+| **VPS E** (172.16.1.6) | Webhook + Redis | 2 核 | 1 GB | — | Webhook 256m + Redis 128m | ~640 MB 系统 |
+| **CXI4** (172.16.1.5) | Whisper + TTS + Email + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB SSD | Whisper 2g + TTS 768m + Email 192m + HA 512m ≈ 3.5g | ~4.5 GB 系统 |
 
 > ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 768m、OpenClaw 设为 450m，均已在 `docker-compose.yml` 中配置。
 >
-> 📌 **Nextcloud 已迁移至 CXI4**：CXI4 拥有 500 GB SSD，更适合存储用户文件和日历数据。VPS D (172.16.1.4) 已释放，可作为备用节点或未来扩展使用。
+> 📌 **6 节点企业架构**：VPS A–E 均为香港 Azure 双核 1 GB VPS，与 Azure PostgreSQL 同机房，DB 依赖服务（Nextcloud、Webhook + Redis）部署在港内消除跨境延迟。CXI4（青岛）仅承担 ML 推理（Whisper + TTS）和本地服务（Email + HA），负载从 5.6 GB 降至 3.5 GB。
 
 ### 各节点 UFW 防火墙规则（CIS L1 要求）
 
@@ -398,14 +407,36 @@ ufw allow in on wg0
 ufw enable
 
 # ──────────────────────────────────────────
-# CXI4 (172.16.1.5) — Nextcloud / Webhook / Redis（内网专用）
+# VPS D (172.16.1.4) — Nextcloud（内网专用）
 # ──────────────────────────────────────────
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
 ufw allow in from 172.16.1.0/24 to any port 8090  # Nextcloud（日历/网盘）
+ufw allow in on wg0
+ufw enable
+
+# ──────────────────────────────────────────
+# VPS E (172.16.1.6) — Webhook + Redis（内网专用）
+# ──────────────────────────────────────────
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
 ufw allow in from 172.16.1.0/24 to any port 3002  # Webhook 计费服务
 ufw allow in from 172.16.1.0/24 to any port 6379  # Redis（禁止公网直连）
+ufw allow in on wg0
+ufw enable
+
+# ──────────────────────────────────────────
+# CXI4 (172.16.1.5) — Whisper + TTS + Email + HA（内网专用）
+# ──────────────────────────────────────────
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow in from 172.16.1.0/24 to any port 8080  # Whisper STT
+ufw allow in from 172.16.1.0/24 to any port 8082  # Coqui TTS
+ufw allow in from 172.16.1.0/24 to any port 3004  # Email 处理
+ufw allow in from 172.16.1.0/24 to any port 8123  # Home Assistant
 ufw allow in on wg0
 ufw enable
 ```
@@ -419,14 +450,16 @@ ufw enable
 ping -c 2 172.16.1.1   # VPS A (Nginx)
 ping -c 2 172.16.1.2   # VPS B (OpenClaw)
 ping -c 2 172.16.1.3   # VPS C (LibreChat)
-ping -c 2 172.16.1.5   # CXI4 (Nextcloud/Webhook/Redis)
+ping -c 2 172.16.1.4   # VPS D (Nextcloud)
+ping -c 2 172.16.1.5   # CXI4 (Whisper/TTS/Email/HA)
+ping -c 2 172.16.1.6   # VPS E (Webhook/Redis)
 ```
 
 ---
 
-## 第一步：CXI4 — 初始化 Webhook 计费服务
+## 第一步：VPS E — 初始化 Webhook 计费服务
 
-> **执行节点：CXI4 (172.16.1.5)**
+> **执行节点：VPS E (172.16.1.6)**
 
 ### 1.1 安装 Redis
 
@@ -439,7 +472,7 @@ apt-get update && apt-get install -y redis-server
 REDIS_PASS="<强随机字符串>"   # 记录此密码，后续 LibreChat 和 OpenClaw 需要
 
 # 修改监听地址
-sed -i 's/^bind 127.0.0.1.*/bind 172.16.1.5 127.0.0.1/' /etc/redis/redis.conf
+sed -i 's/^bind 127.0.0.1.*/bind 172.16.1.6 127.0.0.1/' /etc/redis/redis.conf
 # 设置密码（取消 requirepass 注释并写入密码）
 sed -i "s/^# requirepass .*/requirepass ${REDIS_PASS}/" /etc/redis/redis.conf
 
@@ -447,14 +480,14 @@ systemctl enable --now redis-server
 systemctl restart redis-server
 
 # 验证（REDISCLI_AUTH 避免密码出现在进程列表 ps aux 中）
-REDISCLI_AUTH="${REDIS_PASS}" redis-cli -h 172.16.1.5 ping
+REDISCLI_AUTH="${REDIS_PASS}" redis-cli -h 172.16.1.6 ping
 # 预期输出：PONG
 ```
 
-> ⚠️ **Redis 内存限制（CXI4 共 8 GB，需为 Webhook / Whisper 预留内存）**：
+> ⚠️ **Redis 内存限制（VPS E 仅 1 GB，需为 Webhook + 系统预留内存）**：
 > ```bash
-> # 设置 Redis 最大内存为 1 GB，超出后按 LRU 策略淘汰
-> echo 'maxmemory 1gb' >> /etc/redis/redis.conf
+> # 设置 Redis 最大内存为 128 MB，超出后按 LRU 策略淘汰
+> echo 'maxmemory 128mb' >> /etc/redis/redis.conf
 > echo 'maxmemory-policy allkeys-lru' >> /etc/redis/redis.conf
 > systemctl restart redis-server
 > ```
@@ -519,7 +552,7 @@ PG_USER=animaapp
 PG_PASSWORD=<animaapp数据库密码>
 PG_DATABASE=librechat
 PORT=3002
-HOST=172.16.1.5
+HOST=172.16.1.6
 LOG_LEVEL=info
 ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
 EOF
@@ -588,11 +621,11 @@ sleep 3
 
 ```bash
 # 健康检查
-curl http://172.16.1.5:3002/health
+curl http://172.16.1.6:3002/health
 # 预期：{"status":"ok","db":"ok","ts":"..."}
 
 # 查看预置模型列表
-curl http://172.16.1.5:3002/models
+curl http://172.16.1.6:3002/models
 # 预期：返回 5 个已启用模型（含 Claude Haiku 免费模型）
 
 # 查看服务日志
@@ -936,15 +969,15 @@ tail -20 /www/wwwlogs/owasp/modsec_audit.log
 
 ---
 
-## 第五步：CXI4 — 部署 Nextcloud
+## 第五步：VPS D — 部署 Nextcloud
 
-详细教程参见 [docs/deploy-cxi4.md](docs/deploy-cxi4.md) 中 Nextcloud 部分。
+详细教程参见 [docs/deploy-vpsd.md](docs/deploy-vpsd.md) 中 Nextcloud 部分。
 
-> 📌 Nextcloud 部署在 CXI4 而非独立 VPS，因为 CXI4 拥有 500 GB SSD，更适合企业级文件存储。
+> 📌 Nextcloud 部署在 VPS D（香港 Azure），与 Azure PostgreSQL 同机房，消除跨境数据库延迟。
 
 ### 5.1 前置条件
 
-- CXI4 (172.16.1.5) 已完成第一步 Webhook + Redis 部署
+- VPS D (172.16.1.4) 已完成基础安全加固（UFW / fail2ban）
 - Azure PostgreSQL 已创建 `nextcloud` 数据库
 
 ### 5.2 部署 Nextcloud
@@ -977,7 +1010,7 @@ docker exec -u www-data anima-nextcloud php occ app:enable calendar
 docker exec -u www-data anima-nextcloud php occ dav:create-calendar admin anima
 
 # 验证 CalDAV
-curl -sf -u admin:<密码> http://172.16.1.5:8090/remote.php/dav/calendars/admin/anima/
+curl -sf -u admin:<密码> http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
 ```
 
 ### 5.4 配置 auditd 审计
@@ -1008,7 +1041,7 @@ sudo bash scripts/audit-setup.sh
 ```bash
 ADMIN_TOKEN="$(grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env | cut -d= -f2)"
 
-curl http://172.16.1.5:3002/admin/models \
+curl http://172.16.1.6:3002/admin/models \
   -H "Authorization: Bearer ${ADMIN_TOKEN}"
 ```
 
@@ -1018,7 +1051,7 @@ curl http://172.16.1.5:3002/admin/models \
 # 先查询模型 ID（从上一步输出中找到对应 id 字段）
 MODEL_ID=2   # claude-sonnet-4-5 的 id
 
-curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
+curl -X PUT "http://172.16.1.6:3002/admin/models/${MODEL_ID}" \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"priceInput": 0.025, "priceOutput": 0.050}'
@@ -1028,7 +1061,7 @@ curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
 
 ```bash
 # 添加付费模型
-curl -X POST http://172.16.1.5:3002/admin/models \
+curl -X POST http://172.16.1.6:3002/admin/models \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1042,7 +1075,7 @@ curl -X POST http://172.16.1.5:3002/admin/models \
   }'
 
 # 添加免费模型
-curl -X POST http://172.16.1.5:3002/admin/models \
+curl -X POST http://172.16.1.6:3002/admin/models \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1057,13 +1090,13 @@ curl -X POST http://172.16.1.5:3002/admin/models \
 
 ```bash
 # 停用模型（用户将无法选择该模型）
-curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
+curl -X PUT "http://172.16.1.6:3002/admin/models/${MODEL_ID}" \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"isActive": false}'
 
 # 重新启用
-curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
+curl -X PUT "http://172.16.1.6:3002/admin/models/${MODEL_ID}" \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"isActive": true}'
@@ -1088,7 +1121,7 @@ SQL
 ### 6.6 人工为用户充值
 
 ```bash
-curl -X POST http://172.16.1.5:3002/admin/adjust \
+curl -X POST http://172.16.1.6:3002/admin/adjust \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1108,7 +1141,7 @@ curl -X POST http://172.16.1.5:3002/admin/adjust \
 #### `GET /health` — 健康检查
 
 ```bash
-curl http://172.16.1.5:3002/health
+curl http://172.16.1.6:3002/health
 ```
 ```json
 {"status":"ok","db":"ok","ts":"2026-01-01T00:00:00.000Z"}
@@ -1119,7 +1152,7 @@ curl http://172.16.1.5:3002/health
 #### `GET /models` — 查看所有可用模型及定价
 
 ```bash
-curl http://172.16.1.5:3002/models
+curl http://172.16.1.6:3002/models
 ```
 ```json
 {
@@ -1143,7 +1176,7 @@ curl http://172.16.1.5:3002/models
 #### `POST /activate` — 充值卡激活
 
 ```bash
-curl -X POST http://172.16.1.5:3002/activate \
+curl -X POST http://172.16.1.6:3002/activate \
   -H "Content-Type: application/json" \
   -d '{"cardKey":"ANIMA-TOP20-DEMO","userEmail":"user@example.com"}'
 ```
@@ -1167,7 +1200,7 @@ curl -X POST http://172.16.1.5:3002/activate \
 #### `GET /billing/balance/:email` — 查询用户余额
 
 ```bash
-curl "http://172.16.1.5:3002/billing/balance/user@example.com"
+curl "http://172.16.1.6:3002/billing/balance/user@example.com"
 ```
 ```json
 {
@@ -1184,10 +1217,10 @@ curl "http://172.16.1.5:3002/billing/balance/user@example.com"
 
 ```bash
 # 第一页（默认20条）
-curl "http://172.16.1.5:3002/billing/history/user@example.com"
+curl "http://172.16.1.6:3002/billing/history/user@example.com"
 
 # 分页
-curl "http://172.16.1.5:3002/billing/history/user@example.com?limit=10&offset=10"
+curl "http://172.16.1.6:3002/billing/history/user@example.com?limit=10&offset=10"
 ```
 ```json
 {
@@ -1210,7 +1243,7 @@ curl "http://172.16.1.5:3002/billing/history/user@example.com?limit=10&offset=10
 #### `POST /billing/check` — 调用前预检余额（不扣费）
 
 ```bash
-curl -X POST http://172.16.1.5:3002/billing/check \
+curl -X POST http://172.16.1.6:3002/billing/check \
   -H "Content-Type: application/json" \
   -d '{
     "userEmail": "user@example.com",
@@ -1235,7 +1268,7 @@ curl -X POST http://172.16.1.5:3002/billing/check \
 #### `POST /billing/record` — 记录 API 调用并计费（由 OpenClaw 自动调用）
 
 ```bash
-curl -X POST http://172.16.1.5:3002/billing/record \
+curl -X POST http://172.16.1.6:3002/billing/record \
   -H "Content-Type: application/json" \
   -d '{
     "userEmail":   "user@example.com",
@@ -1277,7 +1310,7 @@ curl -X POST http://172.16.1.5:3002/billing/record \
 #### `GET /admin/models` — 查看所有模型（含未启用）
 
 ```bash
-curl http://172.16.1.5:3002/admin/models \
+curl http://172.16.1.6:3002/admin/models \
   -H "Authorization: Bearer ${ADMIN_TOKEN}"
 ```
 
@@ -1385,7 +1418,7 @@ journalctl -u ai-webhook -n 50 --no-pager
 
 # 常见原因：
 # 1. .env 中 PG_PASSWORD 错误 → 修改后 systemctl restart ai-webhook
-# 2. 数据库连接失败 → 检查 Azure PostgreSQL 防火墙是否允许 172.16.1.5
+# 2. 数据库连接失败 → 检查 Azure PostgreSQL 防火墙是否允许 172.16.1.6（VPS E）、172.16.1.4（VPS D）
 # 3. 端口已被占用 → ss -tlnp | grep 3002
 ```
 
@@ -1422,7 +1455,7 @@ docker stats librechat
 
 ```bash
 # 测试 Webhook 连通性（在 VPS B 上执行）
-curl -X POST http://172.16.1.5:3002/billing/record \
+curl -X POST http://172.16.1.6:3002/billing/record \
   -H "Content-Type: application/json" \
   -d '{"userEmail":"test@test.com","apiProvider":"anthropic","modelName":"claude-haiku-4-5-20251001","inputChars":100,"outputChars":50}'
 # 预期：{"success":true,"is_free":true,...}
@@ -1489,7 +1522,7 @@ systemctl restart ai-webhook
 grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env
 
 # 5. 用新令牌测试管理员接口
-curl http://172.16.1.5:3002/admin/models \
+curl http://172.16.1.6:3002/admin/models \
   -H "Authorization: Bearer ${NEW_TOKEN}"
 ```
 
@@ -1519,7 +1552,7 @@ curl http://172.16.1.5:3002/admin/models \
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
 | 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 450m / Nextcloud 768m）；JSON 日志轮替 |
-| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配各节点；CXI4 托管 Nextcloud（768m）+ Webhook + Redis（1g）+ Whisper（2g）+ TTS（768m），合计 ≈ 5.6g / 8 GB；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
+| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配各节点；CXI4 托管 Whisper（2g）+ TTS（768m）+ Email（192m）+ HA（512m），合计 ≈ 3.5g / 8 GB；VPS E 托管 Webhook（256m）+ Redis（128m）；VPS D 托管 Nextcloud（512m）；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
 | 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | UFW 防火墙 → Nginx 限速/路径拦截 → ModSecurity WAF → 应用层校验 → DB 约束（五层纵深防御） |
 
 ### WAF 性能优化措施
@@ -1555,9 +1588,11 @@ curl http://172.16.1.5:3002/admin/models \
 | **VPS A** (172.16.1.1) | Nginx 反向代理 + ModSecurity WAF | [docs/deploy-vpsa.md](docs/deploy-vpsa.md) |
 | **VPS B** (172.16.1.2) | OpenClaw Agent + 可选 Bot 模块 | [docs/deploy-vpsb.md](docs/deploy-vpsb.md) |
 | **VPS C** (172.16.1.3) | LibreChat Web UI | [docs/deploy-vpsc.md](docs/deploy-vpsc.md) |
-| **CXI4** (172.16.1.5) | Webhook 计费 + Redis + Nextcloud + Whisper + TTS + HA | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
+| **VPS D** (172.16.1.4) | Nextcloud（CalDAV + WebDAV） | [docs/deploy-vpsd.md](docs/deploy-vpsd.md) |
+| **VPS E** (172.16.1.6) | Webhook 计费 + Redis | [docs/deploy-vpse.md](docs/deploy-vpse.md) |
+| **CXI4** (172.16.1.5) | Whisper + TTS + Email + HA | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
 
-**推荐部署顺序：** CXI4（Webhook + Redis + Nextcloud）→ VPS C → VPS B → VPS A
+**推荐部署顺序：** VPS E（Webhook + Redis）→ VPS D（Nextcloud）→ VPS C → VPS B → VPS A
 
 ---
 

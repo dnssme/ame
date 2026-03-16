@@ -9,7 +9,7 @@
 #   1. 先部署 modules/nextcloud/（必须在本模块之前）
 #      cd ../nextcloud && docker compose up -d
 #   2. 在 openclaw/config.yml 中确认 tools.calendar 配置指向 Nextcloud：
-#      url: http://172.16.1.5:8090/remote.php/dav/calendars/admin/anima/
+#      url: http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
 #   3. 本模块无需额外 docker compose 操作
 # =============================================================
 

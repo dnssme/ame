@@ -1,14 +1,12 @@
 # VPS D (172.16.1.4) 详细部署教程
 ## Nextcloud（日历 CalDAV + 网盘 WebDAV）
 
-> ⚠️ **已迁移**：Nextcloud 已从 VPS D 迁移至 **CXI4 (172.16.1.5)**，因为 CXI4 拥有 500 GB SSD，更适合企业级文件存储。  
-> 请参考 [docs/deploy-cxi4.md](deploy-cxi4.md) 第 7 节「部署 Nextcloud」进行部署。  
-> VPS D (172.16.1.4) 已释放，可作为备用节点或未来扩展使用。  
-> 本文档保留仅供历史参考。
+> ✅ **VPS D 已重新激活**：Nextcloud 已从 CXI4 迁回 VPS D (172.16.1.4)，与 Azure PostgreSQL 同在香港机房，消除跨境数据库延迟。  
+> CXI4 (172.16.1.5) 现仅承担 ML 推理（Whisper + TTS）和本地服务（Email + HA）。
 
 ---
 
-> **节点角色**：~~Nextcloud 私有云平台~~（已迁移至 CXI4）  
+> **节点角色**：Nextcloud 私有云平台（CalDAV + WebDAV）  
 > **硬件规格**：2 核 CPU · 1 GB RAM  
 > **操作系统**：Ubuntu 22.04 LTS（推荐）
 
