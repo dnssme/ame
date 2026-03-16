@@ -340,6 +340,15 @@ docker compose logs --tail=50 librechat | grep -i error || echo "✅ 无错误�
 
 ---
 
+## 6.5 配置 auditd 操作审计
+
+```bash
+sudo bash /opt/ai/scripts/audit-setup.sh
+systemctl is-active auditd
+```
+
+---
+
 ## 7. CIS 合规核查清单
 
 ```bash

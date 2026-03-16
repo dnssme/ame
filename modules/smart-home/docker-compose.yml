@@ -1,0 +1,70 @@
+# =============================================================
+# Anima 灵枢 · 智能家居模块（Home Assistant Core）
+# 部署节点：CXI4 (172.16.1.5) · i7-10610U 8 GB RAM
+#
+# 说明：
+#   Home Assistant Core 运行在 CXI4 本机，充分利用 8GB 内存
+#   和本地 USB Zigbee/WiFi/Matter 设备连接。
+#   AI Agent 通过 REST API 调用 HA 控制智能设备。
+#
+# 部署步骤：
+#   1. cp .env.example .env && vim .env  # 设置时区等
+#   2. docker compose up -d
+#   3. 浏览器访问 http://172.16.1.5:8123 完成初始设置
+#   4. 创建长期访问令牌，填入 openclaw/.env 的 HA_TOKEN
+#   5. 在 HA 中添加 Zigbee/WiFi/Matter 设备
+#
+# 架构：
+#   用户 → AI 对话 → OpenClaw Agent → HA REST API → 设备控制
+#   用户 → 语音 "关灯" → Whisper STT → Agent → HA → 灯关闭
+# =============================================================
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: anima-homeassistant
+    restart: unless-stopped
+
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: '1.0'
+    pids_limit: 200
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW          # mDNS 发现局域网设备
+      - NET_ADMIN         # 网络设备发现
+
+    network_mode: host    # 智能家居需要访问本地网络发现设备
+
+    volumes:
+      - ha_config:/config                   # HA 配置和数据库
+      - /etc/localtime:/etc/localtime:ro    # 同步宿主时区
+
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+
+    # Zigbee USB 适配器（如使用 Zigbee2MQTT 或 ZHA）
+    # 取消注释并修改设备路径：
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0    # Zigbee 协调器（如 CC2652P）
+    #   - /dev/ttyACM0:/dev/ttyACM0    # 备选设备路径
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8123/api/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s    # HA 首次启动较慢
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  ha_config:    # Home Assistant 配置（自动化场景、设备信息等）

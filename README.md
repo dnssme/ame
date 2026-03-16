@@ -8,21 +8,23 @@
 
 1. [功能矩阵](#功能矩阵)
 2. [模块化架构](#模块化架构)
-3. [手机 APP 使用方案](#手机-app-使用方案)
-4. [最终用户使用说明](#最终用户使用说明)
-5. [架构概览](#架构概览)
-6. [计费规则](#计费规则)
-7. [前置条件](#前置条件)
-8. [各服务器详细部署教程](#各服务器详细部署教程)
-9. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
-10. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
-11. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
-12. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
-13. [第五步：初始化模型定价](#第五步初始化模型定价)
-14. [API 接口完整参考](#api-接口完整参考)
-15. [常用运维 SQL](#常用运维-sql)
-16. [故障排查](#故障排查)
-17. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
+3. [数据安全与运维](#数据安全与运维)
+4. [手机 APP 使用方案](#手机-app-使用方案)
+5. [最终用户使用说明](#最终用户使用说明)
+6. [架构概览](#架构概览)
+7. [计费规则](#计费规则)
+8. [前置条件](#前置条件)
+9. [各服务器详细部署教程](#各服务器详细部署教程)
+10. [第一步：CXI4 — 初始化 Webhook 计费服务](#第一步cxi4--初始化-webhook-计费服务)
+11. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
+12. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
+13. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
+14. [第五步：VPS D — 部署 Nextcloud](#第五步vps-d--部署-nextcloud)
+15. [第六步：初始化模型定价](#第六步初始化模型定价)
+16. [API 接口完整参考](#api-接口完整参考)
+17. [常用运维 SQL](#常用运维-sql)
+18. [故障排查](#故障排查)
+19. [CIS / PCI-DSS 合规说明](#cis--pci-dss-合规说明)
 
 ---
 
@@ -30,22 +32,32 @@
 
 所有功能均为独立模块，可按需启用或禁用。模块配置集中在 [`modules/modules.yml`](modules/modules.yml)。
 
-| 功能 | 状态 | 模块目录 | 说明 |
-|------|------|----------|------|
-| 🤖 日常 AI 对话 | ✅ 已实现 | `librechat/` | LibreChat Web UI，多轮对话 |
-| 🧠 记忆上下文 | ✅ 已实现 | `openclaw/` | PostgreSQL 持久化 + Redis 会话缓存 |
-| 🔀 多模型切换 | ✅ 已实现 | `openclaw/` | Claude / GPT / Mistral / Ollama |
-| 💬 接入微信 | 🆕 新增模块 | [`modules/wechat/`](modules/wechat/) | 基于 Wechaty 框架 |
-| ✈️ 接入 Telegram | 🆕 新增模块 | [`modules/telegram/`](modules/telegram/) | 基于 Telegraf 框架 |
-| 📧 邮件处理 | 🆕 新增模块 | [`modules/email/`](modules/email/) | IMAP 收件 + AI 分析 + SMTP 发件 |
-| 📅 日历管理 | 🆕 新增模块 | [`modules/calendar/`](modules/calendar/) | Nextcloud CalDAV，手机/电脑同步 |
-| 🌐 网页搜索 | ✅ 已实现 | [`modules/web-search/`](modules/web-search/) | DuckDuckGo（OpenClaw 工具） |
-| 📄 文件分析 | ✅ 已实现 | [`modules/file-analysis/`](modules/file-analysis/) | LibreChat 文件上传 + AI 解析 |
-| 🎤 语音交互 | ✅ 已实现 | [`modules/voice/`](modules/voice/) | Whisper STT + Coqui TTS |
-| 🏠 智能家居 | ✅ 已配置 | [`modules/smart-home/`](modules/smart-home/) | Home Assistant REST API |
-| 💰 订阅收费 | ✅ 已实现 | `webhook/` | 按量计费 + 充值卡系统 |
-| ☁️ 用户网盘 | 🆕 新增模块 | [`modules/cloud-storage/`](modules/cloud-storage/) | Nextcloud WebDAV |
-| 📱 手机 APP | 🆕 新增方案 | [`mobile/`](mobile/) | Flutter 开源 APP 适配方案 |
+| 分类 | 功能 | 状态 | 模块目录 | 说明 |
+|------|------|------|----------|------|
+| 一、AI 对话与推理 | 🤖 日常 AI 对话 | ✅ 已部署 | `librechat/` | LibreChat Web UI，多轮对话，1-100 人并发 |
+| | 🧠 持久记忆 | ✅ 已部署 | `openclaw/` | 用户偏好、历史上下文写入 Azure PostgreSQL + Redis 缓存 |
+| | 🔀 多模型切换 | ✅ 已部署 | `openclaw/` | 全球 Top 10 + 中国 Top 5 提供商，70+ 模型可选 |
+| | 🔄 智能降级 | ✅ 已配置 | `openclaw/` | 复杂任务自动 fallback 到 Claude / Mistral |
+| 二、语音能力 | 🎤 语音输入 (ASR) | ✅ 已部署 | [`modules/voice/`](modules/voice/) | Whisper Small CPU int8，中文优先，10s 音频 ≈ 3s 识别 |
+| | 🔊 语音输出 (TTS) | ✅ 已部署 | [`modules/voice/`](modules/voice/) | Coqui TTS 中文 Baker 模型，延迟 <100ms |
+| 三、AI 工具调用 | 🌐 网页搜索 | ✅ 已部署 | [`modules/web-search/`](modules/web-search/) | DuckDuckGo，无需 API Key |
+| | 📧 邮件处理 | ✅ 已部署 | [`modules/email/`](modules/email/) | AI 自动起草、分类、回复邮件（IMAP/SMTP） |
+| | 📄 文件分析 | ✅ 已部署 | [`modules/file-analysis/`](modules/file-analysis/) | 上传 PDF / 图片 / 文档，AI 解析 |
+| | 🧠 持久记忆 | ✅ 已部署 | `openclaw/` | 用户偏好、历史上下文存入数据库 |
+| 四、智能家居 | 🏠 设备控制 | ✅ 已部署 | [`modules/smart-home/`](modules/smart-home/) | HA Core on CXI4，Zigbee/WiFi/Matter，语音控制 |
+| | 🏠 场景自动化 | ✅ 已配置 | [`modules/smart-home/`](modules/smart-home/) | AI 联动自定义场景（如"回家模式"） |
+| 五、日历与提醒 | 📅 日历管理 | ✅ 已部署 | [`modules/calendar/`](modules/calendar/) | 自然语言 "明天10点开会" → Nextcloud CalDAV |
+| | 🔔 提醒推送 | ✅ 已配置 | [`modules/calendar/`](modules/calendar/) | Nextcloud 原生提醒，邮件 + App 推送 |
+| 六、数据安全 | 🔒 三层加密 | ✅ 已部署 | `nginx/` + WireGuard | HTTPS + WireGuard ChaCha20 + Azure SSL |
+| | 💾 双重备份 | ✅ 已配置 | [`scripts/backup-pg.sh`](scripts/backup-pg.sh) | Azure 每日自动备份（7天）+ CXI4 每日 pg_dump 冷备 |
+| | 📋 操作审计 | ✅ 已配置 | [`scripts/audit-setup.sh`](scripts/audit-setup.sh) | 全节点 auditd，记录所有特权操作和可疑行为 |
+| | 🛡 入侵防护 | ✅ 已部署 | 各节点部署文档 | fail2ban + UFW + SSH 禁密码登录 |
+| 七、商业化 | 💰 卡密充值 | ✅ 已部署 | `webhook/` | 卡密充值，按量计费 + 充值卡系统 |
+| | 🆓 免费/付费分层 | ✅ 已部署 | `webhook/` | 免费用户每日 20 次，付费无限制，Redis 速率控制 |
+| 渠道接入 | 💬 微信接入 | ✅ 就绪 | [`modules/wechat/`](modules/wechat/) | 基于 Wechaty 框架（配置 Token 即可启用） |
+| | ✈️ Telegram 接入 | ✅ 就绪 | [`modules/telegram/`](modules/telegram/) | 基于 Telegraf 框架（配置 Token 即可启用） |
+| 扩展功能 | ☁️ 用户网盘 | ✅ 已部署 | [`modules/cloud-storage/`](modules/cloud-storage/) | Nextcloud WebDAV，多设备文件同步 |
+| | 📱 手机 APP | ✅ 就绪 | [`mobile/`](mobile/) | Flutter 开源 APP 适配方案（Maid / PWA / 自建） |
 
 ---
 
@@ -100,6 +112,46 @@ docker compose up -d         # 启动模块
 docker compose down          # 停止模块
 # 在 modules.yml 中将 enabled 改为 false
 ```
+
+---
+
+## 数据安全与运维
+
+### 三层加密
+
+| 层级 | 技术 | 保护范围 |
+|------|------|---------|
+| 第一层 | HTTPS（Let's Encrypt + Certbot） | 用户 ↔ VPS A（Nginx 反向代理） |
+| 第二层 | WireGuard ChaCha20（双栈 172.16.1.0/24 + fd00:ai::/64） | 所有节点间内网通信 |
+| 第三层 | Azure PostgreSQL SSL（PGSSLMODE=require） | 应用 ↔ 数据库 |
+
+### 双重备份
+
+| 备份 | 方式 | 保留 | 配置 |
+|------|------|------|------|
+| Azure 自动备份 | Azure PostgreSQL 内置 | 7 天 | Azure 控制台默认启用 |
+| CXI4 冷备 | [`scripts/backup-pg.sh`](scripts/backup-pg.sh) 每日 pg_dump | 7 天（可配置） | `crontab: 0 2 * * * /opt/ai/scripts/backup-pg.sh` |
+
+### 操作审计（auditd）
+
+所有节点统一部署 auditd 审计规则：[`scripts/audit-setup.sh`](scripts/audit-setup.sh)
+
+```bash
+# 一键部署审计规则（在每台服务器执行）
+sudo bash scripts/audit-setup.sh
+```
+
+监控项：Docker 操作、敏感文件访问、提权行为、防火墙变更、SSH 配置变更、VPN 配置变更
+
+### 入侵防护
+
+| 措施 | 说明 |
+|------|------|
+| fail2ban | SSH 暴力破解防护，3 次失败锁定 1 小时 |
+| UFW 防火墙 | 默认拒绝入站，仅开放必要端口 |
+| SSH 禁密码登录 | `PasswordAuthentication no`，仅允许密钥认证 |
+| ModSecurity WAF | OWASP CRS 规则集，防 SQL 注入 / XSS / 目录遍历 |
+| Docker 安全加固 | `no-new-privileges` + `read_only` + `cap_drop: ALL` |
 
 ---
 
@@ -244,17 +296,27 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── wechat/              # 微信接入
 │   ├── telegram/            # Telegram 接入
 │   ├── email/               # 邮件处理
-│   ├── calendar/            # 日历管理
-│   ├── cloud-storage/       # 用户网盘
+│   ├── calendar/            # 日历管理（Nextcloud CalDAV）
+│   ├── cloud-storage/       # 用户网盘（Nextcloud WebDAV）
+│   ├── nextcloud/           # Nextcloud 基础设施（CalDAV + WebDAV 底层）
 │   ├── voice/               # 语音交互（Whisper STT + Coqui TTS）
-│   ├── smart-home/          # 智能家居（Home Assistant）
+│   ├── smart-home/          # 智能家居（Home Assistant Core）
 │   ├── web-search/          # 网页搜索
 │   └── file-analysis/       # 文件分析
 ├── mobile/                  # 手机 APP 方案
 │   ├── README.md            # 完整 APP 方案对比与适配指南
 │   └── app_config.json      # APP 后端 API 配置模板
+├── docs/                    # 各节点详细部署教程
+│   ├── deploy-vpsa.md       # VPS A — Nginx + WAF
+│   ├── deploy-vpsb.md       # VPS B — OpenClaw Agent
+│   ├── deploy-vpsc.md       # VPS C — LibreChat
+│   ├── deploy-vpsd.md       # VPS D — Nextcloud（日历 + 网盘）
+│   ├── deploy-cxi4.md       # CXI4 — Webhook + Redis + Voice + HA
+│   └── cloudflare-tunnel.md # Cloudflare Tunnel 配置
 └── scripts/
-    └── watchdog.sh          # Webhook 健康检查看门狗
+    ├── watchdog.sh          # Webhook 健康检查看门狗
+    ├── backup-pg.sh         # PostgreSQL 每日冷备（7 天保留）
+    └── audit-setup.sh       # auditd 操作审计统一配置
 ```
 
 ---
@@ -872,7 +934,56 @@ tail -20 /www/wwwlogs/owasp/modsec_audit.log
 
 ---
 
-## 第五步：初始化模型定价
+## 第五步：VPS D — 部署 Nextcloud
+
+详细教程参见 [docs/deploy-vpsd.md](docs/deploy-vpsd.md)。
+
+### 5.1 前置条件
+
+- VPS D (172.16.1.4) 已完成 OS 加固 + WireGuard + Docker 安装
+- Azure PostgreSQL 已创建 `nextcloud` 数据库
+
+### 5.2 部署 Nextcloud
+
+```bash
+mkdir -p /opt/ai/modules/nextcloud
+cd /opt/ai/modules/nextcloud
+
+# 从仓库复制 docker-compose.yml
+# 创建环境变量文件
+cat > .env <<'EOF'
+PG_PASSWORD=<Azure PostgreSQL 密码>
+NEXTCLOUD_USERNAME=admin
+NEXTCLOUD_PASSWORD=<管理员密码，至少 16 字符>
+NEXTCLOUD_DOMAIN=<你的域名>
+TZ=Asia/Shanghai
+EOF
+chmod 600 .env
+
+docker compose up -d
+```
+
+### 5.3 初始化日历
+
+```bash
+# 启用日历应用并创建 AI 专用日历
+docker exec -u www-data anima-nextcloud php occ app:enable calendar
+docker exec -u www-data anima-nextcloud php occ dav:create-calendar admin anima
+
+# 验证 CalDAV
+curl -sf -u admin:<密码> http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
+```
+
+### 5.4 配置 auditd 审计
+
+```bash
+# 部署审计规则（每台服务器都应执行）
+sudo bash scripts/audit-setup.sh
+```
+
+---
+
+## 第六步：初始化模型定价
 
 初始化脚本已通过 `db/schema.sql` 预置了以下模型：
 
@@ -886,7 +997,7 @@ tail -20 /www/wwwlogs/owasp/modsec_audit.log
 
 > ⚠️ **付费模型价格为示例占位符，请按实际 API 成本调整！**
 
-### 5.1 查看当前所有模型
+### 6.1 查看当前所有模型
 
 ```bash
 ADMIN_TOKEN="$(grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env | cut -d= -f2)"
@@ -895,7 +1006,7 @@ curl http://172.16.1.5:3002/admin/models \
   -H "Authorization: Bearer ${ADMIN_TOKEN}"
 ```
 
-### 5.2 修改模型价格
+### 6.2 修改模型价格
 
 ```bash
 # 先查询模型 ID（从上一步输出中找到对应 id 字段）
@@ -907,7 +1018,7 @@ curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
   -d '{"priceInput": 0.025, "priceOutput": 0.050}'
 ```
 
-### 5.3 添加新模型
+### 6.3 添加新模型
 
 ```bash
 # 添加付费模型
@@ -936,7 +1047,7 @@ curl -X POST http://172.16.1.5:3002/admin/models \
   }'
 ```
 
-### 5.4 停用/启用模型
+### 6.4 停用/启用模型
 
 ```bash
 # 停用模型（用户将无法选择该模型）
@@ -952,7 +1063,7 @@ curl -X PUT "http://172.16.1.5:3002/admin/models/${MODEL_ID}" \
   -d '{"isActive": true}'
 ```
 
-### 5.5 生成充值卡
+### 6.5 生成充值卡
 
 ```bash
 # 通过数据库生成充值卡（使用 heredoc 避免 shell 引号嵌套问题）
@@ -968,7 +1079,7 @@ RETURNING key, credit_fen, label;
 SQL
 ```
 
-### 5.6 人工为用户充值
+### 6.6 人工为用户充值
 
 ```bash
 curl -X POST http://172.16.1.5:3002/admin/adjust \
@@ -1438,9 +1549,10 @@ curl http://172.16.1.5:3002/admin/models \
 | **VPS A** (172.16.1.1) | Nginx 反向代理 + ModSecurity WAF | [docs/deploy-vpsa.md](docs/deploy-vpsa.md) |
 | **VPS B** (172.16.1.2) | OpenClaw Agent + 可选 Bot 模块 | [docs/deploy-vpsb.md](docs/deploy-vpsb.md) |
 | **VPS C** (172.16.1.3) | LibreChat Web UI | [docs/deploy-vpsc.md](docs/deploy-vpsc.md) |
-| **CXI4** (172.16.1.5) | Webhook 计费 + Redis + 可选 Whisper | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
+| **VPS D** (172.16.1.4) | Nextcloud（日历 CalDAV + 网盘 WebDAV） | [docs/deploy-vpsd.md](docs/deploy-vpsd.md) |
+| **CXI4** (172.16.1.5) | Webhook 计费 + Redis + Whisper + TTS + HA | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
 
-**推荐部署顺序：** CXI4 → VPS C → VPS B → VPS A
+**推荐部署顺序：** CXI4 → VPS D → VPS C → VPS B → VPS A
 
 ---
 

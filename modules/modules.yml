@@ -99,7 +99,7 @@ tools:
     depends_on: [agent]
 
   cloud_storage:
-    enabled: false
+    enabled: true
     description: "用户网盘（Nextcloud WebDAV）"
     node: VPS-D
     path: ./cloud-storage/

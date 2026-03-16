@@ -495,6 +495,19 @@ crontab -l | grep certbot
 
 ---
 
+## 9.5 配置 auditd 操作审计
+
+```bash
+# 使用统一审计配置脚本
+sudo bash /opt/ai/scripts/audit-setup.sh
+
+# 验证
+systemctl is-active auditd
+auditctl -l | wc -l
+```
+
+---
+
 ## 10. CIS 合规核查清单
 
 ```bash
