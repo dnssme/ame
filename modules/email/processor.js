@@ -22,6 +22,14 @@ const logger = winston.createLogger({
   transports: [new winston.transports.Console()],
 });
 
+// ─── 启动验证：必要环境变量 ──────────────────────────────────
+const REQUIRED_ENV_VARS = ['IMAP_HOST', 'IMAP_USER', 'IMAP_PASSWORD', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD'];
+const missingEnvVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
+if (missingEnvVars.length > 0) {
+  logger.error(`缺少必要的环境变量，模块无法启动：${missingEnvVars.join(', ')}`);
+  process.exit(1);
+}
+
 // ─── 配置 ────────────────────────────────────────────────────
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'claude-haiku-4-5-20251001';

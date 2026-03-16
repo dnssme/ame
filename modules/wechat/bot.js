@@ -37,7 +37,6 @@ const BOT_NAME        = process.env.BOT_NAME || 'Anima';
 const VOICE_ENABLED   = process.env.VOICE_ENABLED === 'true';
 const WHISPER_URL     = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transcribe';
 const TTS_URL         = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
-const BILLING_ENABLED = process.env.BILLING_ENABLED === 'true';
 const REDIS_URL       = process.env.REDIS_URL;
 
 // ─── Redis（用户邮箱绑定持久化）──────────────────────────────
