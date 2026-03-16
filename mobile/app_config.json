@@ -27,10 +27,10 @@
   "features": {
     "voice": true,
     "fileUpload": true,
-    "calendar": false,
-    "cloudStorage": false,
+    "calendar": true,
+    "cloudStorage": true,
     "webSearch": true,
-    "smartHome": false
+    "smartHome": true
   },
 
   "_comment_theme": "主题配色",

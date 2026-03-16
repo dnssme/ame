@@ -15,7 +15,7 @@ infrastructure:
     enabled: true
     required: true
     description: "私有云平台（日历 CalDAV + 网盘 WebDAV 的底层，calendar/cloud-storage 必须先部署此模块）"
-    node: VPS-B
+    node: VPS-D
     path: ./nextcloud/
 
 # ─── 核心模块（默认已部署）──────────────────────────────────
@@ -55,7 +55,7 @@ channels:
     depends_on: [agent]
 
   email:
-    enabled: false
+    enabled: true
     description: "邮件处理（IMAP 收件 + SMTP 发件 + AI 分析）"
     node: CXI4
     path: ./email/
@@ -65,8 +65,8 @@ channels:
 tools:
   voice:
     enabled: true
-    description: "语音交互（Whisper STT + Coqui TTS）"
-    node: CXI4 / VPS-A
+    description: "语音交互（Whisper STT + Coqui TTS，均部署在 CXI4）"
+    node: CXI4
     path: ./voice/
     depends_on: [agent]
 
@@ -85,23 +85,23 @@ tools:
     depends_on: [chat]
 
   calendar:
-    enabled: false
+    enabled: true
     description: "日历管理（Nextcloud CalDAV 同步手机/Web）"
-    node: VPS-B
+    node: VPS-D
     path: ./calendar/
     depends_on: [nextcloud, agent]
 
   smart_home:
-    enabled: false
-    description: "智能家居控制（Home Assistant）"
-    node: VPS-B
+    enabled: true
+    description: "智能家居控制（Home Assistant Core 运行在 CXI4）"
+    node: CXI4
     path: ./smart-home/
     depends_on: [agent]
 
   cloud_storage:
-    enabled: false
+    enabled: true
     description: "用户网盘（Nextcloud WebDAV）"
-    node: VPS-B
+    node: VPS-D
     path: ./cloud-storage/
     depends_on: [nextcloud, agent]
 

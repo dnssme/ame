@@ -1,6 +1,7 @@
 # =============================================================
 # Anima 灵枢 · Coqui TTS 语音合成
-# 部署节点：VPS-A (本机) 或 CXI4
+# 部署节点：CXI4 (172.16.1.5)
+# 模型：中文 Baker（tacotron2-DDC-GST），延迟 <100ms
 # =============================================================
 
 services:
@@ -9,21 +10,21 @@ services:
     container_name: anima-tts
     restart: unless-stopped
 
-    mem_limit: 1g
-    mem_reservation: 512m
+    mem_limit: 768m
+    mem_reservation: 384m
     cpus: '1.0'
 
     security_opt:
       - no-new-privileges:true
 
     ports:
-      - "127.0.0.1:8082:5002"
+      - "172.16.1.5:8082:5002"
 
     environment:
       TZ: Asia/Shanghai
 
     command: >
-      --model_name tts_models/multilingual/multi-dataset/xtts_v2
+      --model_name tts_models/zh-CN/baker/tacotron2-DDC-GST
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5002/"]

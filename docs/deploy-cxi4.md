@@ -1,8 +1,8 @@
 # CXI4 (172.16.1.5) 详细部署教程
-## Webhook 计费服务 · Redis · Whisper STT
+## Webhook 计费服务 · Redis · Whisper STT · Coqui TTS · Email · Home Assistant
 
-> **节点角色**：内网核心服务节点，托管 Webhook 计费 API、Redis 缓存、可选 Whisper STT 语音识别  
-> **硬件规格**：Intel i5-10610U · 8 GB RAM · 500 GB SSD  
+> **节点角色**：内网核心服务节点，托管 Webhook 计费 API、Redis 缓存、Whisper STT 语音识别、Coqui TTS 语音合成、邮件处理、Home Assistant 智能家居  
+> **硬件规格**：Intel i7-10610U · 8 GB RAM · 500 GB SSD  
 > **操作系统**：Ubuntu 22.04 LTS（推荐）
 
 ---
@@ -15,12 +15,13 @@
 4. [WireGuard 内网配置](#4-wireguard-内网配置)
 5. [安装 Redis](#5-安装-redis)
 6. [部署 Webhook 计费服务](#6-部署-webhook-计费服务)
-7. [可选：部署 Whisper STT](#7-可选部署-whisper-stt)
-8. [CIS 合规核查清单](#8-cis-合规核查清单)
-9. [PCI-DSS 合规核查清单](#9-pci-dss-合规核查清单)
-10. [功能测试](#10-功能测试)
-11. [日常运维](#11-日常运维)
-12. [故障排查](#12-故障排查)
+7. [可选：部署 Whisper STT + Coqui TTS + Email + Home Assistant](#7-可选部署-whisper-stt)
+8. [auditd 操作审计](#75-配置-auditd-操作审计)
+9. [CIS 合规核查清单](#8-cis-合规核查清单)
+10. [PCI-DSS 合规核查清单](#9-pci-dss-合规核查清单)
+11. [功能测试](#10-功能测试)
+12. [日常运维](#11-日常运维)
+13. [故障排查](#12-故障排查)
 
 ---
 
@@ -197,6 +198,9 @@ ufw allow in from 172.16.1.0/24 to any port 6379
 
 # 允许内网访问 Whisper STT（如启用）
 ufw allow in from 172.16.1.0/24 to any port 8080
+
+# 允许内网访问 Coqui TTS（从 VPS A 迁移至 CXI4）
+ufw allow in from 172.16.1.0/24 to any port 8082
 
 # 允许 WireGuard 接口所有流量
 ufw allow in on wg0
@@ -548,25 +552,84 @@ chmod 750 /opt/ai/webhook/watchdog.sh
 
 ---
 
-## 7. 可选：部署 Whisper STT
+## 7. 可选：部署 Whisper STT + Coqui TTS + Email + Home Assistant
+
+CXI4 是主要算力节点（8GB RAM），以下服务均可按需部署在此节点：
+
+### 7.1 Whisper STT（语音识别）
 
 ```bash
-# 安装 Docker（如已安装可跳过）
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+cd /opt/ai/modules/voice
+docker compose -f docker-compose.whisper.yml up -d
 
-# 运行 Whisper STT 容器（仅监听内网）
-docker run -d \
-  --name whisper-stt \
-  --restart unless-stopped \
-  -p 172.16.1.5:8080:8080 \
-  --memory 2g \
-  --memory-reservation 1g \
-  --security-opt no-new-privileges:true \
-  --cap-drop ALL \
-  onerahmet/openai-whisper-asr-webservice:latest
+# 验证（Whisper Small 模型，中文优先，10s 音频 ≈ 3s）
+curl -sf http://172.16.1.5:8080/ || echo "Whisper STT 未就绪，稍候重试"
+```
+
+### 7.2 Coqui TTS（语音合成）
+
+```bash
+cd /opt/ai/modules/voice
+docker compose -f docker-compose.tts.yml up -d
+
+# 验证（中文 Baker 模型，延迟 <100ms）
+curl -sf http://172.16.1.5:8082/api/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"你好"}' --output /dev/null && echo "TTS OK"
+```
+
+### 7.3 Email 处理模块
+
+```bash
+cd /opt/ai/modules/email
+cp .env.example .env
+vim .env  # 填写 IMAP/SMTP 配置
+docker compose up -d
 
 # 验证
-curl -sf http://172.16.1.5:8080/ || echo "Whisper STT 未就绪，稍候重试"
+curl -sf http://172.16.1.5:3004/health && echo "Email OK"
+```
+
+### 7.4 Home Assistant（智能家居）
+
+```bash
+cd /opt/ai/modules/smart-home
+cp .env.example .env
+vim .env  # 设置时区
+docker compose up -d
+
+# 首次启动较慢（约 2 分钟），浏览器访问完成初始设置
+echo "访问 http://172.16.1.5:8123 完成 Home Assistant 初始配置"
+echo "配置完成后，创建长期访问令牌填入 openclaw/.env 的 HA_TOKEN"
+```
+
+### CXI4 资源分配汇总
+
+| 服务 | 端口 | 内存限制 | 说明 |
+|------|------|---------|------|
+| Webhook 计费 | 3002 | 256m | 核心计费 API |
+| Redis | 6379 | ~128m | 会话缓存 + 速率限制 |
+| Whisper STT | 8080 | 2g | Small 模型 int8 量化 |
+| Coqui TTS | 8082 | 768m | 中文 Baker 模型 |
+| Email 处理 | 3004 | 192m | IMAP/SMTP + AI 分析 |
+| Home Assistant | 8123 | 512m | Zigbee/WiFi/Matter |
+| **合计** | | **≈ 3.8g** | CXI4 8GB 余 ~4GB 系统 |
+
+---
+
+## 7.5 配置 auditd 操作审计
+
+```bash
+# 使用统一审计配置脚本
+# 脚本位于仓库 scripts/audit-setup.sh
+sudo bash /opt/ai/scripts/audit-setup.sh
+
+# 验证 auditd 运行状态
+systemctl is-active auditd
+auditctl -l | wc -l  # 应显示已加载的规则数
+
+# 查看今日审计事件
+ausearch -ts today | head -20
 ```
 
 ---

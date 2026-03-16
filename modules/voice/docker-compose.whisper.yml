@@ -1,6 +1,7 @@
 # =============================================================
 # Anima 灵枢 · Whisper 语音识别 (STT)
 # 部署节点：CXI4 (172.16.1.5)
+# 模型：small（CPU int8），中文优先，10s 音频 ≈ 3s 识别
 # =============================================================
 
 services:
@@ -20,8 +21,9 @@ services:
       - "172.16.1.5:8080:9000"
 
     environment:
-      ASR_MODEL: base
+      ASR_MODEL: small
       ASR_ENGINE: openai_whisper
+      ASR_MODEL_LANGUAGE: zh
       TZ: Asia/Shanghai
 
     healthcheck:

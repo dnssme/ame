@@ -14,7 +14,7 @@
 
 ## 部署节点
 
-Home Assistant 运行在 CXI4 (172.16.1.5:8123) 或独立硬件（如树莓派）
+Home Assistant Core 运行在 CXI4 (172.16.1.5:8123)，充分利用 8GB 内存和本地 Zigbee/WiFi/Matter 设备连接。
 
 ## 配置
 

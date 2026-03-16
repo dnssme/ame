@@ -347,6 +347,15 @@ curl -sf http://172.16.1.2:3001/health
 
 ---
 
+## 7.5 配置 auditd 操作审计
+
+```bash
+sudo bash /opt/ai/scripts/audit-setup.sh
+systemctl is-active auditd
+```
+
+---
+
 ## 8. CIS 合规核查清单
 
 ```bash
