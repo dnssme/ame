@@ -15,7 +15,7 @@ infrastructure:
     enabled: true
     required: true
     description: "私有云平台（日历 CalDAV + 网盘 WebDAV 的底层，calendar/cloud-storage 必须先部署此模块）"
-    node: CXI4
+    node: VPS-D
     path: ./nextcloud/
 
 # ─── 核心模块（默认已部署）──────────────────────────────────
@@ -35,7 +35,7 @@ core:
   billing:
     enabled: true
     description: "订阅收费系统（Webhook 计费服务）"
-    node: CXI4
+    node: VPS-E
     path: ../webhook/
 
 # ─── 通讯渠道模块 ──────────────────────────────────────────
@@ -87,7 +87,7 @@ tools:
   calendar:
     enabled: true
     description: "日历管理（Nextcloud CalDAV 同步手机/Web）"
-    node: CXI4
+    node: VPS-D
     path: ./calendar/
     depends_on: [nextcloud, agent]
 
@@ -101,7 +101,7 @@ tools:
   cloud_storage:
     enabled: true
     description: "用户网盘（Nextcloud WebDAV）"
-    node: CXI4
+    node: VPS-D
     path: ./cloud-storage/
     depends_on: [nextcloud, agent]
 

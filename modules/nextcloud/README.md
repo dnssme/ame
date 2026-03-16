@@ -21,7 +21,7 @@ chmod 600 .env
 docker compose up -d
 ```
 
-部署完成后访问 `http://172.16.1.5:8090` 确认 Nextcloud 已正常启动。
+部署完成后访问 `http://172.16.1.4:8090` 确认 Nextcloud 已正常启动。
 
 ## 访问地址
 
@@ -44,7 +44,7 @@ docker compose up -d
 
 ```nginx
 location /nextcloud/ {
-    proxy_pass         http://172.16.1.5:8090/;
+    proxy_pass         http://172.16.1.4:8090/;
     proxy_set_header   Host              $host;
     proxy_set_header   X-Real-IP         $remote_addr;
     proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;

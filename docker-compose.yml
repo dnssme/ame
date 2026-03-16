@@ -5,13 +5,14 @@
 #   轻量启动：docker compose --profile lightweight up -d
 #     轻量 profile 限制核心服务总内存适配 1 GB VPS
 #
-# 硬件基准：3× 双核 1 GB VPS + CXI4 i7-10610U 8 GB (500 GB SSD)
+# 硬件基准：5× 双核 1 GB VPS (香港 Azure) + CXI4 i7-10610U 8 GB (青岛)
 #   VPS A (172.16.1.1)：Nginx 反向代理（无 Docker 服务，仅系统级 Nginx）
 #   VPS B (172.16.1.2)：OpenClaw   450m（default）/ 256m（lightweight）
 #   VPS C (172.16.1.3)：LibreChat  680m（default）/ 384m（lightweight）
-#   CXI4  (172.16.1.5)：Nextcloud 768m + Webhook 384m + Whisper 2g
-#                        + TTS 768m + Email 192m + HA 512m ≈ 4.6g
-#                        + Redis 1g（系统级）→ 合计 ≈ 5.6g，系统预留 ≈ 2.4g
+#   VPS D (172.16.1.4)：Nextcloud  512m（日历/网盘，靠近 Azure PG）
+#   VPS E (172.16.1.6)：Webhook 256m + Redis 128m（计费服务，靠近 Azure PG）
+#   CXI4  (172.16.1.5)：Whisper 2g + TTS 768m + Email 192m + HA 512m
+#                        ≈ 3.5g，系统预留 ≈ 4.5g
 # =============================================================
 services:
   # ─── LibreChat Web UI ──────────────────────────────────────

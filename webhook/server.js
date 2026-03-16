@@ -81,7 +81,7 @@ const db = new Pool({
 db.on('error', (err) => logger.error('DB pool error', { err: err.message }));
 
 // ─── Redis 连接（免费用户每日调用次数限制）────────────────────────
-const REDIS_URL = process.env.REDIS_URL || 'redis://172.16.1.5:6379';
+const REDIS_URL = process.env.REDIS_URL || 'redis://172.16.1.6:6379';
 const redis = new Redis(REDIS_URL, {
   maxRetriesPerRequest: 3,
   retryStrategy(times) {
@@ -1221,7 +1221,7 @@ app.use((err, _req, res, _next) => {
 
 // ─── 启动 ─────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || '3002', 10);
-const HOST = process.env.HOST || '172.16.1.5';
+const HOST = process.env.HOST || '172.16.1.6';
 
 const server = app.listen(PORT, HOST, () => {
   logger.info(`Webhook 服务已启动 http://${HOST}:${PORT}`);

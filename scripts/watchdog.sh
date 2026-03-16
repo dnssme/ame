@@ -5,7 +5,7 @@
 #
 # 用法：
 #   bash scripts/watchdog.sh                    # 使用默认值
-#   HEALTH_URL=http://172.16.1.5:3002/health \
+#   HEALTH_URL=http://172.16.1.6:3002/health \
 #   SERVICE_NAME=ai-webhook \
 #   MAX_FAILURES=3 \
 #   CHECK_INTERVAL=30 \
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ─── 配置（可通过环境变量覆盖）─────────────────────────────────
-HEALTH_URL="${HEALTH_URL:-http://172.16.1.5:3002/health}"
+HEALTH_URL="${HEALTH_URL:-http://172.16.1.6:3002/health}"
 SERVICE_NAME="${SERVICE_NAME:-ai-webhook}"
 MAX_FAILURES="${MAX_FAILURES:-3}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
