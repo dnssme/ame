@@ -63,7 +63,7 @@ const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
 /** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
-const REDIS_EMAIL_KEY = 'anima:user_emails';
+const REDIS_EMAIL_KEY = 'anima:telegram_emails';
 /** userId → model 选择（通过 Redis 持久化，重启不丢失）*/
 const REDIS_MODELS_KEY = 'anima:user_models';
 
