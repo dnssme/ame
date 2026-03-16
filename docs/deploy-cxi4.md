@@ -2,7 +2,7 @@
 ## Webhook 计费服务 · Redis · Whisper STT
 
 > **节点角色**：内网核心服务节点，托管 Webhook 计费 API、Redis 缓存、可选 Whisper STT 语音识别  
-> **硬件规格**：Intel i5-10610U · 8 GB RAM · 500 GB SSD  
+> **硬件规格**：Intel i7-10610U · 8 GB RAM · 500 GB SSD  
 > **操作系统**：Ubuntu 22.04 LTS（推荐）
 
 ---
@@ -197,6 +197,9 @@ ufw allow in from 172.16.1.0/24 to any port 6379
 
 # 允许内网访问 Whisper STT（如启用）
 ufw allow in from 172.16.1.0/24 to any port 8080
+
+# 允许内网访问 Coqui TTS（从 VPS A 迁移至 CXI4）
+ufw allow in from 172.16.1.0/24 to any port 8082
 
 # 允许 WireGuard 接口所有流量
 ufw allow in on wg0
@@ -551,21 +554,11 @@ chmod 750 /opt/ai/webhook/watchdog.sh
 ## 7. 可选：部署 Whisper STT
 
 ```bash
-# 安装 Docker（如已安装可跳过）
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+# 推荐使用 docker-compose（modules/voice/docker-compose.whisper.yml）
+cd /opt/ai/modules/voice
+docker compose -f docker-compose.whisper.yml up -d
 
-# 运行 Whisper STT 容器（仅监听内网）
-docker run -d \
-  --name whisper-stt \
-  --restart unless-stopped \
-  -p 172.16.1.5:8080:8080 \
-  --memory 2g \
-  --memory-reservation 1g \
-  --security-opt no-new-privileges:true \
-  --cap-drop ALL \
-  onerahmet/openai-whisper-asr-webservice:latest
-
-# 验证
+# 验证（Whisper Small 模型，中文优先）
 curl -sf http://172.16.1.5:8080/ || echo "Whisper STT 未就绪，稍候重试"
 ```
 

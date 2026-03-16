@@ -154,8 +154,7 @@ ufw allow 51820/udp
 ufw allow 80/tcp
 # HTTPS（用户访问入口，IPv4 + IPv6）
 ufw allow 443/tcp
-# Coqui TTS（如在 VPS A 本机运行语音合成服务，按需开启）
-# ufw allow in from 172.16.1.0/24 to any port 8082
+# Coqui TTS 已迁移至 CXI4 (172.16.1.5)，VPS A 无需开放 8082 端口
 # WireGuard 接口全部放行（内网流量）
 ufw allow in on wg0
 

@@ -43,6 +43,7 @@ const rateLimit = require('express-rate-limit');
 const { Pool }  = require('pg');
 const winston   = require('winston');
 const { encoding_for_model, get_encoding } = require('tiktoken');
+const Redis     = require('ioredis');
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -79,6 +80,55 @@ const db = new Pool({
 });
 
 db.on('error', (err) => logger.error('DB pool error', { err: err.message }));
+
+// ─── Redis 连接（免费用户每日调用次数限制）────────────────────────
+const REDIS_URL = process.env.REDIS_URL || 'redis://172.16.1.5:6379';
+const redis = new Redis(REDIS_URL, {
+  maxRetriesPerRequest: 3,
+  retryStrategy(times) {
+    return Math.min(times * 200, 2000);
+  },
+  lazyConnect: true,
+});
+redis.connect().catch((err) => logger.warn('Redis connect error (free daily limits disabled)', { err: err.message }));
+redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
+
+// 免费用户每日调用次数上限（付费用户无限制）
+const FREE_DAILY_LIMIT = (() => {
+  const v = parseInt(process.env.FREE_DAILY_LIMIT || '20', 10);
+  if (!Number.isFinite(v) || v <= 0) {
+    logger.warn('FREE_DAILY_LIMIT 非法，使用默认值 20');
+    return 20;
+  }
+  return v;
+})();
+
+/**
+ * 检查免费用户当日剩余调用次数。
+ * 使用 Redis INCR + EXPIRE 实现滑动日计数器。
+ * Redis 不可用时放行（fail-open，避免阻塞服务）。
+ *
+ * @param {string} userEmail - 归一化后的邮箱
+ * @returns {{ allowed: boolean, used: number, limit: number }}
+ */
+async function checkFreeDailyLimit(userEmail) {
+  try {
+    if (redis.status !== 'ready') {
+      return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
+    }
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const key = `anima:free_daily:${userEmail}:${today}`;
+    const count = await redis.incr(key);
+    if (count === 1) {
+      // 首次请求，设置 24 小时过期（自动清理）
+      await redis.expire(key, 86400);
+    }
+    return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT };
+  } catch (err) {
+    logger.warn('Redis daily limit check failed, allowing request', { err: err.message });
+    return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
+  }
+}
 
 // ─── Express 应用 ─────────────────────────────────────────────
 const app = express();
@@ -546,7 +596,16 @@ app.post('/billing/check', readLimiter, async (req, res) => {
   }
 
   if (model.is_free) {
-    return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false });
+    // 免费模型：检查每日调用次数限制
+    const dailyCheck = await checkFreeDailyLimit(userEmail);
+    if (!dailyCheck.allowed) {
+      return res.status(429).json({
+        success: false, can_proceed: false, is_free: true,
+        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
+        daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
+      });
+    }
+    return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false, daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit });
   }
 
   const inTokens  = Math.max(0, parseInt(estimatedInputTokens  ?? estimatedInputChars  ?? '0', 10) || 0);
@@ -691,8 +750,16 @@ app.post('/billing/record', async (req, res) => {
   const promptTk  = parseOptionalNonNegInt(rawPromptTokens);
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
-  // ── 2. 免费模型：只记录，不扣费 ────────────────────────────
+  // ── 2. 免费模型：检查每日限额后记录，不扣费 ─────────────────
   if (isFree) {
+    const dailyCheck = await checkFreeDailyLimit(userEmail);
+    if (!dailyCheck.allowed) {
+      return res.status(429).json({
+        success: false, is_free: true,
+        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已用完。充值后可无限使用。`,
+        daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
+      });
+    }
     try {
       await db.query(
         `INSERT INTO api_usage
@@ -704,7 +771,7 @@ app.post('/billing/record', async (req, res) => {
     } catch (err) {
       logger.error('Free usage insert error', { err: err.message });
     }
-    return res.json({ success: true, is_free: true, charged_fen: 0, balance_fen: null });
+    return res.json({ success: true, is_free: true, charged_fen: 0, balance_fen: null, daily_used: dailyCheck.used, daily_limit: dailyCheck.limit });
   }
 
   // ── 3. 付费模型：检查余额并扣费 ────────────────────────────
@@ -1099,13 +1166,16 @@ const server = app.listen(PORT, HOST, () => {
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
   server.close(() => {
-    db.end()
+    Promise.all([
+      db.end(),
+      redis.quit().catch(() => {}),
+    ])
       .then(() => {
-        logger.info('数据库连接池已关闭');
+        logger.info('数据库连接池与 Redis 已关闭');
         process.exit(0);
       })
       .catch((err) => {
-        logger.error('数据库连接池关闭失败', { err: err.message });
+        logger.error('连接关闭失败', { err: err.message });
         process.exit(1);
       });
   });

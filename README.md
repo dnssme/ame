@@ -193,15 +193,17 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
     ├─── /              → [VPS C] LibreChat    :3080
     ├─── /api/agent     → [VPS B] OpenClaw     :3000
     ├─── /activate      → [CXI4]  Webhook      :3002
-    ├─── /tts/          → Coqui TTS            :8082  （语音合成）
-    ├─── /whisper/      → [CXI4]  Whisper      :8080  （语音识别）
-    └─── /nextcloud/    → [VPS B] Nextcloud    :8090  （日历/网盘）
+    ├─── /tts/          → [CXI4]  Coqui TTS    :8082  （语音合成，中文 Baker）
+    ├─── /whisper/      → [CXI4]  Whisper      :8080  （语音识别，Small 中文优先）
+    └─── /nextcloud/    → [VPS D] Nextcloud    :8090  （日历/网盘）
 
-[CXI4] (172.16.1.5)
+[CXI4] (172.16.1.5, i7-10610U / 8GB)
     ├─── Webhook 计费服务  :3002  ←── OpenClaw / LibreChat 自动调用
-    ├─── Redis             :6379  ←── LibreChat / OpenClaw 缓存
-    ├─── (Whisper STT)     :8080  （语音识别模块）
-    └─── (Email 处理)      :3004  （邮件处理模块）
+    ├─── Redis             :6379  ←── 会话缓存 + 免费用户每日限额
+    ├─── Coqui TTS         :8082  （中文 Baker 模型，延迟 <100ms）
+    ├─── Whisper STT       :8080  （Small 模型，中文优先，10s≈3s）
+    ├─── (Email 处理)      :3004  （邮件处理模块）
+    └─── (Home Assistant)  :8123  （智能家居 Zigbee/WiFi/Matter）
 
 [VPS B] (172.16.1.2) ── 可选模块
     ├─── (微信 Bot)        :3001  （微信接入模块）
@@ -262,9 +264,10 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | 规则 | 说明 |
 |------|------|
 | **按模型独立定价** | 每个 API 模型在 `api_models` 表中单独设定价格，无套餐绑定 |
-| **免费模型** | `is_free=true` 的模型（如 `claude-haiku-4-5-20251001`）永久免费，不扣余额 |
+| **免费模型** | `is_free=true` 的模型（如 `glm-4-flash`）免费使用，**每日限 20 次**（Redis 计数） |
 | **付费模型** | 仅在实际使用时按 Token 扣费：`⌈(输入Token/1000 × 输入价格) + (输出Token/1000 × 输出价格)⌉` 分（v5: 基于 Tiktoken 计数，对齐上游 API 定价） |
-| **预付费** | 用户充值后使用；余额不足时系统返回 HTTP 402 拒绝调用 |
+| **预付费** | 用户充值后使用付费模型；余额不足时系统返回 HTTP 402 拒绝调用 |
+| **免费/付费分层** | 免费用户每日 20 次（`FREE_DAILY_LIMIT`），付费用户无限制；Redis 速率控制 |
 | **本地模型** | Ollama 模型 `is_active=false`，接口定义保留但拒绝所有计费请求 |
 
 ---
@@ -287,8 +290,8 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | **VPS A** (172.16.1.1) | Nginx 反向代理 | 2 核 | 1 GB | — | Nginx ~50 MB | ~950 MB 系统 |
 | **VPS B** (172.16.1.2) | OpenClaw Agent | 2 核 | 1 GB | — | 容器 ≤600 MB | ~400 MB 系统 |
 | **VPS C** (172.16.1.3) | LibreChat | 2 核 | 1 GB | — | 容器 ≤768 MB | ~256 MB 系统 |
-| **VPS D** (172.16.1.4) | Nextcloud（可选） | 2 核 | 1 GB | — | — | — |
-| **CXI4** (172.16.1.5) | Webhook + Redis + Whisper | 4 核 8 线程 (i5-10610U) | 8 GB | 500 GB | Webhook ~256 MB / Redis ≤1 GB / Whisper ~2 GB | ~4 GB 系统 |
+| **VPS D** (172.16.1.4) | Nextcloud（日历/网盘） | 2 核 | 1 GB | — | 容器 ≤512 MB | ~488 MB 系统 |
+| **CXI4** (172.16.1.5) | Webhook + Redis + Whisper + TTS + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB | Webhook 256m + Redis ≤1g + Whisper 2g + TTS 768m ≈ 4g | ~4 GB 系统 |
 
 > ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 768m、OpenClaw 设为 600m，均已在 `docker-compose.yml` 中配置。
 

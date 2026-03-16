@@ -323,4 +323,4 @@ tools:
     recognition:
       url: http://172.16.1.5:8080/transcribe
     synthesis:
-      url: http://172.16.1.1:8082/api/tts
+      url: http://172.16.1.5:8082/api/tts
