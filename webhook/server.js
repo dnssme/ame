@@ -94,6 +94,12 @@ redis.connect().catch((err) => logger.warn('Redis connect error (free daily limi
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // 免费用户每日调用次数上限（付费用户无限制）
+// Lua 脚本：原子执行 INCR + EXPIRE，防止 key 永不过期（PCI-DSS 6.5.5 安全失效）
+const INCR_EXPIRE_LUA =
+  'local c = redis.call("INCR", KEYS[1])\n' +
+  'if c == 1 then redis.call("EXPIRE", KEYS[1], 86400) end\n' +
+  'return c';
+
 const FREE_DAILY_LIMIT = (() => {
   const v = parseInt(process.env.FREE_DAILY_LIMIT || '20', 10);
   if (!Number.isFinite(v) || v <= 0) {
@@ -142,12 +148,7 @@ async function incrFreeDailyUsage(userEmail) {
     const key = `anima:free_daily:${userEmail}:${today}`;
     // 使用 Lua 脚本原子执行 INCR + EXPIRE，防止进程在两条命令之间崩溃
     // 导致 key 永不过期（PCI-DSS 6.5.5 安全失效）
-    const count = await redis.eval(
-      'local c = redis.call("INCR", KEYS[1])\n' +
-      'if c == 1 then redis.call("EXPIRE", KEYS[1], 86400) end\n' +
-      'return c',
-      1, key
-    );
+    const count = await redis.eval(INCR_EXPIRE_LUA, 1, key);
     return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT };
   } catch (err) {
     logger.warn('Redis daily limit incr failed, allowing request', { err: err.message });
