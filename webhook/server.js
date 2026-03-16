@@ -657,6 +657,9 @@ app.post('/billing/check', readLimiter, requireServiceToken, async (req, res) =>
 
   const inTokens  = Math.max(0, parseInt(estimatedInputTokens  ?? estimatedInputChars  ?? '0', 10) || 0);
   const outTokens = Math.max(0, parseInt(estimatedOutputTokens ?? estimatedOutputChars ?? '0', 10) || 0);
+  if (inTokens > MAX_TOKEN_VALUE || outTokens > MAX_TOKEN_VALUE) {
+    return res.status(400).json({ success: false, msg: 'estimatedInputTokens/estimatedOutputTokens 单次上限为 10,000,000' });
+  }
   const priceIn  = Number(model.price_input_per_1k_tokens);
   const priceOut = Number(model.price_output_per_1k_tokens);
 
