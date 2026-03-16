@@ -1,6 +1,6 @@
 # =============================================================
 # Anima 灵枢 · Nextcloud 基础设施模块（必选）
-# 部署节点：VPS-D (172.16.1.4)
+# 部署节点：CXI4 (172.16.1.5)
 #
 # 说明：此服务同时为以下两个功能模块提供后端支持：
 #   - 日历管理（CalDAV 协议，同步手机/电脑日历）
@@ -8,6 +8,10 @@
 #
 # 依赖：calendar 模块与 cloud-storage 模块均依赖本模块，
 #       部署任意一个前必须先启动本模块。
+#
+# 资源说明：CXI4 拥有 500 GB SSD，适合存储用户文件；
+#   PHP + Apache 在处理文件上传/缩略图生成时内存占用较高，
+#   企业级生产环境建议 768m 以确保稳定性。
 # =============================================================
 
 services:
@@ -16,15 +20,16 @@ services:
     container_name: anima-nextcloud
     restart: unless-stopped
 
-    mem_limit: 512m
-    mem_reservation: 256m
+    # CXI4 (8GB)：Nextcloud 768m — 企业级文件存储 + CalDAV + WebDAV
+    mem_limit: 768m
+    mem_reservation: 384m
     cpus: '1.0'
 
     security_opt:
       - no-new-privileges:true
 
     ports:
-      - "172.16.1.4:8090:80"
+      - "172.16.1.5:8090:80"
 
     volumes:
       - nextcloud_data:/var/www/html            # 应用数据（主目录）
@@ -38,7 +43,9 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_USERNAME:-admin}
       NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_PASSWORD}
-      NEXTCLOUD_TRUSTED_DOMAINS: "172.16.1.4 ${NEXTCLOUD_DOMAIN:-localhost}"
+      NEXTCLOUD_TRUSTED_DOMAINS: "172.16.1.5 ${NEXTCLOUD_DOMAIN:-localhost}"
+      PHP_MEMORY_LIMIT: 512M
+      PHP_UPLOAD_LIMIT: 1G
       TZ: Asia/Shanghai
 
     healthcheck:

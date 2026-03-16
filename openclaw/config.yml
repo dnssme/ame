@@ -313,7 +313,7 @@ tools:
   calendar:
     enabled: true
     provider: nextcloud
-    url: http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
+    url: http://172.16.1.5:8090/remote.php/dav/calendars/admin/anima/
     username: admin
     password: ${NEXTCLOUD_PASSWORD}
 

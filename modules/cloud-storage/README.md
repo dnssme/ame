@@ -29,7 +29,7 @@
 
 ## 部署节点
 
-VPS-B (172.16.1.4)（复用日历模块的 Nextcloud 实例）
+CXI4 (172.16.1.5)（复用日历模块的 Nextcloud 实例）
 
 ## 快速部署
 
@@ -57,7 +57,7 @@ docker compose up -d
 
 ```nginx
 location /nextcloud/ {
-    proxy_pass         http://172.16.1.4:8090/;
+    proxy_pass         http://172.16.1.5:8090/;
     proxy_set_header   Host              $host;
     proxy_set_header   X-Real-IP         $remote_addr;
     proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
