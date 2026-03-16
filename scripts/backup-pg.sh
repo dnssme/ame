@@ -90,6 +90,7 @@ for DB in ${DATABASES}; do
     -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${DB}" \
     --no-owner --no-privileges \
     | gzip > "${BACKUP_FILE}"; then
+    chmod 600 "${BACKUP_FILE}"
     SIZE=$(du -h "${BACKUP_FILE}" | cut -f1)
     echo "[INFO]  $(date '+%F %T') 备份完成: ${DB} (${SIZE})"
   else

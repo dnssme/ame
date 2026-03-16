@@ -6,7 +6,7 @@
 
 services:
   openclaw:
-    image: openclaw/openclaw:latest
+    build: .
     container_name: openclaw
     restart: unless-stopped
 

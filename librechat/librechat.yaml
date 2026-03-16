@@ -22,6 +22,10 @@ interface:
 endpoints:
   # ── 全局默认参数 ─────────────────────────────────────────────
   # 控制上下文窗口大小，降低单次请求消耗，配合 webhook 计费安全阈值
+  # ★ maxContextTokens 刻意限制为 4000 以控制每次请求费用 ★
+  # 部分模型（如 Gemini 1.5 Pro 2M、DeepSeek 128k）原生支持更大上下文，
+  # 但为防止单次请求消耗过多余额，此处统一限制。如需放宽，请同步调整
+  # webhook MAX_SINGLE_REQUEST_FEN 安全熔断阈值。
   openAI:
     titleModel: "gpt-4.1-mini"
     maxContextTokens: 4000

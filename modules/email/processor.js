@@ -35,6 +35,7 @@ const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER;
+const MAX_EMAILS_PER_CHECK = parseInt(process.env.MAX_EMAILS_PER_CHECK || '20', 10);
 
 // ─── IMAP 客户端 ─────────────────────────────────────────────
 function createImapClient() {
@@ -60,6 +61,14 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASSWORD,
   },
 });
+
+/**
+ * 清理字符串中的换行符和控制字符，防止邮件头注入。
+ */
+function sanitizeEmailField(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.replace(/[\r\n\x00-\x1f]/g, ' ').trim();
+}
 
 // ─── AI 分析 ─────────────────────────────────────────────────
 async function analyzeEmail(subject, from, body) {
@@ -110,8 +119,8 @@ async function checkNewEmails() {
       let count = 0;
       for await (const msg of messages) {
         const parsed = await simpleParser(msg.source);
-        const subject = parsed.subject || '(无主题)';
-        const from = parsed.from?.text || '(未知发件人)';
+        const subject = sanitizeEmailField(parsed.subject || '(无主题)');
+        const from = sanitizeEmailField(parsed.from?.text || '(未知发件人)');
         const textBody = parsed.text || '';
 
         logger.info('新邮件', { subject, from });
@@ -138,6 +147,10 @@ async function checkNewEmails() {
         }
 
         count++;
+        if (count >= MAX_EMAILS_PER_CHECK) {
+          logger.info(`已达到单次检查上限（${MAX_EMAILS_PER_CHECK} 封），剩余邮件下次处理`);
+          break;
+        }
       }
 
       if (count > 0) {
@@ -152,6 +165,8 @@ async function checkNewEmails() {
     await client.logout();
   } catch (err) {
     logger.error('邮件检查失败', { err: err.message });
+    // 确保 IMAP 连接被清理，防止连接泄漏
+    try { await client.logout(); } catch (logoutErr) { logger.debug('IMAP logout cleanup failed', { err: logoutErr.message }); }
   }
 }
 
