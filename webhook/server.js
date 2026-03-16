@@ -1246,6 +1246,13 @@ const server = app.listen(PORT, HOST, () => {
     // PCI-DSS 8.3.6：令牌长度至少 32 字节（64 个十六进制字符）
     logger.warn('ADMIN_TOKEN 过短（< 32 字符），建议执行 openssl rand -hex 32 重新生成');
   }
+  if (!SERVICE_TOKEN) {
+    // PCI-DSS 7.x / CIS 网络分段：SERVICE_TOKEN 未配置时，任何内网进程均可
+    // 触发计费写入（/billing/record、/billing/check），建议在生产环境设置
+    logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口无内部服务鉴权（建议通过环境变量配置）');
+  } else if (SERVICE_TOKEN.length < 32) {
+    logger.warn('SERVICE_TOKEN 过短（< 32 字符），建议执行 openssl rand -hex 32 重新生成');
+  }
 });
 
 const shutdown = (signal) => {
