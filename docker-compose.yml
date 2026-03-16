@@ -221,14 +221,14 @@ services:
         max-size: "20m"
         max-file: "3"
 
-  # ─── Webhook 计费服务（CXI4 8GB）────────────────────────────
+  # ─── Webhook 计费服务（VPS E 1GB）───────────────────────────
   webhook:
     build: ./webhook
     container_name: anima-webhook
     restart: unless-stopped
     profiles: ["default"]
 
-    # CXI4 i7-10610U 8GB：Nextcloud 768m + 计费 384m + Whisper 2g + TTS 768m + Email 192m + HA 512m ≈ 4.6GB
+    # VPS E (1GB)：Webhook 384m + Redis 128m ≈ 512m → 系统预留 ~500m
     mem_limit: 384m
     mem_reservation: 192m
     cpus: '1.5'
@@ -247,7 +247,7 @@ services:
       - /tmp
 
     ports:
-      - "172.16.1.5:3002:3002"
+      - "172.16.1.6:3002:3002"
 
     env_file:
       - path: ./webhook/.env
@@ -278,7 +278,7 @@ services:
     restart: unless-stopped
     profiles: ["lightweight"]
 
-    # CXI4 i7-10610U 8GB 轻量：Nextcloud 768m + 计费 256m + Whisper 2g + TTS 768m + Email 192m + HA 512m ≈ 4.5GB
+    # VPS E (1GB) 轻量：Webhook 256m + Redis 128m ≈ 384m → 系统预留 ~640m
     mem_limit: 256m
     mem_reservation: 128m
     cpus: '1.0'
@@ -297,7 +297,7 @@ services:
       - /tmp
 
     ports:
-      - "172.16.1.5:3002:3002"
+      - "172.16.1.6:3002:3002"
 
     env_file:
       - path: ./webhook/.env
