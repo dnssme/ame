@@ -118,6 +118,20 @@ const sessionCleanupTimer = setInterval(() => {
   }
 }, SESSION_TTL);
 
+// ─── 消息分段发送 ─────────────────────────────────────────────
+// 微信文字消息限制约 4000 字符，超长消息需分段发送
+const WECHAT_MSG_LIMIT = 4000;
+
+async function saySplitMessage(msg, text) {
+  if (text.length <= WECHAT_MSG_LIMIT) {
+    await msg.say(text);
+  } else {
+    for (let i = 0; i < text.length; i += WECHAT_MSG_LIMIT) {
+      await msg.say(text.substring(i, i + WECHAT_MSG_LIMIT));
+    }
+  }
+}
+
 // ─── Agent API 调用 ──────────────────────────────────────────
 
 /** 标记长耗时任务类型（web-search / file-analysis），可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
@@ -230,7 +244,7 @@ bot.on('message', async (msg) => {
         await msg.say('⏳ 任务处理中，完成后会通知你...');
         callAgent(userId, text)
           .then(async (reply) => {
-            await msg.say(`✅ 任务完成：\n\n${reply}`);
+            await saySplitMessage(msg, `✅ 任务完成：\n\n${reply}`);
           })
           .catch(async (err) => {
             logger.error('Long-running task failed', { err: err.message, userId });
@@ -240,7 +254,7 @@ bot.on('message', async (msg) => {
       }
 
       const reply = await callAgent(userId, text);
-      await msg.say(reply);
+      await saySplitMessage(msg, reply);
     }
 
     // 语音消息（需要语音模块启用）
