@@ -195,7 +195,7 @@ ufw allow 51820/udp
 ufw allow in from 172.16.1.0/24 to any port 3002
 
 # 允许内网访问 Nextcloud（仅 WireGuard 内网）
-ufw allow in from 172.16.1.0/24 to any port 8090 proto tcp comment "Nextcloud HTTP"
+ufw allow in from 172.16.1.0/24 to any port 8090
 
 # 允许内网访问 Redis（仅 WireGuard 内网，禁止公网）
 ufw allow in from 172.16.1.0/24 to any port 6379
