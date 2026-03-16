@@ -40,10 +40,28 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 if [ -z "${PGPASSWORD:-}" ]; then
   ENV_FILE="${ENV_FILE:-/opt/ai/webhook/.env}"
   if [ -f "${ENV_FILE}" ]; then
-    PGPASSWORD="$(grep -E '^PGPASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+    # 使用 Python 解析 .env（比 grep+cut 更安全，正确处理引号和等号）
+    PGPASSWORD="$(python3 -c "
+import re, sys
+with open('${ENV_FILE}') as f:
+    for line in f:
+        m = re.match(r'^PGPASSWORD=(.*)$', line.rstrip())
+        if m:
+            v = m.group(1).strip().strip(\"'\").strip('\"')
+            print(v, end='')
+            sys.exit(0)
+" 2>/dev/null || true)"
     if [ -z "${PGPASSWORD:-}" ]; then
-      # 兼容 PG_PASSWORD 别名
-      PGPASSWORD="$(grep -E '^PG_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")"
+      PGPASSWORD="$(python3 -c "
+import re, sys
+with open('${ENV_FILE}') as f:
+    for line in f:
+        m = re.match(r'^PG_PASSWORD=(.*)$', line.rstrip())
+        if m:
+            v = m.group(1).strip().strip(\"'\").strip('\"')
+            print(v, end='')
+            sys.exit(0)
+" 2>/dev/null || true)"
     fi
     [ -n "${PGPASSWORD:-}" ] && export PGPASSWORD
   fi

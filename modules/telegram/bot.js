@@ -47,7 +47,8 @@ const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 const userModels = new Map(); // userId → model name
 
-/** userId → email 绑定表（持久化需重启后重新绑定，生产建议存 DB/Redis） */
+/** userId → email 绑定表（持久化需重启后重新绑定，生产建议存 DB/Redis）
+ * TODO: 实现持久化存储（写入 PostgreSQL user_billing 或 Redis），避免重启后用户需重新绑定 */
 const userEmailMap = new Map();
 
 function getSession(userId) {
