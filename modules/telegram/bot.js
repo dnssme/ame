@@ -9,6 +9,7 @@ const http        = require('http');
 const { Telegraf } = require('telegraf');
 const { request }  = require('undici');
 const winston     = require('winston');
+const Redis       = require('ioredis');
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -33,6 +34,8 @@ const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'claude-haiku-4-5-20251001';
 const BILLING_URL   = process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.5:3002';
+const BILLING_ENABLED = process.env.BILLING_ENABLED === 'true';
+const REDIS_URL     = process.env.REDIS_URL;
 const ALLOWED_IDS   = (process.env.ALLOWED_USER_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -41,15 +44,47 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
+// ─── Redis（用户邮箱绑定持久化）──────────────────────────────
+const redis = REDIS_URL
+  ? new Redis(REDIS_URL, { maxRetriesPerRequest: 3, lazyConnect: true })
+  : null;
+
+if (redis) {
+  redis.connect().catch((err) => {
+    logger.error('Redis 连接失败（用户绑定将不可用）', { err: err.message });
+  });
+  redis.on('error', (err) => {
+    logger.error('Redis 连接错误', { err: err.message });
+  });
+}
+
 // ─── 会话上下文 ──────────────────────────────────────────────
 const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 const userModels = new Map(); // userId → model name
 
-/** userId → email 绑定表（持久化需重启后重新绑定，生产建议存 DB/Redis）
- * TODO: 实现持久化存储（写入 PostgreSQL user_billing 或 Redis），避免重启后用户需重新绑定 */
-const userEmailMap = new Map();
+/** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
+const REDIS_EMAIL_KEY = 'anima:user_emails';
+
+async function getUserEmail(userId) {
+  if (!redis) return undefined;
+  try {
+    return await redis.hget(REDIS_EMAIL_KEY, String(userId)) || undefined;
+  } catch (err) {
+    logger.error('Redis hget 失败', { err: err.message, userId });
+    return undefined;
+  }
+}
+
+async function setUserEmail(userId, email) {
+  if (!redis) return;
+  try {
+    await redis.hset(REDIS_EMAIL_KEY, String(userId), email);
+  } catch (err) {
+    logger.error('Redis hset 失败', { err: err.message, userId });
+  }
+}
 
 function getSession(userId) {
   const session = sessions.get(userId);
@@ -113,7 +148,7 @@ async function callAgent(userId, message) {
         model,
         messages: session.messages,
         userId: String(userId),
-        userEmail: userEmailMap.get(userId) || undefined,
+        userEmail: await getUserEmail(userId),
       }),
     });
     const data = await body.json();
@@ -170,10 +205,10 @@ bot.help((ctx) => {
 });
 
 // /bind 绑定计费邮箱
-bot.command('bind', (ctx) => {
+bot.command('bind', async (ctx) => {
   const email = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   if (!email) {
-    const current = userEmailMap.get(ctx.from.id);
+    const current = await getUserEmail(ctx.from.id);
     return ctx.reply(current
       ? `当前绑定邮箱：${current}\n\n用法：/bind <邮箱>`
       : '尚未绑定邮箱。\n\n用法：/bind <邮箱>\n示例：/bind yourname@example.com');
@@ -181,7 +216,7 @@ bot.command('bind', (ctx) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
     return ctx.reply('❌ 邮箱格式不正确，请重新输入。\n示例：/bind yourname@example.com');
   }
-  userEmailMap.set(ctx.from.id, email);
+  await setUserEmail(ctx.from.id, email);
   logger.info('用户绑定邮箱', { userId: ctx.from.id, email });
   ctx.reply(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
 });
@@ -303,6 +338,7 @@ bot.launch()
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭...`);
   clearInterval(sessionCleanupTimer);
+  if (redis) redis.disconnect();
   bot.stop(signal);
   healthServer.close();
   process.exit(0);
