@@ -35,7 +35,7 @@ const GROUP_AT_ONLY   = process.env.GROUP_AT_ONLY !== 'false';
 const BOT_NAME        = process.env.BOT_NAME || 'Anima';
 const VOICE_ENABLED   = process.env.VOICE_ENABLED === 'true';
 const WHISPER_URL     = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transcribe';
-const TTS_URL         = process.env.TTS_URL || 'http://172.16.1.1:8082/api/tts';
+const TTS_URL         = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 
 /** 转义正则特殊字符，防止 new RegExp() 注入 */
 function escapeRegExp(s) {
