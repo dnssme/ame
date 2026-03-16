@@ -62,6 +62,14 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+/**
+ * 清理字符串中的换行符和控制字符，防止邮件头注入。
+ */
+function sanitizeEmailField(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.replace(/[\r\n\x00-\x1f]/g, ' ').trim();
+}
+
 // ─── AI 分析 ─────────────────────────────────────────────────
 async function analyzeEmail(subject, from, body) {
   const prompt = [
@@ -111,8 +119,8 @@ async function checkNewEmails() {
       let count = 0;
       for await (const msg of messages) {
         const parsed = await simpleParser(msg.source);
-        const subject = parsed.subject || '(无主题)';
-        const from = parsed.from?.text || '(未知发件人)';
+        const subject = sanitizeEmailField(parsed.subject || '(无主题)');
+        const from = sanitizeEmailField(parsed.from?.text || '(未知发件人)');
         const textBody = parsed.text || '';
 
         logger.info('新邮件', { subject, from });
@@ -157,6 +165,8 @@ async function checkNewEmails() {
     await client.logout();
   } catch (err) {
     logger.error('邮件检查失败', { err: err.message });
+    // 确保 IMAP 连接被清理，防止连接泄漏
+    try { await client.logout(); } catch { /* ignore */ }
   }
 }
 

@@ -212,7 +212,7 @@ mkdir -p /opt/ai/modules/nextcloud
 cd /opt/ai/modules/nextcloud
 
 # 复制项目文件
-cp docker-compose.yml /opt/ai/modules/nextcloud/
+cp /opt/ai/repo/modules/nextcloud/docker-compose.yml /opt/ai/modules/nextcloud/
 ```
 
 ### 6.2 创建环境变量文件

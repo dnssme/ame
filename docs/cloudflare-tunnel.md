@@ -47,13 +47,13 @@ credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
 ingress:
   # LibreChat Web UI
   - hostname: chat.yourdomain.com
-    service: http://172.16.1.1:443
+    service: http://172.16.1.1:80
     originRequest:
       noTLSVerify: false
 
   # 其他子域名按需添加
   # - hostname: api.yourdomain.com
-  #   service: http://172.16.1.1:443
+  #   service: http://172.16.1.1:80
 
   # 兜底规则（必须在最后）
   - service: http_status:404

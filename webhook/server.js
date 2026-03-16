@@ -165,7 +165,7 @@ async function incrFreeDailyUsage(userEmail) {
 const app = express();
 
 // Webhook 运行在 Nginx 反向代理后面，启用 trust proxy 以正确获取客户端真实 IP
-app.set('trust proxy', '172.16.1.1');
+app.set('trust proxy', process.env.TRUST_PROXY || '172.16.1.1');
 
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
@@ -246,13 +246,12 @@ function requireAdmin(req, res, next) {
 /**
  * 内部服务鉴权中间件（用于 /billing/record、/billing/check）。
  * 验证 X-Service-Token 请求头，防止内网未授权进程触发计费。
- * 若未配置 SERVICE_TOKEN 环境变量，接口仍可访问（降级兼容），
- * 但会在日志中发出警告提醒管理员配置。
+ * SERVICE_TOKEN 未配置时拒绝请求（fail-closed），防止在缺少鉴权的情况下暴露写入接口。
  */
 function requireServiceToken(req, res, next) {
   if (!SERVICE_TOKEN) {
-    logger.warn('SERVICE_TOKEN 未配置，/billing 写入接口无内部服务鉴权（建议设置）', { path: req.path });
-    return next();
+    logger.error('SERVICE_TOKEN 未配置，拒绝 /billing 写入请求（请设置环境变量）', { path: req.path, ip: req.ip });
+    return res.status(503).json({ success: false, msg: '服务鉴权未配置，请联系管理员' });
   }
   const token = req.headers['x-service-token'] || '';
   if (!safeCompare(token, SERVICE_TOKEN)) {
@@ -332,8 +331,8 @@ const MAX_SINGLE_REQUEST_FEN = (() => {
 // 默认值 7.2；可通过 USD_TO_CNY_RATE 环境变量在运行时热更新。
 function getUsdToCnyRate() {
   const v = parseFloat(process.env.USD_TO_CNY_RATE || '7.2');
-  if (!Number.isFinite(v) || v <= 0) {
-    logger.warn('USD_TO_CNY_RATE 非法，使用默认值 7.2');
+  if (!Number.isFinite(v) || v < 1 || v > 15) {
+    logger.warn('USD_TO_CNY_RATE 非法或超出合理范围 (1~15)，使用默认值 7.2', { raw: process.env.USD_TO_CNY_RATE });
     return 7.2;
   }
   return v;

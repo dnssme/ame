@@ -256,8 +256,11 @@ bot.command('model', async (ctx) => {
 
 // /balance 查询余额
 bot.command('balance', async (ctx) => {
-  const email = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  const email = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   if (!email) return ctx.reply('用法：/balance <邮箱>');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    return ctx.reply('❌ 邮箱格式不正确');
+  }
   try {
     const { body } = await request(`${BILLING_URL}/billing/balance/${encodeURIComponent(email)}`);
     const data = await body.json();
@@ -267,6 +270,7 @@ bot.command('balance', async (ctx) => {
       ctx.reply(`查询失败：${data.msg}`);
     }
   } catch (err) {
+    logger.error('余额查询失败', { err: err.message, userId: ctx.from.id });
     ctx.reply('余额查询服务暂不可用。');
   }
 });
@@ -281,6 +285,10 @@ bot.command('clear', (ctx) => {
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text || text.startsWith('/')) return;
+
+  if (text.length > 10000) {
+    return ctx.reply('❌ 消息过长（最多 10000 字符），请精简后重试。');
+  }
 
   logger.info('收到消息', { userId: ctx.from.id, text: text.substring(0, 100) });
 

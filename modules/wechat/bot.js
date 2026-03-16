@@ -223,6 +223,11 @@ bot.on('message', async (msg) => {
       }
       if (!text) return;
 
+      if (text.length > 10000) {
+        await msg.say('❌ 消息过长（最多 10000 字符），请精简后重试。');
+        return;
+      }
+
       logger.info('收到文字消息', { userId, text: text.substring(0, 100), isGroup });
 
       // /bind <email> — 绑定计费邮箱，用于计费归因
@@ -244,11 +249,19 @@ bot.on('message', async (msg) => {
         await msg.say('⏳ 任务处理中，完成后会通知你...');
         callAgent(userId, text)
           .then(async (reply) => {
-            await saySplitMessage(msg, `✅ 任务完成：\n\n${reply}`);
+            try {
+              await saySplitMessage(msg, `✅ 任务完成：\n\n${reply}`);
+            } catch (sendErr) {
+              logger.error('发送任务结果失败', { err: sendErr.message, userId });
+            }
           })
           .catch(async (err) => {
             logger.error('Long-running task failed', { err: err.message, userId });
-            await msg.say('❌ 任务执行失败，请稍后重试。');
+            try {
+              await msg.say('❌ 任务执行失败，请稍后重试。');
+            } catch (sendErr) {
+              logger.error('发送错误消息失败', { err: sendErr.message, userId });
+            }
           });
         return;
       }
