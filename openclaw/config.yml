@@ -282,15 +282,15 @@ ollama:
     - qwen2.5:7b-instruct-q4_K_M
     - llama3.2:3b
 
-# ─── 计费 Webhook（向 CXI4 汇报每次 API 调用）────────────────
+# ─── 计费 Webhook（向 VPS-E 汇报每次 API 调用）────────────────
 billing:
   enabled: true
-  webhookUrl: http://172.16.1.5:3002/billing/record
+  webhookUrl: http://172.16.1.6:3002/billing/record
   # 内部服务鉴权 Token（对应 webhook SERVICE_TOKEN 环境变量）
   # 用于 /billing/record 和 /billing/check 的来源鉴权，防止内网未授权进程伪造计费
   serviceToken: ${SERVICE_TOKEN}
   # 调用 /models 接口获取最新定价列表，每 5 分钟缓存一次
-  modelsCacheUrl: http://172.16.1.5:3002/models
+  modelsCacheUrl: http://172.16.1.6:3002/models
   modelsCacheTtl: 300
 
 # ─── 记忆数据库 ───────────────────────────────────────────────
@@ -298,9 +298,9 @@ memory:
   enabled: true
   database: postgresql://animaapp:${PG_PASSWORD}@anima-db.postgres.database.azure.com:5432/openclaw?sslmode=require
 
-# ─── Redis 缓存（复用 CXI4 的 Redis）────────────────────────
+# ─── Redis 缓存（复用 VPS-E 的 Redis）────────────────────────
 redis:
-  url: redis://:${REDIS_PASSWORD}@172.16.1.5:6379
+  url: redis://:${REDIS_PASSWORD}@172.16.1.6:6379
   sessionTtl: 3600  # 对话上下文缓存 TTL（秒）
 
 # ─── 工具配置 ─────────────────────────────────────────────────

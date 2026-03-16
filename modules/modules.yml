@@ -35,7 +35,7 @@ core:
   billing:
     enabled: true
     description: "订阅收费系统（Webhook 计费服务）"
-    node: CXI4
+    node: VPS-E
     path: ../webhook/
 
 # ─── 通讯渠道模块 ──────────────────────────────────────────

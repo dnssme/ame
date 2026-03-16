@@ -1,7 +1,12 @@
 # VPS D (172.16.1.4) 详细部署教程
 ## Nextcloud（日历 CalDAV + 网盘 WebDAV）
 
-> **节点角色**：Nextcloud 私有云平台，提供日历 CalDAV（手机/电脑同步）、网盘 WebDAV（多设备文件同步）  
+> ✅ **VPS D 已重新激活**：Nextcloud 已从 CXI4 迁回 VPS D (172.16.1.4)，与 Azure PostgreSQL 同在香港机房，消除跨境数据库延迟。  
+> CXI4 (172.16.1.5) 现仅承担 ML 推理（Whisper + TTS）和本地服务（Email + HA）。
+
+---
+
+> **节点角色**：Nextcloud 私有云平台（CalDAV + WebDAV）  
 > **硬件规格**：2 核 CPU · 1 GB RAM  
 > **操作系统**：Ubuntu 22.04 LTS（推荐）
 
@@ -149,11 +154,18 @@ AllowedIPs = 172.16.1.2/32, fd00:ai::2/128
 Endpoint = <VPS-B 公网IP>:51820
 PersistentKeepalive = 25
 
-# ─── CXI4（Webhook / Redis / Voice / HA）───
+# ─── CXI4（Whisper + TTS + Email + HA）───
 [Peer]
 PublicKey = <CXI4 公钥>
 AllowedIPs = 172.16.1.5/32, fd00:ai::5/128
 Endpoint = <CXI4 公网IP/DDNS>:51820
+PersistentKeepalive = 25
+
+# ─── VPS E（Webhook + Redis）───
+[Peer]
+PublicKey = <VPS-E 公钥>
+AllowedIPs = 172.16.1.6/32, fd00:ai::6/128
+Endpoint = <VPS-E 公网IP>:51820
 PersistentKeepalive = 25
 EOF
 
