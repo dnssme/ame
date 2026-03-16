@@ -170,11 +170,12 @@ app.set('trust proxy', process.env.TRUST_PROXY || '172.16.1.1');
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
 
-// PCI-DSS 6.5.10: 防止代理或浏览器缓存敏感的计费/余额数据
+// 防止代理或浏览器缓存敏感的计费/余额数据（PCI-DSS 4.2 传输保护）
 // Nginx 已为外部流量设置 Cache-Control，此处覆盖内部服务间调用
 app.use((_req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
   res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
   next();
 });
 
