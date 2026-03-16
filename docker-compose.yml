@@ -40,6 +40,7 @@ services:
 
     volumes:
       - ./librechat/.env:/app/.env:ro
+      - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./librechat/uploads:/app/uploads
       - ./librechat/logs:/app/logs
 
@@ -140,6 +141,7 @@ services:
 
     volumes:
       - ./librechat/.env:/app/.env:ro
+      - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./librechat/uploads:/app/uploads
       - ./librechat/logs:/app/logs
 

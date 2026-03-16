@@ -55,7 +55,7 @@ const logger = winston.createLogger({
   transports: [
     new winston.transports.Console(),
     new winston.transports.File({
-      filename: '/var/log/anima-webhook.log',
+      filename: '/tmp/anima-webhook.log',
       maxsize: 10 * 1024 * 1024, // 10 MB rotate
       maxFiles: 5,
       tailable: true,
