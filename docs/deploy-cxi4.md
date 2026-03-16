@@ -1,7 +1,7 @@
 # CXI4 (172.16.1.5) 详细部署教程
-## Webhook 计费服务 · Redis · Whisper STT · Coqui TTS · Email · Home Assistant
+## Nextcloud · Webhook 计费服务 · Redis · Whisper STT · Coqui TTS · Email · Home Assistant
 
-> **节点角色**：内网核心服务节点，托管 Webhook 计费 API、Redis 缓存、Whisper STT 语音识别、Coqui TTS 语音合成、邮件处理、Home Assistant 智能家居  
+> **节点角色**：内网核心服务节点，托管 Nextcloud 私有云（日历 CalDAV + 网盘 WebDAV）、Webhook 计费 API、Redis 缓存、Whisper STT 语音识别、Coqui TTS 语音合成、邮件处理、Home Assistant 智能家居  
 > **硬件规格**：Intel i7-10610U · 8 GB RAM · 500 GB SSD  
 > **操作系统**：Ubuntu 22.04 LTS（推荐）
 
@@ -15,13 +15,14 @@
 4. [WireGuard 内网配置](#4-wireguard-内网配置)
 5. [安装 Redis](#5-安装-redis)
 6. [部署 Webhook 计费服务](#6-部署-webhook-计费服务)
-7. [可选：部署 Whisper STT + Coqui TTS + Email + Home Assistant](#7-可选部署-whisper-stt)
-8. [auditd 操作审计](#75-配置-auditd-操作审计)
-9. [CIS 合规核查清单](#8-cis-合规核查清单)
-10. [PCI-DSS 合规核查清单](#9-pci-dss-合规核查清单)
-11. [功能测试](#10-功能测试)
-12. [日常运维](#11-日常运维)
-13. [故障排查](#12-故障排查)
+7. [部署 Nextcloud（日历 CalDAV + 网盘 WebDAV）](#7-部署-nextcloud日历-caldav--网盘-webdav)
+8. [可选：部署 Whisper STT + Coqui TTS + Email + Home Assistant](#8-可选部署-whisper-stt--coqui-tts--email--home-assistant)
+9. [auditd 操作审计](#9-auditd-操作审计)
+10. [CIS 合规核查清单](#10-cis-合规核查清单)
+11. [PCI-DSS 合规核查清单](#11-pci-dss-合规核查清单)
+12. [功能测试](#12-功能测试)
+13. [日常运维](#13-日常运维)
+14. [故障排查](#14-故障排查)
 
 ---
 
@@ -31,7 +32,7 @@
 
 - [ ] Ubuntu 22.04 LTS 全新安装，已完成基础系统更新
 - [ ] 已分配 WireGuard 内网 IP `172.16.1.5`
-- [ ] Azure PostgreSQL 实例已创建，`librechat` 和 `openclaw` 数据库已建立
+- [ ] Azure PostgreSQL 实例已创建，`librechat`、`openclaw` 和 `nextcloud` 数据库已建立
 - [ ] `animaapp` 数据库用户已创建，已授予两个数据库的所有权限
 - [ ] 已为 `animaapp` 授予 `azure_pg_admin` 角色（用于 `CREATE EXTENSION`）
 - [ ] 本机 IP 已加入 Azure PostgreSQL 防火墙规则（`172.16.1.5`）
@@ -192,6 +193,9 @@ ufw allow 51820/udp
 
 # 允许内网访问 Webhook（仅 WireGuard 内网）
 ufw allow in from 172.16.1.0/24 to any port 3002
+
+# 允许内网访问 Nextcloud（仅 WireGuard 内网）
+ufw allow in from 172.16.1.0/24 to any port 8090 proto tcp comment "Nextcloud HTTP"
 
 # 允许内网访问 Redis（仅 WireGuard 内网，禁止公网）
 ufw allow in from 172.16.1.0/24 to any port 6379
@@ -560,11 +564,115 @@ chmod 750 /opt/ai/webhook/watchdog.sh
 
 ---
 
-## 7. 可选：部署 Whisper STT + Coqui TTS + Email + Home Assistant
+## 7. 部署 Nextcloud（日历 CalDAV + 网盘 WebDAV）
+
+> Nextcloud 部署在 CXI4 而非独立 VPS，因为 CXI4 拥有 **500 GB SSD**，更适合企业级文件存储。
+> Nextcloud 是必选基础设施模块，为日历管理（CalDAV）和用户网盘（WebDAV）提供底层支撑。
+
+### 7.1 CXI4 资源分配总览
+
+| 服务 | mem_limit | mem_reservation | cpus | 备注 |
+|------|-----------|-----------------|------|------|
+| **Nextcloud** | 768m | 384m | 1.0 | 企业级文件存储 + CalDAV + WebDAV |
+| **Webhook** | 384m | 192m | 1.5 | 计费服务 |
+| **Redis** | 1g (maxmemory) | — | — | 系统级缓存 |
+| **Whisper STT** | 2g | 1g | 2.0 | ML 语音识别模型 |
+| **Coqui TTS** | 768m | 384m | 1.0 | ML 语音合成模型 |
+| **Email** | 192m | 64m | 0.5 | IMAP/SMTP 处理 |
+| **Home Assistant** | 512m | 256m | 1.0 | 智能家居（可选） |
+| **合计** | **≈ 5.6g** | — | — | 系统预留 ≈ 2.4 GB |
+
+### 7.2 准备配置
+
+```bash
+mkdir -p /opt/ai/modules/nextcloud
+cd /opt/ai/modules/nextcloud
+
+# 复制 docker-compose.yml
+cp /opt/ai/repo/modules/nextcloud/docker-compose.yml .
+```
+
+### 7.3 创建环境变量文件
+
+```bash
+cat > .env <<'EOF'
+PG_PASSWORD=<Azure PostgreSQL animaapp 密码>
+NEXTCLOUD_USERNAME=admin
+NEXTCLOUD_PASSWORD=<Nextcloud 管理员密码，至少 16 字符>
+NEXTCLOUD_DOMAIN=<你的域名>
+TZ=Asia/Shanghai
+EOF
+chmod 600 .env
+```
+
+### 7.4 启动 Nextcloud
+
+```bash
+docker compose up -d
+
+# 等待初始化完成（首次约 2-3 分钟）
+docker compose logs -f --tail=50
+
+# 验证服务状态
+docker compose ps
+curl -sf http://172.16.1.5:8090/status.php | jq .
+```
+
+### 7.5 Nextcloud 初始配置
+
+```bash
+# 设置可信域名
+docker exec -u www-data anima-nextcloud php occ config:system:set \
+  trusted_domains 0 --value="172.16.1.5"
+docker exec -u www-data anima-nextcloud php occ config:system:set \
+  trusted_domains 1 --value="<你的域名>"
+
+# 设置默认语言和区域
+docker exec -u www-data anima-nextcloud php occ config:system:set \
+  default_language --value="zh_CN"
+docker exec -u www-data anima-nextcloud php occ config:system:set \
+  default_locale --value="zh_CN"
+docker exec -u www-data anima-nextcloud php occ config:system:set \
+  default_phone_region --value="CN"
+
+# 禁用不需要的应用（减少攻击面）
+docker exec -u www-data anima-nextcloud php occ app:disable survey_client
+docker exec -u www-data anima-nextcloud php occ app:disable firstrunwizard
+
+# 启用日历应用（CalDAV）并创建 AI 专用日历
+docker exec -u www-data anima-nextcloud php occ app:enable calendar
+docker exec -u www-data anima-nextcloud php occ dav:create-calendar admin anima
+```
+
+### 7.6 设置用户配额
+
+```bash
+# 设置默认用户存储配额为 5GB
+docker exec -u www-data anima-nextcloud php occ config:app:set \
+  files default_quota --value="5 GB"
+```
+
+### 7.7 验证 CalDAV / WebDAV
+
+```bash
+# 验证 CalDAV 日历
+curl -sf -u admin:<密码> \
+  http://172.16.1.5:8090/remote.php/dav/calendars/admin/anima/ \
+  && echo "CalDAV OK"
+
+# 验证 WebDAV 网盘
+curl -sf -u admin:<密码> -X PROPFIND \
+  http://172.16.1.5:8090/remote.php/dav/files/admin/ \
+  -o /dev/null -w "HTTP %{http_code}" && echo " WebDAV OK"
+```
+
+---
+
+## 8. 可选：部署 Whisper STT + Coqui TTS + Email + Home Assistant
 
 CXI4 是主要算力节点（8GB RAM），以下服务均可按需部署在此节点：
 
-### 7.1 Whisper STT（语音识别）
+### 8.1 Whisper STT（语音识别）
 
 ```bash
 cd /opt/ai/modules/voice
@@ -574,7 +682,7 @@ docker compose -f docker-compose.whisper.yml up -d
 curl -sf http://172.16.1.5:8080/ || echo "Whisper STT 未就绪，稍候重试"
 ```
 
-### 7.2 Coqui TTS（语音合成）
+### 8.2 Coqui TTS（语音合成）
 
 ```bash
 cd /opt/ai/modules/voice
@@ -586,7 +694,7 @@ curl -sf http://172.16.1.5:8082/api/tts \
   -d '{"text":"你好"}' --output /dev/null && echo "TTS OK"
 ```
 
-### 7.3 Email 处理模块
+### 8.3 Email 处理模块
 
 ```bash
 cd /opt/ai/modules/email
@@ -598,7 +706,7 @@ docker compose up -d
 curl -sf http://172.16.1.5:3004/health && echo "Email OK"
 ```
 
-### 7.4 Home Assistant（智能家居）
+### 8.4 Home Assistant（智能家居）
 
 ```bash
 cd /opt/ai/modules/smart-home
@@ -611,21 +719,9 @@ echo "访问 http://172.16.1.5:8123 完成 Home Assistant 初始配置"
 echo "配置完成后，创建长期访问令牌填入 openclaw/.env 的 HA_TOKEN"
 ```
 
-### CXI4 资源分配汇总
-
-| 服务 | 端口 | 内存限制 | 说明 |
-|------|------|---------|------|
-| Webhook 计费 | 3002 | 256m | 核心计费 API |
-| Redis | 6379 | ~128m | 会话缓存 + 速率限制 |
-| Whisper STT | 8080 | 2g | Small 模型 int8 量化 |
-| Coqui TTS | 8082 | 768m | 中文 Baker 模型 |
-| Email 处理 | 3004 | 192m | IMAP/SMTP + AI 分析 |
-| Home Assistant | 8123 | 512m | Zigbee/WiFi/Matter |
-| **合计** | | **≈ 3.8g** | CXI4 8GB 余 ~4GB 系统 |
-
 ---
 
-## 7.5 配置 auditd 操作审计
+## 9. auditd 操作审计
 
 ```bash
 # 使用统一审计配置脚本
@@ -642,11 +738,11 @@ ausearch -ts today | head -20
 
 ---
 
-## 8. CIS 合规核查清单
+## 10. CIS 合规核查清单
 
 执行以下检查，确认所有项目通过：
 
-### 8.1 操作系统加固
+### 10.1 操作系统加固
 
 ```bash
 echo "=== CIS OS 加固核查 ==="
@@ -676,7 +772,7 @@ echo -n "[CIS 5.2.11] SSH 密码认证禁用: "
 grep '^PasswordAuthentication no' /etc/ssh/sshd_config &>/dev/null && echo "✅ 通过" || echo "❌ 失败"
 ```
 
-### 8.2 服务安全
+### 10.2 服务安全
 
 ```bash
 echo "=== CIS 服务安全核查 ==="
@@ -702,7 +798,7 @@ echo -n "[CIS Docker 5.x] NoNewPrivileges: "
 systemctl show ai-webhook | grep -q 'NoNewPrivileges=yes' && echo "✅ 通过" || echo "❌ 失败"
 ```
 
-### 8.3 防火墙规则
+### 10.3 防火墙规则
 
 ```bash
 echo "=== UFW 防火墙规则核查 ==="
@@ -718,7 +814,7 @@ ufw status | grep '6379' | grep -q '172.16.1.0/24' && echo "✅ 通过" || echo 
 
 ---
 
-## 9. PCI-DSS 合规核查清单
+## 11. PCI-DSS 合规核查清单
 
 ```bash
 echo "=== PCI-DSS 合规核查 ==="
@@ -765,9 +861,9 @@ chronyc tracking &>/dev/null && echo "✅ 通过" || echo "❌ 失败"
 
 ---
 
-## 10. 功能测试
+## 12. 功能测试
 
-### 10.1 健康检查
+### 12.1 健康检查
 
 ```bash
 echo "=== Webhook 功能测试 ==="
@@ -780,7 +876,7 @@ echo "${HEALTH}" | grep -q '"db":"ok"' \
   || echo "❌ 失败 → ${HEALTH}"
 ```
 
-### 10.2 模型接口测试
+### 12.2 模型接口测试
 
 ```bash
 # 查询预置模型列表
@@ -791,7 +887,7 @@ echo "${MODELS}" | grep -q '"success":true' \
   || echo "❌ 失败 → ${MODELS}"
 ```
 
-### 10.3 免费模型计费测试
+### 12.3 免费模型计费测试
 
 ```bash
 # 免费模型计费（应记录但不扣费）
@@ -804,7 +900,7 @@ echo "${RESULT}" | grep -q '"is_free":true' \
   || echo "❌ 失败 → ${RESULT}"
 ```
 
-### 10.4 充值卡激活测试
+### 12.4 充值卡激活测试
 
 ```bash
 # 首先创建测试充值卡（需 psql）
@@ -834,7 +930,7 @@ echo "${DUPLICATE}" | grep -q '"success":false' \
   || echo "❌ 失败（应拒绝但未拒绝）"
 ```
 
-### 10.5 余额查询测试
+### 12.5 余额查询测试
 
 ```bash
 echo -n "[测试 6] 余额查询: "
@@ -844,7 +940,7 @@ echo "${BALANCE}" | grep -q '"success":true' \
   || echo "❌ 失败 → ${BALANCE}"
 ```
 
-### 10.6 付费模型余额不足测试
+### 12.6 付费模型余额不足测试
 
 ```bash
 # 用余额 < 所需的用户测试付费模型
@@ -858,7 +954,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
   || echo "⚠️  余额不足用户可能不存在（HTTP ${HTTP_CODE}），该场景需余额为 0 的用户"
 ```
 
-### 10.7 管理员接口鉴权测试
+### 12.7 管理员接口鉴权测试
 
 ```bash
 ADMIN_TOKEN="$(grep '^ADMIN_TOKEN=' /opt/ai/webhook/.env | cut -d= -f2)"
@@ -876,7 +972,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
 [ "${HTTP_CODE}" = "200" ] && echo "✅ 通过" || echo "❌ 失败（HTTP ${HTTP_CODE}）"
 ```
 
-### 10.8 速率限制测试（PCI-DSS 8.3）
+### 12.8 速率限制测试（PCI-DSS 8.3）
 
 ```bash
 echo -n "[测试 10] 激活接口速率限制: "
@@ -895,7 +991,7 @@ done
 ${BLOCKED} || echo "⚠️  速率限制未在 8 次内触发（检查 LIMIT_ACTIVATE_MAX 配置）"
 ```
 
-### 10.9 Redis 连通性测试
+### 12.9 Redis 连通性测试
 
 ```bash
 echo -n "[测试 11] Redis 连通性（内网）: "
@@ -912,7 +1008,7 @@ redis-cli -h 172.16.1.5 ping 2>&1 | grep -qi 'NOAUTH\|Authentication required' \
 
 ---
 
-## 11. 日常运维
+## 13. 日常运维
 
 ### 查看服务状态
 
@@ -952,7 +1048,7 @@ curl -s -o /dev/null -w "%{http_code}" \
 
 ---
 
-## 12. 故障排查
+## 14. 故障排查
 
 ### Webhook 无法启动
 

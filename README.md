@@ -19,7 +19,7 @@
 11. [第二步：VPS C — 部署 LibreChat](#第二步vps-c--部署-librechat)
 12. [第三步：VPS B — 部署 OpenClaw](#第三步vps-b--部署-openclaw)
 13. [第四步：VPS A — 配置 Nginx + ModSecurity WAF](#第四步vps-a--配置-nginx--modsecurity-waf)
-14. [第五步：VPS D — 部署 Nextcloud](#第五步vps-d--部署-nextcloud)
+14. [第五步：CXI4 — 部署 Nextcloud](#第五步cxi4--部署-nextcloud)
 15. [第六步：初始化模型定价](#第六步初始化模型定价)
 16. [API 接口完整参考](#api-接口完整参考)
 17. [常用运维 SQL](#常用运维-sql)
@@ -247,9 +247,10 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
     ├─── /activate      → [CXI4]  Webhook      :3002
     ├─── /tts/          → [CXI4]  Coqui TTS    :8082  （语音合成，中文 Baker）
     ├─── /whisper/      → [CXI4]  Whisper      :8080  （语音识别，Small 中文优先）
-    └─── /nextcloud/    → [VPS D] Nextcloud    :8090  （日历/网盘）
+    └─── /nextcloud/    → [CXI4]  Nextcloud    :8090  （日历/网盘）
 
-[CXI4] (172.16.1.5, i7-10610U / 8GB)
+[CXI4] (172.16.1.5, i7-10610U / 8GB / 500GB SSD)
+    ├─── Nextcloud         :8090  ←── 日历 CalDAV + 网盘 WebDAV（500GB SSD）
     ├─── Webhook 计费服务  :3002  ←── OpenClaw / LibreChat 自动调用
     ├─── Redis             :6379  ←── 会话缓存 + 免费用户每日限额
     ├─── Coqui TTS         :8082  （中文 Baker 模型，延迟 <100ms）
@@ -310,8 +311,8 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   ├── deploy-vpsa.md       # VPS A — Nginx + WAF
 │   ├── deploy-vpsb.md       # VPS B — OpenClaw Agent
 │   ├── deploy-vpsc.md       # VPS C — LibreChat
-│   ├── deploy-vpsd.md       # VPS D — Nextcloud（日历 + 网盘）
-│   ├── deploy-cxi4.md       # CXI4 — Webhook + Redis + Voice + HA
+│   ├── deploy-vpsd.md       # VPS D — 已释放（Nextcloud 已迁移至 CXI4）
+│   ├── deploy-cxi4.md       # CXI4 — Nextcloud + Webhook + Redis + Voice + HA
 │   └── cloudflare-tunnel.md # Cloudflare Tunnel 配置
 └── scripts/
     ├── watchdog.sh          # Webhook 健康检查看门狗
@@ -352,10 +353,11 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | **VPS A** (172.16.1.1) | Nginx 反向代理 | 2 核 | 1 GB | — | Nginx ~50 MB | ~950 MB 系统 |
 | **VPS B** (172.16.1.2) | OpenClaw Agent | 2 核 | 1 GB | — | 容器 ≤600 MB | ~400 MB 系统 |
 | **VPS C** (172.16.1.3) | LibreChat | 2 核 | 1 GB | — | 容器 ≤768 MB | ~256 MB 系统 |
-| **VPS D** (172.16.1.4) | Nextcloud（日历/网盘） | 2 核 | 1 GB | — | 容器 ≤512 MB | ~488 MB 系统 |
-| **CXI4** (172.16.1.5) | Webhook + Redis + Whisper + TTS + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB | Webhook 256m + Redis ≤1g + Whisper 2g + TTS 768m ≈ 4g | ~4 GB 系统 |
+| **CXI4** (172.16.1.5) | Nextcloud + Webhook + Redis + Whisper + TTS + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB SSD | Nextcloud 768m + Webhook 384m + Redis ≤1g + Whisper 2g + TTS 768m + Email 192m + HA 512m ≈ 5.6g | ~2.4 GB 系统 |
 
 > ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 768m、OpenClaw 设为 450m，均已在 `docker-compose.yml` 中配置。
+>
+> 📌 **Nextcloud 已迁移至 CXI4**：CXI4 拥有 500 GB SSD，更适合存储用户文件和日历数据。VPS D (172.16.1.4) 已释放，可作为备用节点或未来扩展使用。
 
 ### 各节点 UFW 防火墙规则（CIS L1 要求）
 
@@ -396,11 +398,12 @@ ufw allow in on wg0
 ufw enable
 
 # ──────────────────────────────────────────
-# CXI4 (172.16.1.5) — Webhook / Redis（内网专用）
+# CXI4 (172.16.1.5) — Nextcloud / Webhook / Redis（内网专用）
 # ──────────────────────────────────────────
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
+ufw allow in from 172.16.1.0/24 to any port 8090  # Nextcloud（日历/网盘）
 ufw allow in from 172.16.1.0/24 to any port 3002  # Webhook 计费服务
 ufw allow in from 172.16.1.0/24 to any port 6379  # Redis（禁止公网直连）
 ufw allow in on wg0
@@ -412,12 +415,11 @@ ufw enable
 ### 验证 WireGuard 内网互通
 
 ```bash
-# 在任意节点执行，确认四个 IP 均可达
+# 在任意节点执行，确认各节点 IP 均可达
 ping -c 2 172.16.1.1   # VPS A (Nginx)
 ping -c 2 172.16.1.2   # VPS B (OpenClaw)
 ping -c 2 172.16.1.3   # VPS C (LibreChat)
-ping -c 2 172.16.1.4   # VPS D (Nextcloud，如有）
-ping -c 2 172.16.1.5   # CXI4 (Webhook/Redis)
+ping -c 2 172.16.1.5   # CXI4 (Nextcloud/Webhook/Redis)
 ```
 
 ---
@@ -934,13 +936,15 @@ tail -20 /www/wwwlogs/owasp/modsec_audit.log
 
 ---
 
-## 第五步：VPS D — 部署 Nextcloud
+## 第五步：CXI4 — 部署 Nextcloud
 
-详细教程参见 [docs/deploy-vpsd.md](docs/deploy-vpsd.md)。
+详细教程参见 [docs/deploy-cxi4.md](docs/deploy-cxi4.md) 中 Nextcloud 部分。
+
+> 📌 Nextcloud 部署在 CXI4 而非独立 VPS，因为 CXI4 拥有 500 GB SSD，更适合企业级文件存储。
 
 ### 5.1 前置条件
 
-- VPS D (172.16.1.4) 已完成 OS 加固 + WireGuard + Docker 安装
+- CXI4 (172.16.1.5) 已完成第一步 Webhook + Redis 部署
 - Azure PostgreSQL 已创建 `nextcloud` 数据库
 
 ### 5.2 部署 Nextcloud
@@ -950,6 +954,8 @@ mkdir -p /opt/ai/modules/nextcloud
 cd /opt/ai/modules/nextcloud
 
 # 从仓库复制 docker-compose.yml
+cp /opt/ai/repo/modules/nextcloud/docker-compose.yml .
+
 # 创建环境变量文件
 cat > .env <<'EOF'
 PG_PASSWORD=<Azure PostgreSQL 密码>
@@ -971,7 +977,7 @@ docker exec -u www-data anima-nextcloud php occ app:enable calendar
 docker exec -u www-data anima-nextcloud php occ dav:create-calendar admin anima
 
 # 验证 CalDAV
-curl -sf -u admin:<密码> http://172.16.1.4:8090/remote.php/dav/calendars/admin/anima/
+curl -sf -u admin:<密码> http://172.16.1.5:8090/remote.php/dav/calendars/admin/anima/
 ```
 
 ### 5.4 配置 auditd 审计
@@ -1512,8 +1518,8 @@ curl http://172.16.1.5:3002/admin/models \
 | 审计日志（CIS 8, PCI 10.x） | 记录操作日志 | 双层日志：Winston 应用日志（10 MB × 5 轮替）+ ModSecurity 审计日志（`/www/wwwlogs/owasp/modsec_audit.log`，并发模式） |
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
-| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 450m）；JSON 日志轮替 |
-| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配 1 GB VPS；Redis `maxmemory 1gb` + LRU 淘汰策略；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
+| 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 768m / OpenClaw 450m / Nextcloud 768m）；JSON 日志轮替 |
+| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配各节点；CXI4 托管 Nextcloud（768m）+ Webhook + Redis（1g）+ Whisper（2g）+ TTS（768m），合计 ≈ 5.6g / 8 GB；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
 | 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | UFW 防火墙 → Nginx 限速/路径拦截 → ModSecurity WAF → 应用层校验 → DB 约束（五层纵深防御） |
 
 ### WAF 性能优化措施
@@ -1549,10 +1555,9 @@ curl http://172.16.1.5:3002/admin/models \
 | **VPS A** (172.16.1.1) | Nginx 反向代理 + ModSecurity WAF | [docs/deploy-vpsa.md](docs/deploy-vpsa.md) |
 | **VPS B** (172.16.1.2) | OpenClaw Agent + 可选 Bot 模块 | [docs/deploy-vpsb.md](docs/deploy-vpsb.md) |
 | **VPS C** (172.16.1.3) | LibreChat Web UI | [docs/deploy-vpsc.md](docs/deploy-vpsc.md) |
-| **VPS D** (172.16.1.4) | Nextcloud（日历 CalDAV + 网盘 WebDAV） | [docs/deploy-vpsd.md](docs/deploy-vpsd.md) |
-| **CXI4** (172.16.1.5) | Webhook 计费 + Redis + Whisper + TTS + HA | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
+| **CXI4** (172.16.1.5) | Webhook 计费 + Redis + Nextcloud + Whisper + TTS + HA | [docs/deploy-cxi4.md](docs/deploy-cxi4.md) |
 
-**推荐部署顺序：** CXI4 → VPS D → VPS C → VPS B → VPS A
+**推荐部署顺序：** CXI4（Webhook + Redis + Nextcloud）→ VPS C → VPS B → VPS A
 
 ---
 
