@@ -166,7 +166,7 @@ async function checkNewEmails() {
   } catch (err) {
     logger.error('邮件检查失败', { err: err.message });
     // 确保 IMAP 连接被清理，防止连接泄漏
-    try { await client.logout(); } catch { /* ignore */ }
+    try { await client.logout(); } catch (logoutErr) { logger.debug('IMAP logout cleanup failed', { err: logoutErr.message }); }
   }
 }
 
