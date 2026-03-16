@@ -535,7 +535,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
       label:       card.label || null,
     });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     logger.error('Activation error', { err: err.message, userEmail });
     res.status(500).json({ success: false, msg: '服务器内部错误，请稍后重试' });
   } finally {
@@ -931,7 +931,7 @@ app.post('/billing/record', requireServiceToken, async (req, res) => {
 
     res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     logger.error('Billing record error', { err: err.message, userEmail });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
@@ -1210,7 +1210,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     logger.info('Admin balance adjusted', { userEmail, amount_fen, actualApplied, type });
     res.json({ success: true, balance_fen: newBalance, actual_applied_fen: actualApplied });
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     logger.error('Admin adjust error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
