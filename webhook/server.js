@@ -94,9 +94,12 @@ redis.connect().catch((err) => logger.warn('Redis connect error (free daily limi
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // 免费用户每日调用次数上限（付费用户无限制）
-// Lua 脚本：原子执行 INCR + EXPIRE，防止 key 永不过期（PCI-DSS 6.5.5 安全失效）
+// Lua 脚本：原子执行条件 INCR + EXPIRE，防止 key 永不过期（PCI-DSS 6.5.5 安全失效）
+// 当计数器已超过限额时跳过 INCR，防止被拒请求无限膨胀计数器
 const INCR_EXPIRE_LUA =
-  'local c = redis.call("INCR", KEYS[1])\n' +
+  'local c = tonumber(redis.call("GET", KEYS[1]) or "0")\n' +
+  'if c > tonumber(ARGV[1]) then return c end\n' +
+  'c = redis.call("INCR", KEYS[1])\n' +
   'if c == 1 then redis.call("EXPIRE", KEYS[1], 86400) end\n' +
   'return c';
 
@@ -124,7 +127,8 @@ async function peekFreeDailyUsage(userEmail) {
     const today = new Date().toISOString().slice(0, 10);
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = parseInt(await redis.get(key) || '0', 10);
-    return { allowed: count < FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT };
+    // 将 used 封顶为 limit，防止因首次被拒请求的单次额外 INCR 导致显示值偏大
+    return { allowed: count < FREE_DAILY_LIMIT, used: Math.min(count, FREE_DAILY_LIMIT), limit: FREE_DAILY_LIMIT };
   } catch (err) {
     logger.warn('Redis daily peek failed, allowing request', { err: err.message });
     return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
@@ -133,7 +137,8 @@ async function peekFreeDailyUsage(userEmail) {
 
 /**
  * 递增免费用户当日调用计数器（仅在实际使用时调用）。
- * 使用 Redis INCR + EXPIRE 实现日计数器。
+ * 使用 Redis 条件 INCR + EXPIRE 实现日计数器。
+ * 当计数器已超过限额时跳过 INCR，防止被拒请求无限膨胀计数器。
  * Redis 不可用时放行（fail-open，避免阻塞服务）。
  *
  * @param {string} userEmail - 归一化后的邮箱
@@ -146,9 +151,10 @@ async function incrFreeDailyUsage(userEmail) {
     }
     const today = new Date().toISOString().slice(0, 10);
     const key = `anima:free_daily:${userEmail}:${today}`;
-    // 使用 Lua 脚本原子执行 INCR + EXPIRE，防止进程在两条命令之间崩溃
+    // 使用 Lua 脚本原子执行条件 INCR + EXPIRE，防止进程在两条命令之间崩溃
     // 导致 key 永不过期（PCI-DSS 6.5.5 安全失效）
-    const count = await redis.eval(INCR_EXPIRE_LUA, 1, key);
+    // ARGV[1] = FREE_DAILY_LIMIT，超过限额后跳过 INCR 避免计数器无限膨胀
+    const count = await redis.eval(INCR_EXPIRE_LUA, 1, key, FREE_DAILY_LIMIT);
     return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT };
   } catch (err) {
     logger.warn('Redis daily limit incr failed, allowing request', { err: err.message });
