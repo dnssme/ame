@@ -104,19 +104,41 @@ const FREE_DAILY_LIMIT = (() => {
 })();
 
 /**
- * 检查免费用户当日剩余调用次数。
- * 使用 Redis INCR + EXPIRE 实现滑动日计数器。
+ * 查询免费用户当日已使用次数（不递增，用于预检）。
+ * Redis 不可用时放行（fail-open）。
+ *
+ * @param {string} userEmail - 归一化后的邮箱
+ * @returns {{ allowed: boolean, used: number, limit: number }}
+ */
+async function peekFreeDailyUsage(userEmail) {
+  try {
+    if (redis.status !== 'ready') {
+      return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
+    }
+    const today = new Date().toISOString().slice(0, 10);
+    const key = `anima:free_daily:${userEmail}:${today}`;
+    const count = parseInt(await redis.get(key) || '0', 10);
+    return { allowed: count < FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT };
+  } catch (err) {
+    logger.warn('Redis daily peek failed, allowing request', { err: err.message });
+    return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
+  }
+}
+
+/**
+ * 递增免费用户当日调用计数器（仅在实际使用时调用）。
+ * 使用 Redis INCR + EXPIRE 实现日计数器。
  * Redis 不可用时放行（fail-open，避免阻塞服务）。
  *
  * @param {string} userEmail - 归一化后的邮箱
  * @returns {{ allowed: boolean, used: number, limit: number }}
  */
-async function checkFreeDailyLimit(userEmail) {
+async function incrFreeDailyUsage(userEmail) {
   try {
     if (redis.status !== 'ready') {
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
     }
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const today = new Date().toISOString().slice(0, 10);
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = await redis.incr(key);
     if (count === 1) {
@@ -125,7 +147,7 @@ async function checkFreeDailyLimit(userEmail) {
     }
     return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT };
   } catch (err) {
-    logger.warn('Redis daily limit check failed, allowing request', { err: err.message });
+    logger.warn('Redis daily limit incr failed, allowing request', { err: err.message });
     return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
   }
 }
@@ -596,16 +618,16 @@ app.post('/billing/check', readLimiter, async (req, res) => {
   }
 
   if (model.is_free) {
-    // 免费模型：检查每日调用次数限制
-    const dailyCheck = await checkFreeDailyLimit(userEmail);
+    // 免费模型：检查每日调用次数限制（不递增，仅预检）
+    const dailyCheck = await peekFreeDailyUsage(userEmail);
     if (!dailyCheck.allowed) {
       return res.status(429).json({
         success: false, can_proceed: false, is_free: true,
-        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
-        daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
+        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used} 次。充值后可无限使用。`,
+        daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
       });
     }
-    return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false, daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit });
+    return res.json({ success: true, can_proceed: true, is_free: true, estimated_fen: 0, balance_fen: null, is_suspended: false, daily_used: dailyCheck.used, daily_limit: dailyCheck.limit });
   }
 
   const inTokens  = Math.max(0, parseInt(estimatedInputTokens  ?? estimatedInputChars  ?? '0', 10) || 0);
@@ -752,11 +774,11 @@ app.post('/billing/record', async (req, res) => {
 
   // ── 2. 免费模型：检查每日限额后记录，不扣费 ─────────────────
   if (isFree) {
-    const dailyCheck = await checkFreeDailyLimit(userEmail);
+    const dailyCheck = await incrFreeDailyUsage(userEmail);
     if (!dailyCheck.allowed) {
       return res.status(429).json({
         success: false, is_free: true,
-        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已用完。充值后可无限使用。`,
+        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
         daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
       });
     }
