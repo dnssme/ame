@@ -169,7 +169,13 @@ Endpoint   = <VPS A 公网IP>:51820
 PersistentKeepalive = 25
 
 [Peer]
-# CXI4 (172.16.1.5) — Webhook + Redis
+# VPS E (172.16.1.6) — Webhook + Redis
+PublicKey  = <VPS E 公钥>
+AllowedIPs = 172.16.1.6/32
+PersistentKeepalive = 25
+
+[Peer]
+# CXI4 (172.16.1.5) — Whisper + TTS + Email + HA
 # 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
 # CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
 PublicKey  = <CXI4 公钥>
@@ -183,7 +189,8 @@ systemctl enable --now wg-quick@wg0
 # 验证内网互通
 wg show wg0
 ping -c 2 172.16.1.1   # VPS A
-ping -c 2 172.16.1.5   # CXI4（Webhook + Redis）
+ping -c 2 172.16.1.5   # CXI4（Whisper/TTS）
+ping -c 2 172.16.1.6   # VPS E（Webhook + Redis）
 ```
 
 ---
@@ -287,7 +294,7 @@ DOMAIN_SERVER=https://ai.example.com
 JWT_SECRET=<64字符随机十六进制>
 JWT_REFRESH_SECRET=<另一个64字符随机十六进制>
 POSTGRES_URI=postgresql://animaapp:<密码>@anima-db.postgres.database.azure.com:5432/librechat?sslmode=require
-REDIS_URI=redis://:<Redis密码>@172.16.1.5:6379
+REDIS_URI=redis://:<Redis密码>@172.16.1.6:6379
 ANTHROPIC_API_KEY=sk-ant-...
 CREDS_KEY=<64字符随机十六进制>
 CREDS_IV=<32字符随机十六进制>
@@ -419,8 +426,8 @@ grep 'sslmode=require' /opt/ai/repo/librechat/.env &>/dev/null \
 
 # PCI-DSS 4.2: Redis 内网（未加密，但限于 WireGuard 隧道内）
 echo -n "[PCI 4.2] Redis 通过 WireGuard 内网: "
-grep 'REDIS_URI=redis://.*172.16.1.5' /opt/ai/repo/librechat/.env &>/dev/null \
-  && echo "✅ 通过（WireGuard 隧道加密）" || echo "⚠️  请确认 Redis 地址为 172.16.1.5"
+grep 'REDIS_URI=redis://.*172.16.1.6' /opt/ai/repo/librechat/.env &>/dev/null \
+  && echo "✅ 通过（WireGuard 隧道加密）" || echo "⚠️  请确认 Redis 地址为 172.16.1.6"
 
 # PCI-DSS 6.3.x: JWT Secret 长度 ≥ 32 字节
 echo -n "[PCI 6.3.3] JWT_SECRET ≥ 64 字符: "
@@ -621,14 +628,14 @@ free -h
 
 ```bash
 # 在 VPS C 测试内网连通性
-ping -c 2 172.16.1.5
+ping -c 2 172.16.1.6
 
 # 从 VPS C 测试 Redis 连接
 REDIS_PASS="<Redis密码>"
-redis-cli -h 172.16.1.5 -a "${REDIS_PASS}" ping
+redis-cli -h 172.16.1.6 -a "${REDIS_PASS}" ping
 # 预期：PONG
 
-# 如果 ping 通但 redis-cli 失败，检查防火墙（在 CXI4 上检查）
+# 如果 ping 通但 redis-cli 失败，检查防火墙（在 VPS E 上检查）
 # ufw status | grep 6379
 ```
 

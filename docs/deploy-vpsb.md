@@ -168,7 +168,13 @@ Endpoint   = <VPS A 公网IP>:51820
 PersistentKeepalive = 25
 
 [Peer]
-# CXI4 (172.16.1.5) — Webhook 计费 + Redis
+# VPS E (172.16.1.6) — Webhook 计费 + Redis
+PublicKey  = <VPS E 公钥>
+AllowedIPs = 172.16.1.6/32
+PersistentKeepalive = 25
+
+[Peer]
+# CXI4 (172.16.1.5) — Whisper + TTS + Email + HA
 # 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
 # CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
 PublicKey  = <CXI4 公钥>
@@ -183,8 +189,9 @@ systemctl enable --now wg-quick@wg0
 wg show wg0
 ping -c 2 172.16.1.1   # VPS A
 ping -c 2 172.16.1.5   # CXI4
+ping -c 2 172.16.1.6   # VPS E
 # 验证 Webhook 服务可达
-curl -sf http://172.16.1.5:3002/health
+curl -sf http://172.16.1.6:3002/health
 # 预期：{"status":"ok","db":"ok","ts":"..."}
 ```
 
@@ -265,13 +272,13 @@ grep -n '<.*>' /opt/ai/repo/openclaw/.env \
 ### 6.3 核查 `config.yml` 配置
 
 ```bash
-# 确认 billing webhookUrl 指向 CXI4
+# 确认 billing webhookUrl 指向 VPS-E
 grep 'webhookUrl' /opt/ai/repo/openclaw/config.yml
-# 预期：webhookUrl: http://172.16.1.5:3002/billing/record
+# 预期：webhookUrl: http://172.16.1.6:3002/billing/record
 
 # 确认 Redis 地址
 grep 'url:' /opt/ai/repo/openclaw/config.yml | grep redis
-# 预期：url: redis://:${REDIS_PASSWORD}@172.16.1.5:6379
+# 预期：url: redis://:${REDIS_PASSWORD}@172.16.1.6:6379
 
 # 确认数据库地址
 grep 'database:' /opt/ai/repo/openclaw/config.yml
@@ -454,7 +461,7 @@ chronyc tracking &>/dev/null && echo "✅ 通过" || echo "❌ 失败"
 
 # PCI-DSS 6.3.x: Billing Webhook URL 配置
 echo -n "[PCI 6.3.x] 计费 Webhook 已配置: "
-grep -q 'webhookUrl.*172.16.1.5:3002' /opt/ai/repo/openclaw/config.yml \
+grep -q 'webhookUrl.*172.16.1.6:3002' /opt/ai/repo/openclaw/config.yml \
   && echo "✅ 通过" || echo "❌ 失败（计费未接入）"
 ```
 
@@ -482,9 +489,9 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://172.16.1.2:3000/health
 ### 10.2 Webhook 计费接口连通性
 
 ```bash
-# 从 VPS B 发起计费请求，验证与 CXI4 的连通性
+# 从 VPS B 发起计费请求，验证与 VPS-E 的连通性
 echo -n "[测试 3] 计费 Webhook 连通性（内网）: "
-BILL_RESULT=$(curl -sf -X POST http://172.16.1.5:3002/billing/record \
+BILL_RESULT=$(curl -sf -X POST http://172.16.1.6:3002/billing/record \
   -H "Content-Type: application/json" \
   -d '{
     "userEmail": "optest@test.com",
@@ -501,9 +508,9 @@ echo "${BILL_RESULT}" | grep -q '"success":true' \
 ### 10.3 Redis 连通性
 
 ```bash
-echo -n "[测试 4] Redis 连通性（从 VPS B 访问 CXI4 Redis）: "
+echo -n "[测试 4] Redis 连通性（从 VPS B 访问 VPS-E Redis）: "
 REDIS_PASS="$(grep '^REDIS_PASSWORD=' /opt/ai/repo/openclaw/.env | cut -d= -f2)"
-redis-cli -h 172.16.1.5 -a "${REDIS_PASS}" ping 2>/dev/null | grep -q 'PONG' \
+redis-cli -h 172.16.1.6 -a "${REDIS_PASS}" ping 2>/dev/null | grep -q 'PONG' \
   && echo "✅ 通过" \
   || echo "❌ 失败（Redis 不可达或密码错误）"
 ```
@@ -601,8 +608,8 @@ docker compose exec openclaw sh -c \
   'node -e "const {Client}=require(\"pg\");const c=new Client({connectionString:process.env.DATABASE_URL});c.connect().then(()=>console.log(\"DB OK\")).catch(e=>console.error(e.message))"' 2>/dev/null || true
 
 # 常见原因 2: Redis 不可达
-ping -c 2 172.16.1.5
-redis-cli -h 172.16.1.5 -a "${REDIS_PASS}" ping
+ping -c 2 172.16.1.6
+redis-cli -h 172.16.1.6 -a "${REDIS_PASS}" ping
 
 # 常见原因 3: 内存不足
 free -h
@@ -613,7 +620,7 @@ docker stats --no-stream
 
 ```bash
 # 在 VPS B 上手动测试计费接口
-curl -X POST http://172.16.1.5:3002/billing/record \
+curl -X POST http://172.16.1.6:3002/billing/record \
   -H "Content-Type: application/json" \
   -d '{"userEmail":"test@test.com","apiProvider":"anthropic","modelName":"claude-haiku-4-5-20251001","inputTokens":100,"outputTokens":50}'
 
