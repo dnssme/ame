@@ -543,7 +543,8 @@ npm install --omit=dev
 
 ```bash
 # 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
-ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
+# 生成 SERVICE_TOKEN
+SERVICE_TOKEN_VAL="$(openssl rand -hex 32)"
 
 cat > /opt/ai/webhook/.env <<EOF
 PG_HOST=anima-db.postgres.database.azure.com
@@ -552,13 +553,23 @@ PG_USER=animaapp
 PG_PASSWORD=<animaapp数据库密码>
 PG_DATABASE=librechat
 PORT=3002
-HOST=172.16.1.6
+HOST=0.0.0.0
+NODE_ENV=production
 LOG_LEVEL=info
 ADMIN_TOKEN=${ADMIN_TOKEN_VAL}
+SERVICE_TOKEN=${SERVICE_TOKEN_VAL}
+REDIS_URL=redis://:<Redis密码>@127.0.0.1:6379
+FREE_DAILY_LIMIT=20
+MAX_SINGLE_REQUEST_FEN=1000
+USD_TO_CNY_RATE=7.2
+TRUST_PROXY=172.16.1.1
+NODE_OPTIONS=--max-old-space-size=256
+TZ=Asia/Shanghai
 EOF
 
 chmod 600 /opt/ai/webhook/.env
-echo "ADMIN_TOKEN: ${ADMIN_TOKEN_VAL}"
+echo "ADMIN_TOKEN:   ${ADMIN_TOKEN_VAL}"
+echo "SERVICE_TOKEN: ${SERVICE_TOKEN_VAL}"
 ```
 
 > ⚠️ **请立即保存 `ADMIN_TOKEN`**，后续模型管理接口需要用到。
