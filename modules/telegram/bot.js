@@ -3,6 +3,12 @@
 /**
  * Anima 灵枢 · Telegram 接入模块
  * 基于 Telegraf 框架，将 Telegram 消息桥接到 OpenClaw Agent API
+ *
+ * 修复记录：
+ *   #FIX-T1  Agent API / Billing HTTP 请求增加超时（bodyTimeout: 60s）
+ *            防止 Agent 挂起导致 Bot 消息处理器无限等待、事件循环积压
+ *   #FIX-T2  callAgent 增加 AbortController 超时兜底（90s 总时限）
+ *            即使 undici 超时未触发，AbortController 确保请求被取消
  */
 
 const http        = require('http');
@@ -10,6 +16,10 @@ const { Telegraf } = require('telegraf');
 const { request }  = require('undici');
 const winston     = require('winston');
 const Redis       = require('ioredis');
+
+// ─── 超时配置常量 ─────────────────────────────────────────────
+const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '60000', 10);
+const BILLING_REQUEST_TIMEOUT_MS = parseInt(process.env.BILLING_REQUEST_TIMEOUT_MS || '10000', 10);
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -31,7 +41,7 @@ const logger = winston.createLogger({
 
 // ─── 配置 ────────────────────────────────────────────────────
 const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
-const AGENT_API_URL = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, ''); // FIX Bug-4: 移除尾部斜杠
+const AGENT_API_URL = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, '');
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const BILLING_URL   = (process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.6:3002').replace(/\/$/, '');
 const REDIS_URL     = process.env.REDIS_URL;
@@ -62,9 +72,7 @@ const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
-/** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
 const REDIS_EMAIL_KEY = 'anima:telegram_emails';
-/** userId → model 选择（通过 Redis 持久化，重启不丢失）*/
 const REDIS_MODELS_KEY = 'anima:user_models';
 
 async function getUserEmail(userId) {
@@ -111,7 +119,7 @@ function getSession(userId) {
     session.lastActive = Date.now();
     return session;
   }
-  // LRU 淘汰：超过上限时删除最久未活跃的会话
+  // LRU 淘汰
   if (sessions.size >= MAX_SESSIONS) {
     let oldest = null;
     let oldestKey = null;
@@ -128,7 +136,7 @@ function getSession(userId) {
   return newSession;
 }
 
-// 定期清理过期会话（防止内存泄漏）
+// 定期清理过期会话
 const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
@@ -140,7 +148,6 @@ const sessionCleanupTimer = setInterval(() => {
 
 // ─── Agent API 调用 ──────────────────────────────────────────
 
-/** 标记长耗时任务类型，可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
 const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -149,6 +156,11 @@ function isLongRunningTask(message) {
   return LONG_RUNNING_KEYWORDS.some(kw => lower.includes(kw));
 }
 
+/**
+ * FIX-T1/T2：调用 Agent API 增加超时控制
+ * - undici bodyTimeout/headersTimeout: 60s（等待响应体/头的超时）
+ * - AbortController 总时限: 90s（双重保险，确保请求最终被取消）
+ */
 async function callAgent(userId, message) {
   const session = getSession(userId);
   session.messages.push({ role: 'user', content: message });
@@ -158,6 +170,10 @@ async function callAgent(userId, message) {
   }
 
   const model = (await getUserModel(userId)) || DEFAULT_MODEL;
+
+  // FIX-T2：AbortController 总时限兜底
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
 
   try {
     const { body } = await request(`${AGENT_API_URL}/chat`, {
@@ -169,18 +185,28 @@ async function callAgent(userId, message) {
         userId: String(userId),
         userEmail: await getUserEmail(userId),
       }),
+      // FIX-T1：设置超时，防止 Agent 挂起导致 Bot 无限等待
+      bodyTimeout: AGENT_REQUEST_TIMEOUT_MS,
+      headersTimeout: AGENT_REQUEST_TIMEOUT_MS,
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     const data = await body.json();
     const reply = data.reply || data.choices?.[0]?.message?.content || '抱歉，我暂时无法回答。';
     session.messages.push({ role: 'assistant', content: reply });
     return reply;
   } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      logger.error('Agent API 请求超时', { userId, timeoutMs: AGENT_REQUEST_TIMEOUT_MS + 30_000 });
+      return '抱歉，AI 响应超时，请稍后重试。';
+    }
     logger.error('Agent API call failed', { err: err.message, userId });
     return '抱歉，AI 服务暂时不可用，请稍后再试。';
   }
 }
 
-// ─── 安全发送消息（FIX Bug-2: 包裹 try-catch，防止 Telegram API 抖动导致进程崩溃）─
+// ─── 安全发送消息 ─────────────────────────────────────────────
 async function safeSend(ctx, text) {
   try {
     if (text.length <= 4096) {
@@ -212,7 +238,6 @@ bot.use((ctx, next) => {
   return next();
 });
 
-// /start 欢迎
 bot.start((ctx) => {
   ctx.reply(
     '🤖 你好！我是 Anima 灵枢 AI 助手。\n\n' +
@@ -226,7 +251,6 @@ bot.start((ctx) => {
   );
 });
 
-// /help 帮助
 bot.help((ctx) => {
   ctx.reply(
     '📖 Anima 灵枢 命令列表：\n\n' +
@@ -238,7 +262,6 @@ bot.help((ctx) => {
   );
 });
 
-// /bind 绑定计费邮箱
 bot.command('bind', async (ctx) => {
   const email = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   if (!email) {
@@ -255,7 +278,6 @@ bot.command('bind', async (ctx) => {
   ctx.reply(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
 });
 
-// /model 切换模型
 bot.command('model', async (ctx) => {
   const model = ctx.message.text.split(' ').slice(1).join(' ').trim();
   if (!model) {
@@ -269,7 +291,6 @@ bot.command('model', async (ctx) => {
   ctx.reply(`✅ 已切换到模型：${model}`);
 });
 
-// /balance 查询余额
 bot.command('balance', async (ctx) => {
   const email = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
   if (!email) return ctx.reply('用法：/balance <邮箱>');
@@ -277,7 +298,11 @@ bot.command('balance', async (ctx) => {
     return ctx.reply('❌ 邮箱格式不正确');
   }
   try {
-    const { body } = await request(`${BILLING_URL}/billing/balance/${encodeURIComponent(email)}`);
+    // FIX-T1：Billing 查询也设置超时
+    const { body } = await request(`${BILLING_URL}/billing/balance/${encodeURIComponent(email)}`, {
+      bodyTimeout: BILLING_REQUEST_TIMEOUT_MS,
+      headersTimeout: BILLING_REQUEST_TIMEOUT_MS,
+    });
     const data = await body.json();
     if (data.success) {
       ctx.reply(`💰 余额：¥${(data.balance_fen / 100).toFixed(2)}`);
@@ -290,13 +315,11 @@ bot.command('balance', async (ctx) => {
   }
 });
 
-// /clear 清除上下文
 bot.command('clear', (ctx) => {
   sessions.delete(ctx.from.id);
   ctx.reply('🗑 对话上下文已清除。');
 });
 
-// 文字消息 → AI 对话
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   if (!text || text.startsWith('/')) return;
@@ -310,7 +333,6 @@ bot.on('text', async (ctx) => {
   const longRunning = isLongRunningTask(text);
 
   if (longRunning) {
-    // FIX Bug-2: 初始提示也包裹 try-catch
     try {
       await ctx.reply('⏳ 任务处理中，完成后会通知你...');
     } catch (err) {
@@ -321,7 +343,6 @@ bot.on('text', async (ctx) => {
       .then(async (reply) => {
         const prefix = '✅ 任务完成：\n\n';
         const fullReply = prefix + reply;
-        // FIX #13 + FIX Bug-2: 使用 safeSend 统一包裹
         await safeSend(ctx, fullReply);
       })
       .catch(async (err) => {
@@ -339,7 +360,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // FIX Bug-2: 普通文本消息回复也通过 safeSend 包裹，防止 API 抖动时崩溃
   const reply = await callAgent(ctx.from.id, text);
   await safeSend(ctx, reply);
 });
