@@ -160,23 +160,43 @@ PrivateKey = <VPS B 私钥>
 Address    = 172.16.1.2/24
 ListenPort = 51820
 
-[Peer]
 # VPS A (172.16.1.1) — Nginx 反向代理，/api/agent 路径流量来源
+[Peer]
 PublicKey  = <VPS A 公钥>
 AllowedIPs = 172.16.1.1/32
 Endpoint   = <VPS A 公网IP>:51820
 PersistentKeepalive = 25
 
+# VPS C (172.16.1.3) — LibreChat
+# 若 LibreChat 直接调用 OpenClaw API（不经过 Nginx），
+# 需要此 Peer 才能建立 VPS C→VPS B 的直连隧道。
 [Peer]
-# VPS E (172.16.1.6) — Webhook 计费 + Redis
-PublicKey  = <VPS E 公钥>
-AllowedIPs = 172.16.1.6/32
+PublicKey  = <VPS C 公钥>
+AllowedIPs = 172.16.1.3/32
+Endpoint   = <VPS C 公网IP>:51820
 PersistentKeepalive = 25
 
+# FIX #3: VPS D (172.16.1.4) — Nextcloud
+# OpenClaw config.yml 中 tools.calendar.url 指向 172.16.1.4:8090；
+# 原文档缺少此 Peer，导致 OpenClaw 日历工具调用 Nextcloud CalDAV 时路由失败。
 [Peer]
+PublicKey  = <VPS D 公钥>
+AllowedIPs = 172.16.1.4/32
+Endpoint   = <VPS D 公网IP>:51820
+PersistentKeepalive = 25
+
+# VPS E (172.16.1.6) — Webhook 计费 + Redis
+# OpenClaw 通过此节点发送计费记录和读取 Redis 会话缓存
+[Peer]
+PublicKey  = <VPS E 公钥>
+AllowedIPs = 172.16.1.6/32
+Endpoint   = <VPS E 公网IP>:51820
+PersistentKeepalive = 25
+
 # CXI4 (172.16.1.5) — Whisper + TTS + Email + HA
 # 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
 # CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
+[Peer]
 PublicKey  = <CXI4 公钥>
 AllowedIPs = 172.16.1.5/32
 PersistentKeepalive = 25
@@ -185,11 +205,12 @@ EOF
 chmod 600 /etc/wireguard/wg0.conf
 systemctl enable --now wg-quick@wg0
 
-# 验证
+# 验证连通性
 wg show wg0
-ping -c 2 172.16.1.1   # VPS A
-ping -c 2 172.16.1.5   # CXI4
-ping -c 2 172.16.1.6   # VPS E
+ping -c 2 172.16.1.1   # VPS A（nginx，来源流量）
+ping -c 2 172.16.1.4   # VPS D（Nextcloud，日历工具）
+ping -c 2 172.16.1.5   # CXI4（Whisper/TTS）
+ping -c 2 172.16.1.6   # VPS E（Webhook + Redis）
 # 验证 Webhook 服务可达
 curl -sf http://172.16.1.6:3002/health
 # 预期：{"status":"ok","db":"ok","ts":"..."}
