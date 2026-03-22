@@ -3,6 +3,11 @@
 /**
  * Anima 灵枢 · 邮件处理模块
  * IMAP 轮询收件 + AI 分析摘要 + SMTP 发件
+ *
+ * 修复记录：
+ *   #FIX-E1  analyzeEmail HTTP 请求增加超时（bodyTimeout/headersTimeout: 30s）
+ *            防止 Agent 挂起导致整个邮件检查周期阻塞
+ *   #FIX-E2  analyzeEmail AbortController 总时限兜底（60s）
  */
 
 const http           = require('http');
@@ -11,6 +16,9 @@ const nodemailer     = require('nodemailer');
 const { simpleParser } = require('mailparser');
 const { request }    = require('undici');
 const winston        = require('winston');
+
+// ─── 超时配置常量 ─────────────────────────────────────────────
+const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '30000', 10);
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -31,7 +39,6 @@ if (missingEnvVars.length > 0) {
 }
 
 // ─── 配置 ────────────────────────────────────────────────────
-// FIX Bug-4: 移除 AGENT_API_URL 尾部斜杠，防止拼接出 //chat 双斜杠
 const AGENT_API_URL = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, '');
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
@@ -72,6 +79,9 @@ function sanitizeEmailField(str) {
 }
 
 // ─── AI 分析 ─────────────────────────────────────────────────
+/**
+ * FIX-E1/E2：增加超时控制，防止 Agent 挂起阻塞邮件处理周期。
+ */
 async function analyzeEmail(subject, from, body) {
   const prompt = [
     '你是一个邮件助手。请对以下邮件进行分析：',
@@ -79,23 +89,37 @@ async function analyzeEmail(subject, from, body) {
     `发件人：${from}`,
     `主题：${subject}`,
     `正文：`,
-    body.substring(0, 3000), // 限制长度
+    body.substring(0, 3000),
     '',
     '请提供：1) 邮件摘要（50字以内）2) 重要程度（高/中/低）3) 建议回复要点',
   ].join('\n');
 
+  // FIX-E2：AbortController 总时限兜底
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
+
   try {
-    const { body: respBody } = await request(`${AGENT_API_URL}/chat`, { // FIX Bug-4: URL 已在配置处去除尾部斜杠
+    const { body: respBody } = await request(`${AGENT_API_URL}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: DEFAULT_MODEL,
         messages: [{ role: 'user', content: prompt }],
       }),
+      // FIX-E1：设置超时，防止 Agent 挂起阻塞邮件检查周期
+      bodyTimeout: AGENT_REQUEST_TIMEOUT_MS,
+      headersTimeout: AGENT_REQUEST_TIMEOUT_MS,
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     const data = await respBody.json();
     return data.reply || data.choices?.[0]?.message?.content || '分析失败';
   } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      logger.error('AI 分析请求超时', { timeoutMs: AGENT_REQUEST_TIMEOUT_MS + 30_000 });
+      return 'AI 分析超时，请稍后重试';
+    }
     logger.error('AI 分析失败', { err: err.message });
     return '分析服务暂不可用';
   }
@@ -106,9 +130,6 @@ let lastCheck = new Date();
 
 async function checkNewEmails() {
   const client = createImapClient();
-  // FIX Bug-11: 记录本轮检查的起始时间，无论是否完成都更新 lastCheck，
-  // 防止每次中断后都重新处理同一批邮件（可能造成重复通知）。
-  // 代价是极端情况下可能漏掉中断时刻前几秒到达的邮件，但对邮件场景可接受。
   const checkStartTime = new Date();
 
   try {
@@ -160,8 +181,6 @@ async function checkNewEmails() {
         logger.info(`共处理 ${count} 封新邮件`);
       }
 
-      // FIX Bug-11: 使用本轮检查开始时间（而非 new Date()）作为下次起点，
-      // 防止循环耗时期间到达的新邮件在下轮被跳过
       lastCheck = checkStartTime;
     } finally {
       lock.release();
@@ -170,17 +189,14 @@ async function checkNewEmails() {
     await client.logout();
   } catch (err) {
     logger.error('邮件检查失败', { err: err.message });
-    // FIX Bug-11: 即使出错也更新 lastCheck 到本轮起始时间，
-    // 配合 ImapFlow 的 since 过滤，避免无限重试同一批出错邮件
     lastCheck = checkStartTime;
-    // 确保 IMAP 连接被清理，防止连接泄漏
     try { await client.logout(); } catch (logoutErr) {
       logger.debug('IMAP logout cleanup failed', { err: logoutErr.message });
     }
   }
 }
 
-// ─── 发送邮件 API ────────────────────────────────────────────
+// ─── 发送邮件 ────────────────────────────────────────────────
 async function sendEmail(to, subject, text) {
   try {
     const info = await transporter.sendMail({
