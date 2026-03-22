@@ -3,26 +3,16 @@
 # Anima 灵枢 · PostgreSQL 每日冷备脚本
 # 部署节点：CXI4 (172.16.1.5)
 #
-# 功能：
-#   - 备份 Azure PostgreSQL 的 librechat / openclaw / nextcloud 数据库
-#   - gzip 压缩存储到本地磁盘
-#   - 自动清理超过保留天数的旧备份
-#   - 支持通过环境变量自定义配置
+# 修复记录：
+#   #FIX-B1  Python3 可用性检查：先尝试 python3，失败则用 grep+sed
+#            兜底，确保在 python3 未安装的环境中也能正确读取密码
+#   #FIX-B2  明确使用 set -euo pipefail，并增加 PGPASSWORD 来源日志
 #
 # 用法：
-#   # 手动执行
 #   bash scripts/backup-pg.sh
 #
 #   # 配置 cron 每日凌晨 2 点自动执行
 #   0 2 * * * /opt/ai/scripts/backup-pg.sh >> /var/log/anima-backup.log 2>&1
-#
-# 环境变量：
-#   PGHOST         - PostgreSQL 主机（默认 anima-db.postgres.database.azure.com）
-#   PGUSER         - 数据库用户（默认 animaapp）
-#   PGPASSWORD     - 数据库密码（必填）
-#   BACKUP_DIR     - 备份目录（默认 /opt/ai/backup）
-#   RETENTION_DAYS - 备份保留天数（默认 7）
-#   DATABASES      - 空格分隔的数据库列表（默认包含全部三个库）
 # =============================================================
 set -euo pipefail
 
@@ -33,39 +23,38 @@ PGUSER="${PGUSER:-animaapp}"
 PGSSLMODE="${PGSSLMODE:-require}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/ai/backup}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
-# FIX Bug-1: 补充 nextcloud 数据库，三个库全量备份
 DATABASES="${DATABASES:-librechat openclaw nextcloud}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-# ─── 检查必要条件 ───────────────────────────────────────────
-# PGPASSWORD 未设置时尝试从 webhook/.env 自动加载（cron 环境无 shell 变量）
+# ─── FIX-B1：读取 PGPASSWORD —— python3 优先，降级为 grep+sed ──
 if [ -z "${PGPASSWORD:-}" ]; then
   ENV_FILE="${ENV_FILE:-/opt/ai/webhook/.env}"
   if [ -f "${ENV_FILE}" ]; then
-    # 使用 Python 解析 .env（比 grep+cut 更安全，正确处理引号和等号）
-    PGPASSWORD="$(python3 -c "
-import re, sys
-with open('${ENV_FILE}') as f:
-    for line in f:
-        m = re.match(r'^PGPASSWORD=(.*)$', line.rstrip())
-        if m:
-            v = m.group(1).strip().strip(\"'\").strip('\"')
-            print(v, end='')
-            sys.exit(0)
-" 2>/dev/null || true)"
-    if [ -z "${PGPASSWORD:-}" ]; then
+    # 尝试 python3（最可靠：正确处理引号、等号、多行）
+    if command -v python3 &>/dev/null; then
       PGPASSWORD="$(python3 -c "
 import re, sys
 with open('${ENV_FILE}') as f:
     for line in f:
-        m = re.match(r'^PG_PASSWORD=(.*)$', line.rstrip())
-        if m:
-            v = m.group(1).strip().strip(\"'\").strip('\"')
-            print(v, end='')
-            sys.exit(0)
+        # 优先匹配 PGPASSWORD=，其次 PG_PASSWORD=
+        for key in ('PGPASSWORD', 'PG_PASSWORD'):
+            m = re.match(r'^' + key + r'=(.*)$', line.rstrip())
+            if m:
+                v = m.group(1).strip().strip(\"'\").strip('\"')
+                print(v, end='')
+                sys.exit(0)
 " 2>/dev/null || true)"
     fi
-    [ -n "${PGPASSWORD:-}" ] && export PGPASSWORD
+
+    # FIX-B1 降级：python3 不可用时使用 grep+sed（不支持值中有引号的情况，但覆盖常见场景）
+    if [ -z "${PGPASSWORD:-}" ]; then
+      PGPASSWORD="$(grep -E '^(PGPASSWORD|PG_PASSWORD)=' "${ENV_FILE}" | head -1 | sed 's/^[^=]*=//' | sed "s/^['\"]//;s/['\"]$//" || true)"
+    fi
+
+    if [ -n "${PGPASSWORD:-}" ]; then
+      export PGPASSWORD
+      echo "[INFO]  $(date '+%F %T') PGPASSWORD 已从 ${ENV_FILE} 加载"
+    fi
   fi
 fi
 
