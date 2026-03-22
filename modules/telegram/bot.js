@@ -294,32 +294,36 @@ bot.on('text', async (ctx) => {
 
   const longRunning = isLongRunningTask(text);
 
-  if (longRunning) {
-    await ctx.reply('⏳ 任务处理中，完成后会通知你...');
-  }
-
-  await ctx.sendChatAction('typing');
-
-  // 长耗时任务在后台执行，完成后主动推送通知
-  if (longRunning) {
-    callAgent(ctx.from.id, text)
-      .then(async (reply) => {
-        const prefix = '✅ 任务完成：\n\n';
-        const fullReply = prefix + reply;
-        if (fullReply.length <= 4096) {
-          await ctx.reply(fullReply);
-        } else {
-          for (let i = 0; i < fullReply.length; i += 4096) {
-            await ctx.reply(fullReply.substring(i, i + 4096));
-          }
+if (longRunning) {
+  await ctx.reply('⏳ 任务处理中，完成后会通知你...');
+  callAgent(ctx.from.id, text)
+    .then(async (reply) => {
+      const prefix = '✅ 任务完成：\n\n';
+      const fullReply = prefix + reply;
+      if (fullReply.length <= 4096) {
+        await ctx.reply(fullReply);
+      } else {
+        for (let i = 0; i < fullReply.length; i += 4096) {
+          await ctx.reply(fullReply.substring(i, i + 4096));
         }
-      })
-      .catch(async (err) => {
-        logger.error('Long-running task failed', { err: err.message, userId: ctx.from.id });
+      }
+    })
+    .catch(async (err) => {
+      logger.error('Long-running task failed', { err: err.message, userId: ctx.from.id });
+      // FIX #13: 将 reply 也包裹 catch，防止 Telegram 网络抖动时
+      // ctx.reply() 抛出异常导致 unhandledRejection 使进程崩溃
+      try {
         await ctx.reply('❌ 任务执行失败，请稍后重试。');
-      });
-    return;
-  }
+      } catch (replyErr) {
+        logger.error('Failed to send error reply to user', {
+          err: replyErr.message,
+          userId: ctx.from.id,
+          originalErr: err.message,
+        });
+      }
+    });
+  return;
+}
 
   const reply = await callAgent(ctx.from.id, text);
 
