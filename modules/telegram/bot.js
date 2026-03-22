@@ -5,10 +5,15 @@
  * 基于 Telegraf 框架，将 Telegram 消息桥接到 OpenClaw Agent API
  *
  * 修复记录：
- *   #FIX-T1  Agent API / Billing HTTP 请求增加超时（bodyTimeout: 60s）
+ *   #FIX-T1  Agent API / Billing HTTP 请求增加超时（bodyTimeout/headersTimeout: 60s）
  *            防止 Agent 挂起导致 Bot 消息处理器无限等待、事件循环积压
  *   #FIX-T2  callAgent 增加 AbortController 超时兜底（90s 总时限）
  *            即使 undici 超时未触发，AbortController 确保请求被取消
+ *   #BUG-4  添加 bot.catch() 全局错误处理器，防止 Telegraf 内部错误
+ *            （如 ctx.reply 因用户封禁 bot 失败）触发 unhandledRejection
+ *            导致整个进程崩溃。
+ *   #BUG-6  /balance 命令中的余额查询添加 AbortController 兜底，
+ *            与 callAgent 保持一致，防止 Billing API 挂起。
  */
 
 const http        = require('http');
@@ -119,7 +124,7 @@ function getSession(userId) {
     session.lastActive = Date.now();
     return session;
   }
-  // LRU 淘汰
+  // LRU 淘汰：找到最久未活跃的会话删除
   if (sessions.size >= MAX_SESSIONS) {
     let oldest = null;
     let oldestKey = null;
@@ -157,9 +162,7 @@ function isLongRunningTask(message) {
 }
 
 /**
- * FIX-T1/T2：调用 Agent API 增加超时控制
- * - undici bodyTimeout/headersTimeout: 60s（等待响应体/头的超时）
- * - AbortController 总时限: 90s（双重保险，确保请求最终被取消）
+ * 调用 Agent API，带双重超时保护。
  */
 async function callAgent(userId, message) {
   const session = getSession(userId);
@@ -171,7 +174,6 @@ async function callAgent(userId, message) {
 
   const model = (await getUserModel(userId)) || DEFAULT_MODEL;
 
-  // FIX-T2：AbortController 总时限兜底
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
 
@@ -185,7 +187,6 @@ async function callAgent(userId, message) {
         userId: String(userId),
         userEmail: await getUserEmail(userId),
       }),
-      // FIX-T1：设置超时，防止 Agent 挂起导致 Bot 无限等待
       bodyTimeout: AGENT_REQUEST_TIMEOUT_MS,
       headersTimeout: AGENT_REQUEST_TIMEOUT_MS,
       signal: controller.signal,
@@ -217,7 +218,7 @@ async function safeSend(ctx, text) {
       }
     }
   } catch (err) {
-    logger.error('ctx.reply 失败（Telegram API 错误）', { err: err.message, userId: ctx.from?.id });
+    logger.error('ctx.reply 失败（Telegram API 错误，可能用户已封禁 bot）', { err: err.message, userId: ctx.from?.id });
   }
 }
 
@@ -229,6 +230,21 @@ function isAllowed(userId) {
 
 // ─── Telegraf Bot ─────────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
+
+// BUG-4 修复：全局错误处理器
+// 捕获所有 Telegraf 中间件和命令处理器中的未捕获错误，
+// 防止它们变成 unhandledRejection 导致进程崩溃。
+// 典型场景：用户封禁 bot 后 ctx.reply() 抛出 TelegramError 403。
+bot.catch((err, ctx) => {
+  logger.error('Telegraf 未捕获错误', {
+    err: err.message,
+    updateType: ctx?.updateType,
+    userId: ctx?.from?.id,
+    chatId: ctx?.chat?.id,
+  });
+  // 尝试通知用户，忽略此处的二次错误（bot 可能已被封禁）
+  ctx?.reply('发生内部错误，请稍后重试。').catch(() => {});
+});
 
 // 中间件：访问控制
 bot.use((ctx, next) => {
@@ -297,12 +313,18 @@ bot.command('balance', async (ctx) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
     return ctx.reply('❌ 邮箱格式不正确');
   }
+
+  // BUG-6 修复：余额查询添加 AbortController 兜底，防止 Billing API 挂起
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), BILLING_REQUEST_TIMEOUT_MS + 5_000);
+
   try {
-    // FIX-T1：Billing 查询也设置超时
     const { body } = await request(`${BILLING_URL}/billing/balance/${encodeURIComponent(email)}`, {
       bodyTimeout: BILLING_REQUEST_TIMEOUT_MS,
       headersTimeout: BILLING_REQUEST_TIMEOUT_MS,
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     const data = await body.json();
     if (data.success) {
       ctx.reply(`💰 余额：¥${(data.balance_fen / 100).toFixed(2)}`);
@@ -310,8 +332,14 @@ bot.command('balance', async (ctx) => {
       ctx.reply(`查询失败：${data.msg}`);
     }
   } catch (err) {
-    logger.error('余额查询失败', { err: err.message, userId: ctx.from.id });
-    ctx.reply('余额查询服务暂不可用。');
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      logger.error('余额查询超时', { userId: ctx.from.id });
+      ctx.reply('余额查询超时，请稍后重试。');
+    } else {
+      logger.error('余额查询失败', { err: err.message, userId: ctx.from.id });
+      ctx.reply('余额查询服务暂不可用。');
+    }
   }
 });
 
