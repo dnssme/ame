@@ -4,7 +4,7 @@
 # 部署节点：CXI4 (172.16.1.5)
 #
 # 功能：
-#   - 备份 Azure PostgreSQL 的 librechat 和 openclaw 数据库
+#   - 备份 Azure PostgreSQL 的 librechat / openclaw / nextcloud 数据库
 #   - gzip 压缩存储到本地磁盘
 #   - 自动清理超过保留天数的旧备份
 #   - 支持通过环境变量自定义配置
@@ -13,15 +13,16 @@
 #   # 手动执行
 #   bash scripts/backup-pg.sh
 #
-#   # 配置 cron 每日凌晨 2 点自动执行（脚本会自动从 /opt/ai/webhook/.env 加载 PGPASSWORD）
+#   # 配置 cron 每日凌晨 2 点自动执行
 #   0 2 * * * /opt/ai/scripts/backup-pg.sh >> /var/log/anima-backup.log 2>&1
 #
 # 环境变量：
-#   PGHOST        - PostgreSQL 主机（默认 anima-db.postgres.database.azure.com）
-#   PGUSER        - 数据库用户（默认 animaapp）
-#   PGPASSWORD    - 数据库密码（必填）
-#   BACKUP_DIR    - 备份目录（默认 /opt/ai/backup）
+#   PGHOST         - PostgreSQL 主机（默认 anima-db.postgres.database.azure.com）
+#   PGUSER         - 数据库用户（默认 animaapp）
+#   PGPASSWORD     - 数据库密码（必填）
+#   BACKUP_DIR     - 备份目录（默认 /opt/ai/backup）
 #   RETENTION_DAYS - 备份保留天数（默认 7）
+#   DATABASES      - 空格分隔的数据库列表（默认包含全部三个库）
 # =============================================================
 set -euo pipefail
 
@@ -32,7 +33,8 @@ PGUSER="${PGUSER:-animaapp}"
 PGSSLMODE="${PGSSLMODE:-require}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/ai/backup}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
-DATABASES="${DATABASES:-librechat openclaw}"
+# FIX Bug-1: 补充 nextcloud 数据库，三个库全量备份
+DATABASES="${DATABASES:-librechat openclaw nextcloud}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # ─── 检查必要条件 ───────────────────────────────────────────
