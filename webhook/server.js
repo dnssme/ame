@@ -1,65 +1,31 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5
+ * Anima 灵枢 · Webhook 服务 v5.3
  * ─────────────────────────────────────────────────────────────
- * 功能：
- *   1. 充值卡激活           POST  /activate
- *   2. API 计费记录         POST  /billing/record
- *   3. 用户余额查询         GET   /billing/balance/:email
- *   4. 用户消费历史         GET   /billing/history/:email
- *   5. 预检余额是否充足      POST  /billing/check
- *   6. 查看可用模型（用户）  GET   /models
- *   7. 健康检查             GET   /health
- *   ── 管理员接口（需 ADMIN_TOKEN）──────────────────────────
- *   8.  查看所有模型         GET   /admin/models
- *   9.  添加/更新模型定价    POST  /admin/models
- *   10. 修改模型定价         PUT   /admin/models/:id
- *   11. 人工调整余额         POST  /admin/adjust
- *
- * 计费规则（v5: 按 Token 计费，对齐上游 API 定价）：
- *   · 每个模型在 api_models 表中独立定价（管理员自由设定），无套餐绑定
- *   · is_free=true 的模型永久免费，不扣余额
- *   · 付费模型按 Token 计费：(inputTokens/1000)*price_in + (outputTokens/1000)*price_out
- *   · 支持缓存感知分层计费：supports_cache 模型对超过阈值的历史上下文 Token 享受 90% 折扣
- *   · 单次请求安全熔断：预估费用超过阈值时拒绝请求（防余额耗尽）
- *   · 支持通过 Tiktoken 库在服务端估算 Token 数（当调用方传入文本时）
- *   · 余额不足时拒绝请求，返回 402
- *   · is_active=false 的模型（如本地 Ollama）保留接口定义，拒绝计费调用
- *
- * 安全：
- *   · helmet 安全响应头
- *   · express-rate-limit 分级限速
- *   · 仅监听内网 172.16.1.6
- *   · 全部 DB 操作参数化查询，防 SQL 注入
- *   · 充值激活使用 FOR UPDATE 行锁，防并发重复激活
- *   · 管理员接口通过 ADMIN_TOKEN 环境变量保护
- */
-/**
- * Anima 灵枢 · Webhook 服务 v5.1
- * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.1）：
- *   #1  移除 /billing/check 的 requireServiceToken（公开只读接口）
- *   #5  Redis Lua 脚本增加 TTL 守护，防止 key 丢失 TTL 导致计数器永不过期
- *   #6  /billing/record 增加独立限速（600次/分，与全局限速分离）
- *   #7  calculateChargedFen 增加 promptTokens+historyTokens 一致性校验
- *   #11 FREE_DAILY_LIMIT / MAX_SINGLE_REQUEST_FEN 改为运行时读取
+ * 修复记录（v5.3 相对于 v5.2）：
+ *   #BUG-1  INCR_EXPIRE_LUA：新建 key 时 TTL=-2，旧逻辑只处理 TTL=-1，
+ *           导致新 key 永远没有过期时间。修复：INCR 后若 new_c==1，
+ *           表明是新创建的 key，立即执行 EXPIRE。
+ *           同时将 early-return 分支也纳入 TTL 守护，彻底消除漏网场景。
+ *   #BUG-7  与 BUG-1 配合：确保 early-return 路径不会绕过 TTL 守护。
+ *   #BUG-8  /billing/record 同时警告旧版 outputChars 字段使用。
+ *   #BUG-9  /billing/check 使用独立限速器（120次/分），避免正常 AI 对话
+ *           预检被 readLimiter 的 20次/分 误限。
  */
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.2
- * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.2 相对于 v5.1）：
- *   #FIX-A  全局限速器增加 skip 条件，跳过 /billing/record（内部服务路由），
- *           使 billingRecordLimiter(600次/分) 真正独立生效
- *   #FIX-B  INCR_EXPIRE_LUA 脚本：early-return 分支也执行 TTL 守护，
- *           防止 PERSIST 或故障恢复后计数器永不过期
- *   #FIX-C  calculateChargedFen：inputTokens=0 但 partitionSum>0 时
- *           发出警告并回退到标准计费，而非静默使用错误数据
- *   #FIX-D  免费模型计费：DB 插入失败时尝试 Redis 回滚（DECR），
- *           减少计数器与使用记录不一致的窗口
- *   #FIX-E  PUT /admin/models/:id：先查询当前模型 is_free 状态，
- *           再决定是否允许修改价格字段，而非依赖请求体的 isFree 字段
+ * 之前修复记录（v5.0 → v5.2）保留供溯源：
+ *   v5.1 #1  移除 /billing/check 的 requireServiceToken（公开只读接口）
+ *   v5.1 #5  Redis Lua 脚本增加 TTL 守护（FIX-B）
+ *   v5.1 #6  /billing/record 增加独立限速（600次/分）
+ *   v5.1 #7  calculateChargedFen 增加 promptTokens+historyTokens 一致性校验
+ *   v5.1 #11 FREE_DAILY_LIMIT / MAX_SINGLE_REQUEST_FEN 改为运行时读取
+ *   v5.2 FIX-A  全局限速跳过 /billing/record
+ *   v5.2 FIX-B  INCR_EXPIRE_LUA early-return 分支也执行 TTL 守护
+ *   v5.2 FIX-C  calculateChargedFen inputTokens=0 但 partitionSum>0 时回退
+ *   v5.2 FIX-D  免费模型 DB 插入失败时尝试 Redis DECR 回滚
+ *   v5.2 FIX-E  PUT /admin/models/:id 先查 DB is_free 再验证价格字段
  */
 
 const crypto    = require('crypto');
@@ -118,24 +84,38 @@ const redis = new Redis(REDIS_URL, {
 redis.connect().catch((err) => logger.warn('Redis connect error (free daily limits disabled)', { err: err.message }));
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
-// ─── FIX-B：INCR_EXPIRE_LUA — early-return 分支也执行 TTL 守护 ──
-// 原版 early-return 在 c > ARGV[1] 时直接返回，跳过 TTL 检查。
-// 修复：在所有返回路径前统一检查 TTL，防止 PERSIST 或故障恢复
-// 导致超限计数器永不过期、用户被永久封禁免费额度。
+// ─────────────────────────────────────────────────────────────
+// BUG-1 修复：完整的 INCR+EXPIRE Lua 脚本
+// ─────────────────────────────────────────────────────────────
+// 问题：原脚本 TTL 守护只检查 ttl==-1（key 存在但无 TTL）。
+// 当 key 不存在时 TTL==-2，守护不生效，INCR 创建的新 key 没有过期时间，
+// 导致计数器永不过期，用户首次使用免费模型后该 key 会永久存在。
+//
+// 修复方案：
+//   1. 先执行 TTL 守护（修复 ttl==-1 的已有 key）
+//   2. early-return 分支（超限）直接返回前也通过步骤1保证 TTL
+//   3. INCR 后检查 new_c==1：若为1表明是新创建的 key，立即设置 TTL
+//
+// 保证所有路径下的 key 都有 TTL，彻底消除计数器永不过期问题。
+// ─────────────────────────────────────────────────────────────
 const INCR_EXPIRE_LUA =
   'local key = KEYS[1]\n' +
   'local limit = tonumber(ARGV[1])\n' +
-  // TTL 守护：无论走哪条分支，先修复 TTL=-1 的情况
+  // 步骤1：TTL 守护 —— 修复已有 key 丢失 TTL 的情况（如 PERSIST 命令或故障恢复）
+  // 注：ttl==-2 表示 key 不存在，此时 EXPIRE 无效但 INCR 后新 key 由步骤3处理
   'local ttl = redis.call("TTL", key)\n' +
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
-  // 读当前值
+  // 步骤2：读当前值（GET 对不存在的 key 返回 nil，or "0" 保证 tonumber 成功）
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
-  // 已超限：直接返回当前值，不再递增（防止计数器无限增长）
+  // 步骤2a：已超限 —— 不递增，直接返回当前值，防止计数器无限增长
   'if c > limit then return c end\n' +
-  // 递增并返回新值
-  'return redis.call("INCR", key)';
+  // 步骤3：递增
+  'local new_c = redis.call("INCR", key)\n' +
+  // 步骤3a：BUG-1 核心修复 —— new_c==1 表明 key 是刚被 INCR 新创建的，立即设置 TTL
+  'if new_c == 1 then redis.call("EXPIRE", key, 86400) end\n' +
+  'return new_c';
 
-// ─── 运行时读取配置（FIX #11：热更新无需重启）────────────────────
+// ─── 运行时读取配置（热更新无需重启）──────────────────────────
 function getFreeDailyLimit() {
   const v = parseInt(process.env.FREE_DAILY_LIMIT || '20', 10);
   if (!Number.isFinite(v) || v <= 0) {
@@ -231,20 +211,20 @@ app.use((_req, res, next) => {
   next();
 });
 
-// ─── FIX-A：全局限速器跳过内部服务路由 ──────────────────────
-// /billing/record 由 OpenClaw 内部调用，有独立限速器保护，
-// 且 SERVICE_TOKEN 鉴权已提供安全保障。
-// 跳过全局 60次/分 限制，使其不与其他用户请求共享配额。
+// ─── 限速器 ──────────────────────────────────────────────────
+
+// 全局通用限速：60次/分（跳过内部服务路由 /billing/record）
 app.use(rateLimit({
   windowMs: 60_000,
   max:      60,
   standardHeaders: true,
   legacyHeaders:   false,
   message: { success: false, msg: '请求过于频繁，请稍后再试' },
-  skip: (req) => req.path === '/billing/record',  // FIX-A
+  // /billing/record 由 OpenClaw 内部调用，有独立限速器 + SERVICE_TOKEN 保护
+  skip: (req) => req.path === '/billing/record',
 }));
 
-// 激活接口限速：5 次/10 分
+// 激活接口限速：5 次/10 分（防暴力枚举卡密）
 const activateLimiter = rateLimit({
   windowMs: 10 * 60_000,
   max:      5,
@@ -253,7 +233,7 @@ const activateLimiter = rateLimit({
   message: { success: false, msg: '激活尝试过于频繁，请 10 分钟后再试' },
 });
 
-// 只读查询限速：20 次/分
+// 只读查询限速：20 次/分（余额查询、消费历史等低频接口）
 const readLimiter = rateLimit({
   windowMs: 60_000,
   max:      20,
@@ -262,8 +242,19 @@ const readLimiter = rateLimit({
   message: { success: false, msg: '查询过于频繁，请稍后再试' },
 });
 
+// BUG-9 修复：/billing/check 使用独立限速器
+// 原因：/billing/check 是每次 AI 对话前的预检，正常使用场景下
+// 每分钟可能调用数十次（用户连续对话），readLimiter 的 20次/分
+// 会误限合法用户。设为 120次/分（2次/秒），足够应对正常对话。
+const billingCheckLimiter = rateLimit({
+  windowMs: 60_000,
+  max:      120,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { success: false, msg: '预检请求过于频繁，请稍后再试' },
+});
+
 // /billing/record 独立限速：600 次/分（内部服务 ~10次/秒）
-// FIX-A 配合全局 skip，使此限速器真正独立生效
 const billingRecordLimiter = rateLimit({
   windowMs: 60_000,
   max:      600,
@@ -366,11 +357,6 @@ const CACHE_DISCOUNT = 0.1;
 
 /**
  * 计算本次请求的费用（分），支持缓存感知分层定价。
- *
- * FIX-C（原 FIX #7 增强）：
- *   - 当 inputTokens=0 但 partitionSum>0 时：记录警告并回退标准计费
- *   - 当 partitionSum 与 inputTokens 偏差超过 1%：同样回退
- *   两种情况都不再静默地使用错误数据进行缓存分层计算。
  */
 function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, currency, supportsCache, promptTokens, historyTokens }) {
   const fxRate = (currency === 'USD') ? getUsdToCnyRate() : 1;
@@ -383,14 +369,12 @@ function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, cur
   if (supportsCache && hasPartition && historyTokens > CACHE_THRESHOLD_TOKENS) {
     const partitionSum = promptTokens + historyTokens;
 
-    // FIX-C：处理 inputTokens=0 但分区字段有值的情况
     if (inputTokens === 0 && partitionSum > 0) {
       logger.warn('calculateChargedFen: inputTokens=0 但 partitionSum>0，数据不一致，回退到标准计费', {
         inputTokens, promptTokens, historyTokens, partitionSum,
       });
-      inputCostYuan = 0; // inputTokens=0，输入无费用
+      inputCostYuan = 0;
     } else {
-      // 偏差校验（原 FIX #7）
       const deviation = inputTokens > 0 ? Math.abs(partitionSum - inputTokens) / inputTokens : 0;
       if (deviation > 0.01) {
         logger.warn('calculateChargedFen: promptTokens+historyTokens 与 inputTokens 偏差超过 1%，回退到标准计费', {
@@ -399,7 +383,6 @@ function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, cur
         });
         inputCostYuan = (inputTokens / 1000) * cnyPriceIn;
       } else {
-        // 缓存感知分层计费：超过阈值的历史上下文 Token 享受 CACHE_DISCOUNT 折扣
         const fullPriceTokens  = promptTokens + CACHE_THRESHOLD_TOKENS;
         const discountedTokens = historyTokens - CACHE_THRESHOLD_TOKENS;
         inputCostYuan = (fullPriceTokens  / 1000) * cnyPriceIn
@@ -585,9 +568,10 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
 });
 
 /**
- * POST /billing/check — 公开只读预检接口，无需服务鉴权（FIX #1）
+ * POST /billing/check — 公开只读预检接口，无需服务鉴权
+ * BUG-9 修复：使用独立的 billingCheckLimiter（120次/分）
  */
-app.post('/billing/check', readLimiter, async (req, res) => {
+app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
           estimatedInputChars, estimatedOutputChars,
           estimatedPromptTokens, estimatedHistoryTokens } = req.body ?? {};
@@ -683,10 +667,7 @@ app.post('/billing/check', readLimiter, async (req, res) => {
 });
 
 /**
- * POST /billing/record — 内部服务专用，需要 SERVICE_TOKEN
- *
- * FIX-D：免费模型计费路径中，DB 插入失败时回滚 Redis 计数器，
- * 减少"Redis 已增、DB 未写"的不一致窗口。
+ * POST /billing/record — 内部服务专用，需要 SERVICE_TOKEN（x-service-token 请求头）
  */
 app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (req, res) => {
   let { userEmail, apiProvider, modelName,
@@ -697,8 +678,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const inputTokens  = rawInputTokens  ?? inputChars  ?? 0;
   const outputTokens = rawOutputTokens ?? outputChars ?? 0;
 
+  // BUG-8 修复：同时警告 inputChars 和 outputChars 旧版字段
   if (rawInputTokens == null && inputChars != null) {
     logger.warn('billing/record: 调用方使用旧版 inputChars 字段，请迁移到 inputTokens', { userEmail, modelName });
+  }
+  if (rawOutputTokens == null && outputChars != null) {
+    logger.warn('billing/record: 调用方使用旧版 outputChars 字段，请迁移到 outputTokens', { userEmail, modelName });
   }
 
   if (!userEmail || !apiProvider || !modelName) {
@@ -750,10 +735,8 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
   if (isFree) {
-    // FIX-D：先递增 Redis 计数器，记录 key 用于失败时回滚
     const dailyCheck = await incrFreeDailyUsage(userEmail);
     if (!dailyCheck.allowed) {
-      // 超限：Redis 已递增到 limit+1，但下次读时 early-return 不再递增
       return res.status(429).json({
         success: false, is_free: true,
         msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
@@ -769,7 +752,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens]
       );
     } catch (err) {
-      // FIX-D：DB 插入失败，尝试回滚 Redis 计数器
       logger.error('Free usage DB insert failed, attempting Redis counter rollback', { err: err.message });
       await tryDecrFreeDailyUsage(dailyCheck.key);
       return res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -953,21 +935,12 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   }
 });
 
-/**
- * PUT /admin/models/:id
- *
- * FIX-E：先查询数据库中模型的当前 is_free 状态，
- * 而非信任请求体中的 isFree 字段来决定是否允许修改价格。
- * 防止：请求不传 isFree（undefined）时 !undefined=true 绕过约束
- * 对免费模型错误写入非零价格。
- */
 app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({ success: false, msg: '模型 ID 无效' });
   }
 
-  // FIX-E：先查当前模型状态
   let currentModel;
   try {
     const cur = await db.query('SELECT is_free FROM api_models WHERE id=$1', [id]);
@@ -984,15 +957,12 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   const updates = [];
   const values  = [];
 
-  // 确定本次请求后模型将是什么 is_free 状态
-  // 如果请求中指定了 isFree，以请求为准；否则以数据库当前状态为准
   const effectiveIsFree = (typeof isFree === 'boolean') ? isFree : currentModel.is_free;
 
   if (typeof isFree === 'boolean') {
     updates.push(`is_free = $${values.length + 1}`);
     values.push(isFree);
     if (isFree) {
-      // 切换为免费时，强制清零价格
       updates.push(`price_input_per_1k_tokens = $${values.length + 1}`);
       values.push(0);
       updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
@@ -1000,7 +970,6 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     }
   }
 
-  // FIX-E：仅当模型（本次更新后）为付费模式时才允许修改价格
   if (!effectiveIsFree && typeof priceInput === 'number') {
     if (!Number.isFinite(priceInput) || priceInput < 0) {
       return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
