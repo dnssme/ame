@@ -8,6 +8,10 @@
  *   #FIX-E1  analyzeEmail HTTP 请求增加超时（bodyTimeout/headersTimeout: 30s）
  *            防止 Agent 挂起导致整个邮件检查周期阻塞
  *   #FIX-E2  analyzeEmail AbortController 总时限兜底（60s）
+ *   #BUG-3   checkNewEmails() catch 块中错误地将 lastCheck 推进到
+ *            checkStartTime，导致 IMAP 失败时 T1~T2 期间的邮件永久丢失。
+ *            修复：失败时不更新 lastCheck，保留上次成功时间，
+ *            下次运行重试时仍从正确时间点开始。
  */
 
 const http           = require('http');
@@ -79,9 +83,6 @@ function sanitizeEmailField(str) {
 }
 
 // ─── AI 分析 ─────────────────────────────────────────────────
-/**
- * FIX-E1/E2：增加超时控制，防止 Agent 挂起阻塞邮件处理周期。
- */
 async function analyzeEmail(subject, from, body) {
   const prompt = [
     '你是一个邮件助手。请对以下邮件进行分析：',
@@ -94,7 +95,6 @@ async function analyzeEmail(subject, from, body) {
     '请提供：1) 邮件摘要（50字以内）2) 重要程度（高/中/低）3) 建议回复要点',
   ].join('\n');
 
-  // FIX-E2：AbortController 总时限兜底
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
 
@@ -106,7 +106,6 @@ async function analyzeEmail(subject, from, body) {
         model: DEFAULT_MODEL,
         messages: [{ role: 'user', content: prompt }],
       }),
-      // FIX-E1：设置超时，防止 Agent 挂起阻塞邮件检查周期
       bodyTimeout: AGENT_REQUEST_TIMEOUT_MS,
       headersTimeout: AGENT_REQUEST_TIMEOUT_MS,
       signal: controller.signal,
@@ -181,6 +180,7 @@ async function checkNewEmails() {
         logger.info(`共处理 ${count} 封新邮件`);
       }
 
+      // 成功完成后才更新 lastCheck，以本次检查开始时间为准
       lastCheck = checkStartTime;
     } finally {
       lock.release();
@@ -189,7 +189,10 @@ async function checkNewEmails() {
     await client.logout();
   } catch (err) {
     logger.error('邮件检查失败', { err: err.message });
-    lastCheck = checkStartTime;
+    // BUG-3 修复：失败时不更新 lastCheck
+    // 原代码在此处执行 lastCheck = checkStartTime，将 lastCheck 推进到本次
+    // 失败检查的开始时间，导致上次成功到本次失败之间的邮件（T1~T2）永久丢失。
+    // 修复：保持 lastCheck 不变，下次运行仍从上次成功时间重试，不遗漏邮件。
     try { await client.logout(); } catch (logoutErr) {
       logger.debug('IMAP logout cleanup failed', { err: logoutErr.message });
     }
