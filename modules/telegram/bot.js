@@ -31,9 +31,9 @@ const logger = winston.createLogger({
 
 // ─── 配置 ────────────────────────────────────────────────────
 const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
+const AGENT_API_URL = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, ''); // FIX Bug-4: 移除尾部斜杠
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
-const BILLING_URL   = process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.6:3002';
+const BILLING_URL   = (process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.6:3002').replace(/\/$/, '');
 const REDIS_URL     = process.env.REDIS_URL;
 const ALLOWED_IDS   = (process.env.ALLOWED_USER_IDS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -140,7 +140,7 @@ const sessionCleanupTimer = setInterval(() => {
 
 // ─── Agent API 调用 ──────────────────────────────────────────
 
-/** 标记长耗时任务类型（web-search / file-analysis），可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
+/** 标记长耗时任务类型，可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
 const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -177,6 +177,21 @@ async function callAgent(userId, message) {
   } catch (err) {
     logger.error('Agent API call failed', { err: err.message, userId });
     return '抱歉，AI 服务暂时不可用，请稍后再试。';
+  }
+}
+
+// ─── 安全发送消息（FIX Bug-2: 包裹 try-catch，防止 Telegram API 抖动导致进程崩溃）─
+async function safeSend(ctx, text) {
+  try {
+    if (text.length <= 4096) {
+      await ctx.reply(text);
+    } else {
+      for (let i = 0; i < text.length; i += 4096) {
+        await ctx.reply(text.substring(i, i + 4096));
+      }
+    }
+  } catch (err) {
+    logger.error('ctx.reply 失败（Telegram API 错误）', { err: err.message, userId: ctx.from?.id });
   }
 }
 
@@ -294,47 +309,39 @@ bot.on('text', async (ctx) => {
 
   const longRunning = isLongRunningTask(text);
 
-if (longRunning) {
-  await ctx.reply('⏳ 任务处理中，完成后会通知你...');
-  callAgent(ctx.from.id, text)
-    .then(async (reply) => {
-      const prefix = '✅ 任务完成：\n\n';
-      const fullReply = prefix + reply;
-      if (fullReply.length <= 4096) {
-        await ctx.reply(fullReply);
-      } else {
-        for (let i = 0; i < fullReply.length; i += 4096) {
-          await ctx.reply(fullReply.substring(i, i + 4096));
-        }
-      }
-    })
-    .catch(async (err) => {
-      logger.error('Long-running task failed', { err: err.message, userId: ctx.from.id });
-      // FIX #13: 将 reply 也包裹 catch，防止 Telegram 网络抖动时
-      // ctx.reply() 抛出异常导致 unhandledRejection 使进程崩溃
-      try {
-        await ctx.reply('❌ 任务执行失败，请稍后重试。');
-      } catch (replyErr) {
-        logger.error('Failed to send error reply to user', {
-          err: replyErr.message,
-          userId: ctx.from.id,
-          originalErr: err.message,
-        });
-      }
-    });
-  return;
-}
-
-  const reply = await callAgent(ctx.from.id, text);
-
-  // Telegram 消息限制 4096 字符，超长分段发送
-  if (reply.length <= 4096) {
-    await ctx.reply(reply);
-  } else {
-    for (let i = 0; i < reply.length; i += 4096) {
-      await ctx.reply(reply.substring(i, i + 4096));
+  if (longRunning) {
+    // FIX Bug-2: 初始提示也包裹 try-catch
+    try {
+      await ctx.reply('⏳ 任务处理中，完成后会通知你...');
+    } catch (err) {
+      logger.error('发送等待提示失败', { err: err.message, userId: ctx.from.id });
     }
+
+    callAgent(ctx.from.id, text)
+      .then(async (reply) => {
+        const prefix = '✅ 任务完成：\n\n';
+        const fullReply = prefix + reply;
+        // FIX #13 + FIX Bug-2: 使用 safeSend 统一包裹
+        await safeSend(ctx, fullReply);
+      })
+      .catch(async (err) => {
+        logger.error('Long-running task failed', { err: err.message, userId: ctx.from.id });
+        try {
+          await ctx.reply('❌ 任务执行失败，请稍后重试。');
+        } catch (replyErr) {
+          logger.error('Failed to send error reply to user', {
+            err: replyErr.message,
+            userId: ctx.from.id,
+            originalErr: err.message,
+          });
+        }
+      });
+    return;
   }
+
+  // FIX Bug-2: 普通文本消息回复也通过 safeSend 包裹，防止 API 抖动时崩溃
+  const reply = await callAgent(ctx.from.id, text);
+  await safeSend(ctx, reply);
 });
 
 // ─── 健康检查 ────────────────────────────────────────────────
