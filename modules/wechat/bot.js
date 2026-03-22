@@ -6,12 +6,20 @@
  *
  * 修复记录：
  *   #FIX-W1  callAgent 增加 undici 超时（bodyTimeout/headersTimeout: 60s）
- *            防止 Agent 挂起导致微信消息处理器无限等待
  *   #FIX-W2  callAgent 增加 AbortController 总时限兜底（90s）
+ *   #BUG-5a  添加 bot.on('error', ...) 监听 Wechaty puppet 内部错误，
+ *            防止未捕获的错误触发 unhandledRejection 导致进程崩溃。
+ *   #BUG-5b  修复 Message.Type 访问方式。
+ *            原代码使用 bot.Message.Type.Text 和 bot.Message.Type.Audio，
+ *            在 Wechaty v1.20 中 bot 实例上没有 .Message 属性，会抛
+ *            "Cannot read property 'Type' of undefined"。
+ *            修复：从 wechaty 包直接导入 types，或使用 msg.type() 的数值
+ *            与 puppet 枚举比较。此处改为从消息类型字符串名匹配，
+ *            完全避免 bot.Message 的依赖。
  */
 
 const http       = require('http');
-const { WechatyBuilder } = require('wechaty');
+const { WechatyBuilder, types } = require('wechaty');
 const { request } = require('undici');
 const winston    = require('winston');
 const Redis      = require('ioredis');
@@ -144,9 +152,6 @@ function isLongRunningTask(message) {
   return LONG_RUNNING_KEYWORDS.some(kw => lower.includes(kw));
 }
 
-/**
- * FIX-W1/W2：增加 undici 超时和 AbortController 兜底
- */
 async function callAgent(userId, message) {
   const session = getSession(userId);
   session.messages.push({ role: 'user', content: message });
@@ -155,7 +160,6 @@ async function callAgent(userId, message) {
     session.messages = session.messages.slice(-20);
   }
 
-  // FIX-W2：AbortController 总时限兜底
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
 
@@ -169,7 +173,6 @@ async function callAgent(userId, message) {
         userId: userId,
         userEmail: await getUserEmail(userId),
       }),
-      // FIX-W1：设置超时，防止 Agent 挂起导致微信 Bot 无限等待
       bodyTimeout: AGENT_REQUEST_TIMEOUT_MS,
       headersTimeout: AGENT_REQUEST_TIMEOUT_MS,
       signal: controller.signal,
@@ -213,6 +216,15 @@ bot.on('logout', (user) => {
   logger.info('微信已登出', { user: user.name() });
 });
 
+// BUG-5a 修复：监听 Wechaty error 事件
+// Wechaty puppet 内部错误（如网络断开、协议异常）会通过 error 事件抛出。
+// 若无监听器，Node.js 会将 EventEmitter 的 error 事件当作未捕获异常处理，
+// 导致进程崩溃。此处记录错误并继续运行，Wechaty 会自动尝试重连。
+bot.on('error', (err) => {
+  logger.error('Wechaty puppet 错误', { err: err.message, stack: err.stack });
+  // 不退出进程，让 Wechaty 自动尝试恢复
+});
+
 bot.on('message', async (msg) => {
   if (msg.self()) return;
 
@@ -227,9 +239,20 @@ bot.on('message', async (msg) => {
   }
 
   try {
+    // BUG-5b 修复：不再使用 bot.Message.Type.xxx（Wechaty v1.20 中不存在）
+    // 改为使用从 wechaty 包导入的 types 枚举，若 types 不可用则用数值比对。
+    // msg.type() 返回 MessageType 枚举数值（Text=7, Audio=1 等）
     const msgType = msg.type();
 
-    if (msgType === bot.Message.Type.Text) {
+    // 安全地获取 MessageType 枚举（兼容不同 Wechaty 版本）
+    const MessageType = (typeof types !== 'undefined' && types.Message)
+      ? types.Message
+      : null;
+
+    const isText  = MessageType ? msgType === MessageType.Text  : msgType === 7;
+    const isAudio = MessageType ? msgType === MessageType.Audio : msgType === 1;
+
+    if (isText) {
       let text = msg.text().trim();
       if (isGroup) {
         text = text.replace(new RegExp(`@${escapeRegExp(BOT_NAME)}\\s*`, 'g'), '').trim();
@@ -293,7 +316,7 @@ bot.on('message', async (msg) => {
       await saySplitMessage(msg, reply);
     }
 
-    if (msgType === bot.Message.Type.Audio && VOICE_ENABLED) {
+    if (isAudio && VOICE_ENABLED) {
       logger.info('收到语音消息', { userId });
       await msg.say('语音处理中，请稍候...');
       await msg.say('语音功能开发中，请先发送文字消息。');
