@@ -161,23 +161,45 @@ PrivateKey = <VPS C 私钥>
 Address    = 172.16.1.3/24
 ListenPort = 51820
 
-[Peer]
 # VPS A (172.16.1.1) — Nginx 反向代理，下行流量的来源
+[Peer]
 PublicKey  = <VPS A 公钥>
 AllowedIPs = 172.16.1.1/32
 Endpoint   = <VPS A 公网IP>:51820
 PersistentKeepalive = 25
 
+# FIX #4: VPS B (172.16.1.2) — OpenClaw Agent
+# LibreChat 可能直接调用 OpenClaw API（如 http://172.16.1.2:3000/api/chat）
+# 作为其 AI 后端。原文档缺少此 Peer，若 LibreChat→OpenClaw 存在直连调用，
+# 会导致连接超时。即使当前所有流量经 Nginx 中转，添加此 Peer 确保
+# 未来直连模式下也能正常工作，成本极低。
 [Peer]
-# VPS E (172.16.1.6) — Webhook + Redis
-PublicKey  = <VPS E 公钥>
-AllowedIPs = 172.16.1.6/32
+PublicKey  = <VPS B 公钥>
+AllowedIPs = 172.16.1.2/32
+Endpoint   = <VPS B 公网IP>:51820
 PersistentKeepalive = 25
 
+# FIX #4: VPS D (172.16.1.4) — Nextcloud（日历 CalDAV / 网盘 WebDAV）
+# 若 LibreChat 集成了日历或文件功能，需要直接访问 Nextcloud。
+# 添加此 Peer 为未来集成预留路由能力。
 [Peer]
+PublicKey  = <VPS D 公钥>
+AllowedIPs = 172.16.1.4/32
+Endpoint   = <VPS D 公网IP>:51820
+PersistentKeepalive = 25
+
+# VPS E (172.16.1.6) — Webhook 计费 + Redis
+# LibreChat 使用 Redis 作为会话缓存（REDIS_URI=redis://172.16.1.6:6379）
+[Peer]
+PublicKey  = <VPS E 公钥>
+AllowedIPs = 172.16.1.6/32
+Endpoint   = <VPS E 公网IP>:51820
+PersistentKeepalive = 25
+
 # CXI4 (172.16.1.5) — Whisper + TTS + Email + HA
 # 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
 # CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
+[Peer]
 PublicKey  = <CXI4 公钥>
 AllowedIPs = 172.16.1.5/32
 PersistentKeepalive = 25
@@ -186,11 +208,15 @@ EOF
 chmod 600 /etc/wireguard/wg0.conf
 systemctl enable --now wg-quick@wg0
 
-# 验证内网互通
+# 验证内网互通（全部节点须可达）
 wg show wg0
-ping -c 2 172.16.1.1   # VPS A
+ping -c 2 172.16.1.1   # VPS A（nginx，来源流量）
+ping -c 2 172.16.1.2   # VPS B（OpenClaw）
+ping -c 2 172.16.1.4   # VPS D（Nextcloud）
 ping -c 2 172.16.1.5   # CXI4（Whisper/TTS）
-ping -c 2 172.16.1.6   # VPS E（Webhook + Redis）
+ping -c 2 172.16.1.6   # VPS E（Redis）
+# 验证 Redis 连通性（LibreChat 依赖）
+redis-cli -h 172.16.1.6 -a "<Redis密码>" ping   # 预期：PONG
 ```
 
 ---
