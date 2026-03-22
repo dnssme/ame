@@ -31,7 +31,8 @@ if (missingEnvVars.length > 0) {
 }
 
 // ─── 配置 ────────────────────────────────────────────────────
-const AGENT_API_URL = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
+// FIX Bug-4: 移除 AGENT_API_URL 尾部斜杠，防止拼接出 //chat 双斜杠
+const AGENT_API_URL = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, '');
 const DEFAULT_MODEL = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER;
@@ -84,7 +85,7 @@ async function analyzeEmail(subject, from, body) {
   ].join('\n');
 
   try {
-    const { body: respBody } = await request(`${AGENT_API_URL}/chat`, {
+    const { body: respBody } = await request(`${AGENT_API_URL}/chat`, { // FIX Bug-4: URL 已在配置处去除尾部斜杠
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -105,12 +106,16 @@ let lastCheck = new Date();
 
 async function checkNewEmails() {
   const client = createImapClient();
+  // FIX Bug-11: 记录本轮检查的起始时间，无论是否完成都更新 lastCheck，
+  // 防止每次中断后都重新处理同一批邮件（可能造成重复通知）。
+  // 代价是极端情况下可能漏掉中断时刻前几秒到达的邮件，但对邮件场景可接受。
+  const checkStartTime = new Date();
+
   try {
     await client.connect();
 
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // 搜索上次检查后的新邮件
       const messages = client.fetch(
         { since: lastCheck },
         { source: true, envelope: true }
@@ -125,11 +130,9 @@ async function checkNewEmails() {
 
         logger.info('新邮件', { subject, from });
 
-        // AI 分析
         const analysis = await analyzeEmail(subject, from, textBody);
         logger.info('邮件分析完成', { subject, analysis: analysis.substring(0, 200) });
 
-        // 将分析结果发送到通知邮箱
         if (NOTIFY_EMAIL) {
           await sendEmail(
             NOTIFY_EMAIL,
@@ -157,7 +160,9 @@ async function checkNewEmails() {
         logger.info(`共处理 ${count} 封新邮件`);
       }
 
-      lastCheck = new Date();
+      // FIX Bug-11: 使用本轮检查开始时间（而非 new Date()）作为下次起点，
+      // 防止循环耗时期间到达的新邮件在下轮被跳过
+      lastCheck = checkStartTime;
     } finally {
       lock.release();
     }
@@ -165,8 +170,13 @@ async function checkNewEmails() {
     await client.logout();
   } catch (err) {
     logger.error('邮件检查失败', { err: err.message });
+    // FIX Bug-11: 即使出错也更新 lastCheck 到本轮起始时间，
+    // 配合 ImapFlow 的 since 过滤，避免无限重试同一批出错邮件
+    lastCheck = checkStartTime;
     // 确保 IMAP 连接被清理，防止连接泄漏
-    try { await client.logout(); } catch (logoutErr) { logger.debug('IMAP logout cleanup failed', { err: logoutErr.message }); }
+    try { await client.logout(); } catch (logoutErr) {
+      logger.debug('IMAP logout cleanup failed', { err: logoutErr.message });
+    }
   }
 }
 
@@ -190,10 +200,8 @@ async function sendEmail(to, subject, text) {
 // ─── 定时轮询 ────────────────────────────────────────────────
 logger.info(`邮件处理模块启动，检查间隔 ${CHECK_INTERVAL / 1000}s`);
 
-// 首次立即检查
 checkNewEmails();
 
-// 定时检查
 const timer = setInterval(checkNewEmails, CHECK_INTERVAL);
 
 // ─── 健康检查 ────────────────────────────────────────────────
