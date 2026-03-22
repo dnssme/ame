@@ -3,6 +3,11 @@
 /**
  * Anima 灵枢 · 微信接入模块
  * 基于 Wechaty 框架，将微信消息桥接到 OpenClaw Agent API
+ *
+ * 修复记录：
+ *   #FIX-W1  callAgent 增加 undici 超时（bodyTimeout/headersTimeout: 60s）
+ *            防止 Agent 挂起导致微信消息处理器无限等待
+ *   #FIX-W2  callAgent 增加 AbortController 总时限兜底（90s）
  */
 
 const http       = require('http');
@@ -10,6 +15,9 @@ const { WechatyBuilder } = require('wechaty');
 const { request } = require('undici');
 const winston    = require('winston');
 const Redis      = require('ioredis');
+
+// ─── 超时配置常量 ─────────────────────────────────────────────
+const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '60000', 10);
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -30,7 +38,7 @@ const logger = winston.createLogger({
 });
 
 // ─── 配置 ────────────────────────────────────────────────────
-const AGENT_API_URL   = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, ''); // FIX Bug-4: 移除尾部斜杠
+const AGENT_API_URL   = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, '');
 const DEFAULT_MODEL   = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const GROUP_AT_ONLY   = process.env.GROUP_AT_ONLY !== 'false';
 const BOT_NAME        = process.env.BOT_NAME || 'Anima';
@@ -136,6 +144,9 @@ function isLongRunningTask(message) {
   return LONG_RUNNING_KEYWORDS.some(kw => lower.includes(kw));
 }
 
+/**
+ * FIX-W1/W2：增加 undici 超时和 AbortController 兜底
+ */
 async function callAgent(userId, message) {
   const session = getSession(userId);
   session.messages.push({ role: 'user', content: message });
@@ -143,6 +154,10 @@ async function callAgent(userId, message) {
   if (session.messages.length > 20) {
     session.messages = session.messages.slice(-20);
   }
+
+  // FIX-W2：AbortController 总时限兜底
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
 
   try {
     const { body } = await request(`${AGENT_API_URL}/chat`, {
@@ -154,12 +169,22 @@ async function callAgent(userId, message) {
         userId: userId,
         userEmail: await getUserEmail(userId),
       }),
+      // FIX-W1：设置超时，防止 Agent 挂起导致微信 Bot 无限等待
+      bodyTimeout: AGENT_REQUEST_TIMEOUT_MS,
+      headersTimeout: AGENT_REQUEST_TIMEOUT_MS,
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     const data = await body.json();
     const reply = data.reply || data.choices?.[0]?.message?.content || '抱歉，我暂时无法回答。';
     session.messages.push({ role: 'assistant', content: reply });
     return reply;
   } catch (err) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      logger.error('Agent API 请求超时', { userId, timeoutMs: AGENT_REQUEST_TIMEOUT_MS + 30_000 });
+      return '抱歉，AI 响应超时，请稍后重试。';
+    }
     logger.error('Agent API call failed', { err: err.message, userId });
     return '抱歉，AI 服务暂时不可用，请稍后再试。';
   }
@@ -275,8 +300,6 @@ bot.on('message', async (msg) => {
     }
   } catch (err) {
     logger.error('消息处理失败', { err: err.message, userId });
-    // FIX Bug-3: catch 块中的 msg.say 也包裹 try-catch，
-    // 防止 Wechat API 抖动时抛出 unhandledRejection → process.exit(1)
     try {
       await msg.say('处理消息时出错，请稍后再试。');
     } catch (sayErr) {
