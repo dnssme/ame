@@ -30,13 +30,11 @@ const logger = winston.createLogger({
 });
 
 // ─── 配置 ────────────────────────────────────────────────────
-const AGENT_API_URL   = process.env.AGENT_API_URL || 'http://172.16.1.2:3000';
+const AGENT_API_URL   = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, ''); // FIX Bug-4: 移除尾部斜杠
 const DEFAULT_MODEL   = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const GROUP_AT_ONLY   = process.env.GROUP_AT_ONLY !== 'false';
 const BOT_NAME        = process.env.BOT_NAME || 'Anima';
 const VOICE_ENABLED   = process.env.VOICE_ENABLED === 'true';
-const WHISPER_URL     = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transcribe';
-const TTS_URL         = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 const REDIS_URL       = process.env.REDIS_URL;
 
 // ─── Redis（用户邮箱绑定持久化）──────────────────────────────
@@ -58,12 +56,11 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// ─── 会话上下文缓存（简易内存版，生产环境建议用 Redis）──────
+// ─── 会话上下文缓存 ──────────────────────────────────────────
 const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
-/** userId → email 绑定表（通过 Redis 持久化，重启不丢失）*/
 const REDIS_EMAIL_KEY = 'anima:wechat_emails';
 
 async function getUserEmail(userId) {
@@ -91,7 +88,6 @@ function getSession(userId) {
     session.lastActive = Date.now();
     return session;
   }
-  // LRU 淘汰：超过上限时删除最久未活跃的会话
   if (sessions.size >= MAX_SESSIONS) {
     let oldest = null;
     let oldestKey = null;
@@ -108,7 +104,6 @@ function getSession(userId) {
   return newSession;
 }
 
-// 定期清理过期会话（防止内存泄漏）
 const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
@@ -119,7 +114,6 @@ const sessionCleanupTimer = setInterval(() => {
 }, SESSION_TTL);
 
 // ─── 消息分段发送 ─────────────────────────────────────────────
-// 微信文字消息限制约 4000 字符，超长消息需分段发送
 const WECHAT_MSG_LIMIT = 4000;
 
 async function saySplitMessage(msg, text) {
@@ -134,7 +128,6 @@ async function saySplitMessage(msg, text) {
 
 // ─── Agent API 调用 ──────────────────────────────────────────
 
-/** 标记长耗时任务类型（web-search / file-analysis），可通过 LONG_RUNNING_KEYWORDS 环境变量覆盖 */
 const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze')
   .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -147,7 +140,6 @@ async function callAgent(userId, message) {
   const session = getSession(userId);
   session.messages.push({ role: 'user', content: message });
 
-  // 保留最近 20 条上下文
   if (session.messages.length > 20) {
     session.messages = session.messages.slice(-20);
   }
@@ -197,7 +189,6 @@ bot.on('logout', (user) => {
 });
 
 bot.on('message', async (msg) => {
-  // 忽略自己发的消息
   if (msg.self()) return;
 
   const contact = msg.talker();
@@ -205,7 +196,6 @@ bot.on('message', async (msg) => {
   const userId = contact.id;
   const isGroup = !!room;
 
-  // 群聊：仅响应 @机器人 的消息
   if (isGroup && GROUP_AT_ONLY) {
     const mentionSelf = await msg.mentionSelf();
     if (!mentionSelf) return;
@@ -214,10 +204,8 @@ bot.on('message', async (msg) => {
   try {
     const msgType = msg.type();
 
-    // 文字消息
     if (msgType === bot.Message.Type.Text) {
       let text = msg.text().trim();
-      // 去除群聊中的 @机器人 前缀
       if (isGroup) {
         text = text.replace(new RegExp(`@${escapeRegExp(BOT_NAME)}\\s*`, 'g'), '').trim();
       }
@@ -230,7 +218,6 @@ bot.on('message', async (msg) => {
 
       logger.info('收到文字消息', { userId, text: text.substring(0, 100), isGroup });
 
-      // /clear — 清除对话上下文
       if (text === '/clear') {
         sessions.delete(userId);
         logger.info('用户清除对话上下文', { userId });
@@ -238,7 +225,6 @@ bot.on('message', async (msg) => {
         return;
       }
 
-      // /bind <email> — 绑定计费邮箱，用于计费归因
       if (text.startsWith('/bind ')) {
         const email = text.slice(6).trim().toLowerCase();
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
@@ -254,7 +240,11 @@ bot.on('message', async (msg) => {
       const longRunning = isLongRunningTask(text);
 
       if (longRunning) {
-        await msg.say('⏳ 任务处理中，完成后会通知你...');
+        try {
+          await msg.say('⏳ 任务处理中，完成后会通知你...');
+        } catch (sayErr) {
+          logger.error('发送等待提示失败', { err: sayErr.message, userId });
+        }
         callAgent(userId, text)
           .then(async (reply) => {
             try {
@@ -278,17 +268,20 @@ bot.on('message', async (msg) => {
       await saySplitMessage(msg, reply);
     }
 
-    // 语音消息（需要语音模块启用）
     if (msgType === bot.Message.Type.Audio && VOICE_ENABLED) {
       logger.info('收到语音消息', { userId });
       await msg.say('语音处理中，请稍候...');
-      // 语音 → 文字 → AI → 文字回复
-      // 完整实现需要下载语音文件、调用 Whisper API、再调用 Agent
       await msg.say('语音功能开发中，请先发送文字消息。');
     }
   } catch (err) {
     logger.error('消息处理失败', { err: err.message, userId });
-    await msg.say('处理消息时出错，请稍后再试。');
+    // FIX Bug-3: catch 块中的 msg.say 也包裹 try-catch，
+    // 防止 Wechat API 抖动时抛出 unhandledRejection → process.exit(1)
+    try {
+      await msg.say('处理消息时出错，请稍后再试。');
+    } catch (sayErr) {
+      logger.error('发送错误提示失败（微信 API 不可用）', { err: sayErr.message, userId });
+    }
   }
 });
 
