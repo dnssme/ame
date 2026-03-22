@@ -179,43 +179,67 @@ PrivateKey = <VPS A 私钥>
 Address    = 172.16.1.1/24
 ListenPort = 51820
 
+# VPS B (172.16.1.2) — OpenClaw Agent
+# nginx 将 /api/agent/ 路由至此节点
 [Peer]
-# VPS B (172.16.1.2) — OpenClaw
 PublicKey  = <VPS B 公钥>
 AllowedIPs = 172.16.1.2/32
 Endpoint   = <VPS B 公网IP>:51820
 PersistentKeepalive = 25
 
+# VPS C (172.16.1.3) — LibreChat Web UI
+# nginx 将 / 及 /api/ 路由至此节点
 [Peer]
-# VPS C (172.16.1.3) — LibreChat
 PublicKey  = <VPS C 公钥>
 AllowedIPs = 172.16.1.3/32
 Endpoint   = <VPS C 公网IP>:51820
 PersistentKeepalive = 25
 
+# FIX #2: VPS D (172.16.1.4) — Nextcloud（日历 CalDAV / 网盘 WebDAV）
+# nginx 将 /nextcloud/ 路由至此节点；原文档缺少此 Peer，
+# 导致 nginx 请求 http://172.16.1.4:8090 时路由不通，返回 502。
 [Peer]
-# CXI4 (172.16.1.5) — Webhook + Redis
+PublicKey  = <VPS D 公钥>
+AllowedIPs = 172.16.1.4/32
+Endpoint   = <VPS D 公网IP>:51820
+PersistentKeepalive = 25
+
+# CXI4 (172.16.1.5) — Whisper STT / Coqui TTS
+# nginx 将 /whisper/ 和 /tts/ 路由至此节点
 # 注意：CXI4 使用动态公网 IP，不设置 Endpoint；
 # CXI4 会主动连接本节点并维持隧道，本节点通过学习对端地址进行通信。
+[Peer]
 PublicKey  = <CXI4 公钥>
 AllowedIPs = 172.16.1.5/32
+PersistentKeepalive = 25
+
+# FIX #2: VPS E (172.16.1.6) — Webhook 计费服务 + Redis
+# nginx 将 /activate、/billing/*、/models 路由至此节点；
+# 原文档缺少此 Peer，导致所有充值激活和计费查询接口返回 502。
+[Peer]
+PublicKey  = <VPS E 公钥>
+AllowedIPs = 172.16.1.6/32
+Endpoint   = <VPS E 公网IP>:51820
 PersistentKeepalive = 25
 EOF
 
 chmod 600 /etc/wireguard/wg0.conf
 systemctl enable --now wg-quick@wg0
 
-# 验证所有节点连通
+# 验证所有节点连通（必须全部可达，否则 nginx 对应路径返回 502）
 wg show wg0
 echo "--- 内网连通性验证 ---"
-ping -c 2 172.16.1.2 && echo "✅ VPS B 可达" || echo "❌ VPS B 不可达"
-ping -c 2 172.16.1.3 && echo "✅ VPS C 可达" || echo "❌ VPS C 不可达"
-ping -c 2 172.16.1.5 && echo "✅ CXI4 可达"  || echo "❌ CXI4 不可达"
+ping -c 2 172.16.1.2 && echo "✅ VPS B (OpenClaw) 可达" || echo "❌ VPS B 不可达"
+ping -c 2 172.16.1.3 && echo "✅ VPS C (LibreChat) 可达" || echo "❌ VPS C 不可达"
+ping -c 2 172.16.1.4 && echo "✅ VPS D (Nextcloud) 可达" || echo "❌ VPS D 不可达"
+ping -c 2 172.16.1.5 && echo "✅ CXI4 (Whisper/TTS) 可达" || echo "❌ CXI4 不可达"
+ping -c 2 172.16.1.6 && echo "✅ VPS E (Webhook) 可达" || echo "❌ VPS E 不可达"
 
 # 验证各服务健康状态
 curl -sf http://172.16.1.3:3080/health && echo "✅ LibreChat" || echo "❌ LibreChat 不可达"
 curl -sf http://172.16.1.2:3000/health && echo "✅ OpenClaw"  || echo "❌ OpenClaw 不可达"
-curl -sf http://172.16.1.5:3002/health && echo "✅ Webhook"   || echo "❌ Webhook 不可达"
+curl -sf http://172.16.1.6:3002/health && echo "✅ Webhook"   || echo "❌ Webhook 不可达"
+curl -sf http://172.16.1.4:8090/status.php | grep -q '"installed":true' && echo "✅ Nextcloud" || echo "❌ Nextcloud 不可达"
 ```
 
 ---
