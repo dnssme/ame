@@ -1,12 +1,12 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v5
+-- Anima 灵枢 · 数据库 Schema v5.1
 -- 数据库: librechat (Azure PostgreSQL)
--- 设计原则：
---   · 按模型按量计费，无套餐绑定
---   · 每个 API 模型独立定价（管理员可随时添加/修改价格）
---   · 标记为 is_free=true 的模型永久免费
---   · 本地 Ollama 模型保留条目但默认 is_active=false
---   · v5: 按 Token 计费（Tiktoken），替代按字符计费
+-- 变更记录（v5.1）：
+--   · BUG-NEW-2：v_today_model_usage 视图改用上海时区，与
+--                Migration 003 保持一致（原 CURRENT_DATE 为 UTC，
+--                导致北京时间 00:00-08:00 统计前一天数据）
+--   · BUG-NEW-5：api_usage.input_tokens/output_tokens 改为 BIGINT，
+--                防止未来统计视图 SUM 溢出（INT 最大约 21 亿）
 -- =============================================================
 
 -- ─── 启用必要扩展 ──────────────────────────────────────────────
@@ -18,21 +18,16 @@ CREATE EXTENSION IF NOT EXISTS "pg_stat_statements"; -- 慢查询监控
 -- =============================================================
 CREATE TABLE IF NOT EXISTS api_models (
     id           SERIAL       PRIMARY KEY,
-    provider     VARCHAR(32)  NOT NULL,            -- 'anthropic' | 'openai' | 'mistral' | 'ollama' 等
-    model_name   VARCHAR(128) NOT NULL UNIQUE,     -- API 中使用的模型标识符
-    display_name VARCHAR(128) NOT NULL,            -- 界面显示名称
-    -- 定价（元/1000 Token）；is_free=true 时忽略这两个字段
-    -- v5: 改为按 Token 计费（对齐上游 API 定价），旧按字符计费列保留兼容
+    provider     VARCHAR(32)  NOT NULL,
+    model_name   VARCHAR(128) NOT NULL UNIQUE,
+    display_name VARCHAR(128) NOT NULL,
     is_free                    BOOLEAN      NOT NULL DEFAULT false,
     price_input_per_1k_tokens  NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_input_per_1k_tokens >= 0),
     price_output_per_1k_tokens NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_output_per_1k_tokens >= 0),
-    -- 定价货币（'USD' 或 'CNY'）；计费时 USD 按汇率换算为人民币分
     currency                   VARCHAR(3)   NOT NULL DEFAULT 'CNY',
-    -- 是否支持 Prompt Caching（用于智能分层计费）
     supports_cache BOOLEAN    NOT NULL DEFAULT false,
-    -- 是否启用（false = 仅保留接口定义，用户不可选）
     is_active    BOOLEAN      NOT NULL DEFAULT true,
-    description  TEXT,                             -- 管理员备注
+    description  TEXT,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -40,18 +35,7 @@ CREATE TABLE IF NOT EXISTS api_models (
 CREATE INDEX IF NOT EXISTS idx_api_models_active
     ON api_models(is_active, provider);
 
--- 预置模型（管理员可在运行时通过 POST /admin/models 增加更多）
--- ┌──────────────────────────────────────────────────────────────────────────────────┐
--- │  默认免费模型：glm-4-flash（智谱 GLM-4-Flash）                                   │
--- │  · 智谱官方免费提供（free tier），系统 0 成本运营                                  │
--- │  · is_free=true → 用户不消耗余额                                                  │
--- │  · 速度快（约 1s），支持 128k 上下文，适合日常对话                                  │
--- │                                                                                  │
--- │  价格单位说明：                                                                    │
--- │  · 西方主流提供商（Anthropic/OpenAI/Google/Mistral/xAI 等）价格单位为 USD/1K Token │
--- │  · 中国提供商（DeepSeek/Qwen/Moonshot/Zhipu/Doubao/Baidu）价格单位为 CNY/1K Token │
--- │  · 管理员请按实际汇率和成本在部署后通过 PUT /admin/models/:id 调整价格               │
--- └──────────────────────────────────────────────────────────────────────────────────┘
+-- 预置模型
 INSERT INTO api_models
     (provider, model_name, display_name, is_free,
      price_input_per_1k_tokens, price_output_per_1k_tokens, currency, is_active, supports_cache, description)
@@ -59,12 +43,10 @@ VALUES
     -- ══════════════════════════════════════════════════════════════════════
     -- ── 免费模型 ───────────────────────────────────────────────────────────
     -- ══════════════════════════════════════════════════════════════════════
-    -- ★ 默认免费模型（0 成本，智谱官方免费配额） ★
     ('zhipu',     'glm-4-flash',                    'GLM-4-Flash（★默认免费）',
      true, 0, 0, 'CNY', true, false,
      '★ 系统默认免费模型 ★ 智谱官方免费提供，0 成本运营。速度快（~1s），128k 上下文，适合日常对话。openclaw 默认路由此模型。'),
 
-    -- 其他标记为免费的模型（管理员承担 API 成本）
     ('anthropic', 'claude-haiku-4-5-20251001',      'Claude Haiku 4.5（免费）',
      true, 0, 0, 'USD', true, false,
      '管理员标记为用户免费；Anthropic 实际收费约 $0.0008/$0.004 per 1K token（USD），成本由运营商承担'),
@@ -81,8 +63,6 @@ VALUES
     -- ── 全球 Top 10 提供商 · 付费模型 ─────────────────────────────────────
     -- ══════════════════════════════════════════════════════════════════════
 
-    -- ── 1. Anthropic / Claude ─────────────────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://www.anthropic.com/pricing）
     ('anthropic', 'claude-opus-4-0',                'Claude Opus 4',
      false, 0.015000, 0.075000, 'USD', true, true,
      'Anthropic 旗舰，最强推理，supports Prompt Caching；$15/$75 per 1M token（USD）'),
@@ -103,8 +83,6 @@ VALUES
      false, 0.000800, 0.004000, 'USD', true, false,
      '快速轻量，高性价比；$0.8/$4 per 1M token（USD）'),
 
-    -- ── 2. OpenAI / GPT ──────────────────────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://openai.com/pricing）
     ('openai',    'gpt-4.1',                        'GPT-4.1',
      false, 0.002000, 0.008000, 'USD', true, true,
      'GPT-4.1 旗舰，128k 上下文，supports Prompt Caching；$2/$8 per 1M token（USD）'),
@@ -145,8 +123,6 @@ VALUES
      false, 0.003000, 0.012000, 'USD', true, false,
      '推理入门版；$3/$12 per 1M token（USD）'),
 
-    -- ── 3. Google / Gemini ───────────────────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://ai.google.dev/pricing）
     ('google',    'gemini-2.5-pro-preview-05-06',   'Gemini 2.5 Pro',
      false, 0.001250, 0.010000, 'USD', true, false,
      'Google 旗舰推理模型；$1.25/$10 per 1M token（USD）'),
@@ -175,8 +151,6 @@ VALUES
      false, 0.000038, 0.000150, 'USD', true, false,
      '最轻量版，极低延迟；$0.0375/$0.15 per 1M token（USD）'),
 
-    -- ── 4. xAI / Grok ────────────────────────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://x.ai/api#pricing）
     ('xai',       'grok-3',                         'Grok-3',
      false, 0.003000, 0.015000, 'USD', true, false,
      'xAI 旗舰模型；$3/$15 per 1M token（USD）'),
@@ -193,8 +167,6 @@ VALUES
      false, 0.002000, 0.010000, 'USD', true, false,
      '上一代稳定版；$2/$10 per 1M token（USD）'),
 
-    -- ── 5. Mistral AI ────────────────────────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://mistral.ai/technology/#pricing）
     ('mistral',   'mistral-large-latest',           'Mistral Large',
      false, 0.002000, 0.006000, 'USD', true, false,
      '旗舰综合模型；$2/$6 per 1M token（USD）'),
@@ -215,8 +187,6 @@ VALUES
      false, 0.000250, 0.000250, 'USD', true, false,
      '开源 7B 模型，价格极低；$0.25/$0.25 per 1M token（USD）'),
 
-    -- ── 6. Cohere ────────────────────────────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://cohere.com/pricing）
     ('cohere',    'command-r-plus-08-2024',         'Command R+',
      false, 0.002500, 0.010000, 'USD', true, false,
      '旗舰 RAG 模型，适合企业知识库；$2.5/$10 per 1M token（USD）'),
@@ -229,8 +199,6 @@ VALUES
      false, 0.000038, 0.000150, 'USD', true, false,
      '轻量快速 RAG；$0.0375/$0.15 per 1M token（USD）'),
 
-    -- ── 7. Groq（托管开源模型）──────────────────────────────────────────
-    -- 价格单位：USD/1K Token
     ('groq',      'meta-llama/llama-4-scout-17b-16e-instruct', 'Llama 4 Scout 17B (Groq)',
      false, 0.000110, 0.000340, 'USD', true, false,
      'Groq 托管 Llama 4 Scout，速度极快；$0.11/$0.34 per 1M token（USD）'),
@@ -251,8 +219,6 @@ VALUES
      false, 0.000200, 0.000200, 'USD', true, false,
      'Groq 托管 Google Gemma2；$0.2/$0.2 per 1M token（USD）'),
 
-    -- ── 8. Perplexity（联网搜索增强）───────────────────────────────────
-    -- 价格单位：USD/1K Token（参考 https://docs.perplexity.ai/pricing）
     ('perplexity', 'sonar-pro',                     'Sonar Pro（联网旗舰）',
      false, 0.003000, 0.015000, 'USD', true, false,
      '联网搜索旗舰，实时信息；$3/$15 per 1M token（USD）'),
@@ -271,11 +237,8 @@ VALUES
 
     -- ══════════════════════════════════════════════════════════════════════
     -- ── 中国 Top 5 提供商 · 付费模型 ──────────────────────────────────────
-    -- 价格单位：CNY/1K Token（人民币）
     -- ══════════════════════════════════════════════════════════════════════
 
-    -- ── 中1. DeepSeek（深度求索） ─────────────────────────────────────────
-    -- 价格参考：https://platform.deepseek.com/api-docs/pricing
     ('deepseek',  'deepseek-chat',                  'DeepSeek-V3（通用旗舰）',
      false, 0.001000, 0.002000, 'CNY', true, true,
      'DeepSeek-V3，综合能力最强，价格极低，supports Prefix Caching；¥0.001/¥0.002 per 1K token（CNY）'),
@@ -284,8 +247,6 @@ VALUES
      false, 0.004000, 0.016000, 'CNY', true, true,
      'DeepSeek-R1，深度推理，supports Prefix Caching；¥0.004/¥0.016 per 1K token（CNY）'),
 
-    -- ── 中2. Qwen 通义千问（阿里云灵积） ─────────────────────────────────
-    -- 价格参考：https://dashscope.aliyuncs.com/pricing
     ('qwen',      'qwen3-235b-a22b',                'Qwen3-235B MoE（旗舰）',
      false, 0.002000, 0.006000, 'CNY', true, false,
      'Qwen3 旗舰 MoE 模型；¥0.002/¥0.006 per 1K token（CNY）'),
@@ -322,8 +283,6 @@ VALUES
      false, 0.003500, 0.007000, 'CNY', true, false,
      '代码专用，指令跟随强；¥0.0035/¥0.007 per 1K token（CNY）'),
 
-    -- ── 中3. Moonshot / Kimi（月之暗面） ─────────────────────────────────
-    -- 价格参考：https://platform.moonshot.cn/pricing
     ('moonshot',  'kimi-latest',                    'Kimi Latest（自动跟最新）',
      false, 0.012000, 0.012000, 'CNY', true, false,
      'Kimi 最新版，自动跟踪；¥0.012/¥0.012 per 1K token（CNY）'),
@@ -340,8 +299,6 @@ VALUES
      false, 0.060000, 0.060000, 'CNY', true, false,
      '128k 超长上下文；¥0.06/¥0.06 per 1K token（CNY）'),
 
-    -- ── 中4. Zhipu AI / GLM（智谱清言） ──────────────────────────────────
-    -- 价格参考：https://open.bigmodel.cn/pricing
     ('zhipu',     'glm-z1-plus',                    'GLM-Z1-Plus（推理旗舰）',
      false, 0.010000, 0.010000, 'CNY', true, false,
      'GLM 推理旗舰；¥0.01/¥0.01 per 1K token（CNY）'),
@@ -358,8 +315,6 @@ VALUES
      false, 0.001000, 0.001000, 'CNY', true, false,
      '超长上下文版；¥0.001/¥0.001 per 1K token（CNY）'),
 
-    -- ── 中5-A. ByteDance / 豆包（字节跳动火山方舟） ──────────────────────
-    -- 价格参考：https://console.volcengine.com/ark/region:ark+cn-beijing/pricing
     ('doubao',    'doubao-pro-32k',                 '豆包 Pro 32K',
      false, 0.000800, 0.002000, 'CNY', true, false,
      '字节旗舰，32k 上下文；¥0.0008/¥0.002 per 1K token（CNY）'),
@@ -376,8 +331,6 @@ VALUES
      false, 0.000800, 0.001000, 'CNY', true, false,
      '轻量长上下文；¥0.0008/¥0.001 per 1K token（CNY）'),
 
-    -- ── 中5-B. Baidu / ERNIE 文心一言（百度千帆） ────────────────────────
-    -- 价格参考：https://console.bce.baidu.com/qianfan/chargemanage/list
     ('baidu',     'ernie-4.5-turbo-preview',        'ERNIE 4.5 Turbo（旗舰）',
      false, 0.004000, 0.016000, 'CNY', true, false,
      '百度 ERNIE 4.5 旗舰；¥0.004/¥0.016 per 1K token（CNY）'),
@@ -408,13 +361,9 @@ ON CONFLICT (model_name) DO NOTHING;
 -- =============================================================
 CREATE TABLE IF NOT EXISTS user_billing (
     id                BIGSERIAL    PRIMARY KEY,
-    -- LibreChat 用户邮箱（外部关联，无 FK 保证解耦）
     user_email        VARCHAR(254) NOT NULL UNIQUE,
-    -- 余额（分），预付费模式
     balance_fen       NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (balance_fen >= 0),
-    -- 累计消费（分），仅统计用
     total_charged_fen NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (total_charged_fen >= 0),
-    -- 账户状态（管理员可暂停）
     is_suspended      BOOLEAN       NOT NULL DEFAULT false,
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
@@ -429,9 +378,7 @@ CREATE INDEX IF NOT EXISTS idx_user_billing_email
 CREATE TABLE IF NOT EXISTS recharge_cards (
     id          BIGSERIAL     PRIMARY KEY,
     key         VARCHAR(64)   NOT NULL UNIQUE,
-    -- 充值金额（分）
     credit_fen  NUMERIC(12,2) NOT NULL CHECK (credit_fen > 0),
-    -- 管理员备注（如 "¥20 新用户体验包"）
     label       VARCHAR(128),
     used        BOOLEAN       NOT NULL DEFAULT false,
     used_at     TIMESTAMPTZ,
@@ -446,22 +393,22 @@ CREATE INDEX IF NOT EXISTS idx_recharge_cards_unused
 
 -- =============================================================
 -- 4. API 调用记录（计费核心）
+-- BUG-NEW-5 修复：input_tokens/output_tokens 改为 BIGINT
+-- 原因：SUM 聚合在统计视图中可能超出 INT 最大值（约 21 亿），
+--       BIGINT 上限约 922 亿亿，完全消除溢出风险。
 -- =============================================================
 CREATE TABLE IF NOT EXISTS api_usage (
     id              BIGSERIAL     PRIMARY KEY,
     user_email      VARCHAR(254)  NOT NULL,
-    -- 关联模型（NULL = 早期兜底记录或模型已被删除）
     api_model_id    INT           REFERENCES api_models(id) ON DELETE SET NULL,
     api_provider    VARCHAR(32)   NOT NULL,
     model_name      VARCHAR(128)  NOT NULL,
-    is_free         BOOLEAN       NOT NULL, -- 本次调用是否免费
-    -- Token 统计（v5: 使用 Tiktoken 计数，对齐上游 API 定价）
-    input_tokens    INT           NOT NULL DEFAULT 0,
-    output_tokens   INT           NOT NULL DEFAULT 0,
-    -- 本次计费金额（分），0 = 免费
+    is_free         BOOLEAN       NOT NULL,
+    -- BUG-NEW-5：改为 BIGINT 防止统计视图 SUM 溢出
+    input_tokens    BIGINT        NOT NULL DEFAULT 0,
+    output_tokens   BIGINT        NOT NULL DEFAULT 0,
     charged_fen     NUMERIC(10,4) NOT NULL DEFAULT 0,
-    -- 状态
-    status          VARCHAR(16)   NOT NULL DEFAULT 'ok', -- 'ok' | 'error'
+    status          VARCHAR(16)   NOT NULL DEFAULT 'ok',
     error_msg       TEXT,
     created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
@@ -482,7 +429,7 @@ CREATE TABLE IF NOT EXISTS billing_transactions (
     amount_fen        NUMERIC(12,4) NOT NULL,
     balance_after_fen NUMERIC(12,2) NOT NULL CHECK (balance_after_fen >= 0),
     description       TEXT,
-    ref_id            VARCHAR(128), -- api_usage.id 或 recharge_cards.key
+    ref_id            VARCHAR(128),
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
@@ -525,6 +472,10 @@ SELECT
 FROM user_billing;
 
 -- 7-B. 当日各模型调用量汇总（用于监控 / 运营）
+-- BUG-NEW-2 修复：使用北京时间（Asia/Shanghai）作为"今天"的起始时刻。
+-- 原写法 CURRENT_DATE 使用 UTC，导致北京时间 00:00-08:00 期间
+-- 统计的仍是"昨天"的数据，运营监控有 8 小时误差窗口。
+-- 与 Migration 003 (003_fix_today_view_timezone.sql) 保持一致。
 CREATE OR REPLACE VIEW v_today_model_usage AS
 SELECT
     am.provider,
@@ -536,17 +487,18 @@ SELECT
     SUM(au.charged_fen)     AS total_charged_fen
 FROM api_usage au
 JOIN api_models am ON am.id = au.api_model_id
-WHERE au.created_at >= CURRENT_DATE
+WHERE au.created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
 GROUP BY am.provider, am.model_name, am.display_name;
+
+COMMENT ON VIEW v_today_model_usage IS
+  '当日（北京时间）各模型调用量汇总。使用 Asia/Shanghai 时区计算"今天"起始点，
+   避免 Azure PostgreSQL 默认 UTC 时区导致北京时间午夜前 8 小时统计数据错误。
+   此视图已在 schema.sql v5.1 中修复，与 Migration 003 保持一致。';
 
 -- =============================================================
 -- 8. 最小权限角色（安全加固：服务专用角色）
 -- =============================================================
 
--- 8-A. billing_svc：Webhook 计费服务专用角色
--- 仅可操作计费相关表，不可修改 schema
--- ⚠️ 当前为 NOLOGIN 占位角色；如需启用，执行：
--- ALTER ROLE billing_svc LOGIN PASSWORD '新强密码';
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'billing_svc') THEN
@@ -561,10 +513,6 @@ GRANT SELECT, INSERT, UPDATE ON TABLE user_billing, recharge_cards, api_usage, b
 GRANT SELECT ON TABLE api_models TO billing_svc;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO billing_svc;
 
--- 8-B. agent_svc：OpenClaw Agent 服务专用角色
--- 仅可读取模型列表和写入用量记录，不可操作余额或卡密
--- ⚠️ 当前为 NOLOGIN 占位角色；如需启用，执行：
--- ALTER ROLE agent_svc LOGIN PASSWORD '新强密码';
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'agent_svc') THEN
