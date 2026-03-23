@@ -1,40 +1,41 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.6
+ * Anima 灵枢 · Webhook 服务 v5.7
  * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.6 相对于 v5.5）：
- *   #FIX-5.6-1  实现 idempotency_key 幂等计费防护
- *               Migration 004 / Schema v5.2 已添加列和唯一索引，
- *               但 server.js 从未使用。本版补充：
- *               · 从 POST /billing/record 请求体读取 idempotencyKey
- *               · 校验格式（1-128 字符，仅允许 [a-zA-Z0-9\-:_]）
- *               · 事务前预检：若 key 已存在则直接返回原始结果（不扣费）
- *               · INSERT api_usage 时写入 idempotency_key 字段
- *               · 唯一约束冲突（并发竞态）捕获并优雅返回幂等响应
- *               · 免费模型路径不使用幂等键（无需防重复扣费）
+ * 修复记录（v5.7 相对于 v5.6）：
+ *   #FIX-5.7-1  ADMIN_TOKEN / SERVICE_TOKEN 长度警告阈值：32 → 64
+ *               openssl rand -hex 32 生成 64 个十六进制字符（32字节），
+ *               原代码 length < 32 实际上对 32~63 字符的弱令牌不告警，
+ *               存在安全隐患。
  *
- * 修复记录（v5.5 相对于 v5.4）：
- *   #FIX-5.5-1  PUT /admin/models/:id 允许免费模型传入 priceInput=0/priceOutput=0
- *   #FIX-5.5-2  calculateChargedFen 偏差阈值从 1% 放宽到 5%
+ *   #FIX-5.7-2  TOCTOU 竞态修复：将 lookupModel 移入 /billing/record 事务内，
+ *               使用 FOR SHARE 行级锁。原代码在事务外查询模型，模型价格/状态
+ *               在检查与扣费之间可能被管理员修改，导致按旧价格扣费或
+ *               对已停用模型继续计费。FOR SHARE 允许并发读，但阻止
+ *               管理员并发 UPDATE 直到事务提交。
+ *               注意：/billing/check 为只读预检，无需锁，保留原逻辑。
  *
- * 历史修复记录（v5.0 → v5.4）保留供溯源：
- *   v5.1 #1  移除 /billing/check 的 requireServiceToken（公开只读接口）
- *   v5.1 #5  Redis Lua 脚本增加 TTL 守护（FIX-B）
- *   v5.1 #6  /billing/record 增加独立限速（600次/分）
- *   v5.1 #7  calculateChargedFen 增加 promptTokens+historyTokens 一致性校验
- *   v5.1 #11 FREE_DAILY_LIMIT / MAX_SINGLE_REQUEST_FEN 改为运行时读取
- *   v5.2 FIX-A  全局限速跳过 /billing/record
- *   v5.2 FIX-B  INCR_EXPIRE_LUA early-return 分支也执行 TTL 守护
- *   v5.2 FIX-C  calculateChargedFen inputTokens=0 但 partitionSum>0 时回退
- *   v5.2 FIX-D  免费模型 DB 插入失败时尝试 Redis DECR 回滚
- *   v5.2 FIX-E  PUT /admin/models/:id 先查 DB is_free 再验证价格字段
- *   v5.3 #BUG-1  INCR_EXPIRE_LUA：新建 key 时 TTL=-2，修复 TTL 丢失
- *   v5.3 #BUG-7  确保 early-return 路径不绕过 TTL 守护
- *   v5.3 #BUG-8  /billing/record 同时警告旧版 outputChars 字段使用
- *   v5.3 #BUG-9  /billing/check 使用独立限速器（120次/分）
- *   v5.4 #BUG-NEW-1  免费用户日期计算改用上海时区
- *   v5.4 #BUG-NEW-4  移除未使用的 tiktoken 依赖
+ *   #FIX-5.7-3  ROLLBACK 失败不再静默吞掉：改为 logger.warn 记录错误，
+ *               便于生产环境排查数据库连接泄漏。
+ *
+ *   #FIX-5.7-4  新增 api_providers 数据库表支持：
+ *               新增 GET /providers 端点，返回已启用的 provider 配置
+ *               （base_url、display_name），不含 API Key（Key 仍在 .env）。
+ *               配合 db/schema.sql v5.3 中新增的 api_providers 表使用。
+ *
+ *   #FIX-5.7-5  免费模型返回 balance_fen: 0（整数）替代 null，
+ *               避免前端未处理 null 导致的 NaN 错误。
+ *
+ *   #FIX-5.7-6  /billing/record 中 ROLLBACK 之后的 billing_transactions
+ *               INSERT 使用 usageRes.rows[0].id 前增加防御检查，
+ *               避免理论上的 undefined 引用错误。
+ *
+ *   #FIX-5.7-7  calculateChargedFen 增加 JSDoc 注释，明确说明
+ *               这是简化的缓存定价模型，与 Anthropic 实际
+ *               cache write/read 分层计费有细微差异。
+ *
+ * 历史修复记录（v5.0 → v5.6）见 CHANGELOG.md。
  */
 
 const crypto    = require('crypto');
@@ -164,6 +165,7 @@ async function incrFreeDailyUsage(userEmail) {
   const FREE_DAILY_LIMIT = getFreeDailyLimit();
   try {
     if (redis.status !== 'ready') {
+      logger.warn('Redis unavailable: free daily limit NOT enforced for request', { userEmail });
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
     }
     const today = getShanghaiDate();
@@ -264,6 +266,11 @@ const adminLimiter = rateLimit({
 const ADMIN_TOKEN   = process.env.ADMIN_TOKEN;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 
+/**
+ * 常量时间字符串比较，防止时序攻击（Timing Attack）。
+ * 使用 Node.js 内置 crypto.timingSafeEqual，两端补齐后比较，
+ * 同时严格检查原始长度相等，避免不等长字符串因补齐产生假阳性。
+ */
 function safeCompare(a, b) {
   const aBuf = Buffer.from(typeof a === 'string' ? a : '');
   const bBuf = Buffer.from(typeof b === 'string' ? b : '');
@@ -331,10 +338,35 @@ async function ensureUser(client, userEmail) {
   );
 }
 
+/**
+ * 在连接池（非事务）中查找模型，用于只读路径（/billing/check, /models）。
+ * ⚠️ 不要在需要价格一致性保证的事务中使用本函数。
+ *    /billing/record 事务内使用带 FOR SHARE 锁的 lookupModelForUpdate。
+ */
 async function lookupModel(modelName) {
   const res = await db.query(
-    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens, currency, is_active, supports_cache
+    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens,
+            currency, is_active, supports_cache
        FROM api_models WHERE model_name = $1`,
+    [modelName]
+  );
+  return res.rows[0] || null;
+}
+
+/**
+ * 在事务中查找模型并加 FOR SHARE 锁，防止 TOCTOU 竞态：
+ * 确保从模型查询到余额扣减整个事务期间，模型价格和状态不会被
+ * 管理员并发修改（UPDATE api_models 会等待本事务提交后再执行）。
+ *
+ * @param {object} client - pg 事务 client
+ * @param {string} modelName
+ */
+async function lookupModelInTx(client, modelName) {
+  const res = await client.query(
+    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens,
+            currency, is_active, supports_cache
+       FROM api_models WHERE model_name = $1
+       FOR SHARE`,
     [modelName]
   );
   return res.rows[0] || null;
@@ -345,12 +377,36 @@ const CACHE_THRESHOLD_TOKENS = 2000;
 const CACHE_DISCOUNT = 0.1;
 
 /**
- * 计算本次请求费用（分）。
+ * 计算本次请求费用（单位：分）。
  *
- * 偏差阈值 5%（v5.5 FIX-5.5-2）：
+ * 缓存定价说明（简化模型）：
+ *   当 supportsCache=true 且 historyTokens > CACHE_THRESHOLD_TOKENS 时：
+ *   - promptTokens（新输入）+ 前 CACHE_THRESHOLD_TOKENS 条历史 → 全价
+ *   - 超出阈值的历史 Token → 全价 × CACHE_DISCOUNT（10%）
+ *
+ *   ⚠️ 这是对 Anthropic/DeepSeek Prompt Cache 定价的简化：
+ *     实际 Anthropic 区分 cache_write（较贵）和 cache_read（便宜），
+ *     本模型将两者均视为 cache_read 折扣，略有低估 cache_write 成本。
+ *     对于 B2C 场景可接受；若需精确成本核算，应传入 write/read 分类。
+ *
+ * 偏差阈值 5%（FIX-5.5-2）：
  *   不同 tokenizer 实现在长对话中有固有误差，5% 是合理容忍范围。
+ *
+ * @param {object} params
+ * @param {number} params.inputTokens   - 总输入 token 数
+ * @param {number} params.outputTokens  - 总输出 token 数
+ * @param {number} params.priceIn       - 输入价格（元/1K token）
+ * @param {number} params.priceOut      - 输出价格（元/1K token）
+ * @param {string} params.currency      - 'USD' | 'CNY'
+ * @param {boolean} params.supportsCache - 模型是否支持 Prompt Cache
+ * @param {number|undefined} params.promptTokens  - 新提示 token 数（可选）
+ * @param {number|undefined} params.historyTokens - 历史上下文 token 数（可选）
+ * @returns {number} 费用（分，向上取整）
  */
-function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, currency, supportsCache, promptTokens, historyTokens }) {
+function calculateChargedFen({
+  inputTokens, outputTokens, priceIn, priceOut, currency,
+  supportsCache, promptTokens, historyTokens,
+}) {
   const fxRate = (currency === 'USD') ? getUsdToCnyRate() : 1;
   const cnyPriceIn  = priceIn  * fxRate;
   const cnyPriceOut = priceOut * fxRate;
@@ -389,10 +445,27 @@ function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, cur
   return Math.ceil((inputCostYuan + outputCostYuan) * 100);
 }
 
+// ─── 安全的 ROLLBACK 辅助函数 ────────────────────────────────
+/**
+ * 在 catch/finally 中安全地执行 ROLLBACK，失败时记录警告而不是静默吞掉。
+ * 静默吞掉 ROLLBACK 错误会隐藏数据库连接故障，导致连接泄漏难以排查。
+ */
+async function safeRollback(client, context) {
+  try {
+    await client.query('ROLLBACK');
+  } catch (rollbackErr) {
+    logger.warn('ROLLBACK 失败，可能存在连接泄漏', {
+      context,
+      err: rollbackErr.message,
+    });
+  }
+}
+
 // =============================================================
 // ─── 路由 ────────────────────────────────────────────────────
 // =============================================================
 
+// ─── 健康检查 ──────────────────────────────────────────────
 app.get('/health', async (_req, res) => {
   try {
     await db.query('SELECT 1');
@@ -403,6 +476,7 @@ app.get('/health', async (_req, res) => {
   }
 });
 
+// ─── 模型列表（公开）──────────────────────────────────────
 app.get('/models', readLimiter, async (_req, res) => {
   try {
     const result = await db.query(
@@ -420,6 +494,34 @@ app.get('/models', readLimiter, async (_req, res) => {
   }
 });
 
+// ─── Provider 配置列表（公开，不含 API Key）─────────────────
+// FIX-5.7-4: 新增端点，供 OpenClaw/LibreChat 动态获取 provider 配置，
+// 实现"数据库统一调用"——provider base URL 集中存储在 DB 中，
+// 而非分散在各服务的配置文件里。
+// API Key 仍在 .env（符合 PCI-DSS 3.x，不允许将密钥存入数据库明文）。
+app.get('/providers', readLimiter, async (_req, res) => {
+  try {
+    // 若 api_providers 表不存在（旧版部署），优雅降级返回空列表
+    const result = await db.query(
+      `SELECT provider_name, display_name, base_url, is_enabled, description
+         FROM api_providers
+        WHERE is_enabled = true
+        ORDER BY provider_name`
+    ).catch((err) => {
+      if (err.code === '42P01') { // undefined_table
+        logger.warn('api_providers 表不存在，请执行 db/schema.sql 升级');
+        return { rows: [] };
+      }
+      throw err;
+    });
+    res.json({ success: true, providers: result.rows });
+  } catch (err) {
+    logger.error('Providers query error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+// ─── 充值卡激活 ──────────────────────────────────────────
 app.post('/activate', activateLimiter, async (req, res) => {
   let { cardKey, userEmail } = req.body ?? {};
 
@@ -449,7 +551,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
       [cardKey]
     );
     if (cardRes.rows.length === 0) {
-      await client.query('ROLLBACK');
+      await safeRollback(client, '/activate card lookup');
       return res.json({ success: false, msg: '卡密无效或已使用' });
     }
 
@@ -492,7 +594,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
       label:       card.label || null,
     });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await safeRollback(client, '/activate error');
     logger.error('Activation error', { err: err.message, userEmail });
     res.status(500).json({ success: false, msg: '服务器内部错误，请稍后重试' });
   } finally {
@@ -500,6 +602,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
   }
 });
 
+// ─── 余额查询 ──────────────────────────────────────────────
 app.get('/billing/balance/:email', readLimiter, async (req, res) => {
   const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
@@ -528,6 +631,7 @@ app.get('/billing/balance/:email', readLimiter, async (req, res) => {
   }
 });
 
+// ─── 消费历史 ──────────────────────────────────────────────
 app.get('/billing/history/:email', readLimiter, async (req, res) => {
   const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
@@ -559,8 +663,12 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
   }
 });
 
+// ─── 余额预检（只读，无需服务鉴权）──────────────────────────
 /**
- * POST /billing/check — 公开只读预检接口，无需服务鉴权
+ * POST /billing/check — 公开只读预检接口
+ * 调用方（LibreChat/OpenClaw）在每次 AI 请求前调用，估算费用并确认余额充足。
+ * 不扣费，不需要 SERVICE_TOKEN。
+ * 注意：使用 lookupModel（非事务版本），只读路径无需 FOR SHARE 锁。
  */
 app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
@@ -604,7 +712,8 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     }
     return res.json({
       success: true, can_proceed: true, is_free: true, estimated_fen: 0,
-      balance_fen: null, is_suspended: false,
+      // FIX-5.7-5: 返回 0 而非 null，避免前端 NaN
+      balance_fen: 0, is_suspended: false,
       daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
     });
   }
@@ -661,12 +770,14 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   }
 });
 
+// ─── 计费记录（内部服务专用）──────────────────────────────
 /**
- * POST /billing/record — 内部服务专用，需要 SERVICE_TOKEN（x-service-token 请求头）
+ * POST /billing/record — 需要 SERVICE_TOKEN（x-service-token 请求头）
  *
- * v5.6 新增 idempotencyKey 支持：
- *   调用方传入 idempotencyKey 时，相同 key 的重复请求直接返回原始结果，不重复扣费。
- *   推荐格式：<conversation_id>:<message_id>:<model_name>
+ * 关键设计原则：
+ *   1. lookupModel 在事务内执行（lookupModelInTx + FOR SHARE），防止 TOCTOU。
+ *   2. idempotencyKey 去重：相同 key 的第二次请求直接返回原始结果，不重复扣费。
+ *   3. ROLLBACK 失败记录 warning 日志，不静默吞掉。
  */
 app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (req, res) => {
   let {
@@ -713,7 +824,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   }
 
   // ── 幂等键校验 ────────────────────────────────────────────
-  // 允许不传（向后兼容旧版 OpenClaw），若传则严格校验格式
   if (idempotencyKey !== undefined) {
     if (
       typeof idempotencyKey !== 'string' ||
@@ -727,66 +837,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       });
     }
   }
-  // 标准化为 undefined（未传）或字符串
   const normalizedIdempKey = (typeof idempotencyKey === 'string') ? idempotencyKey : null;
-
-  // ── 模型查询 ──────────────────────────────────────────────
-  let model;
-  try {
-    model = await lookupModel(modelName);
-  } catch (err) {
-    logger.error('Model lookup error in /billing/record', { err: err.message, modelName });
-    return res.status(500).json({ success: false, msg: '服务器内部错误' });
-  }
-
-  if (!model) {
-    logger.warn('Model not registered in api_models', { modelName, apiProvider });
-    return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
-  }
-  if (!model.is_active) {
-    return res.status(400).json({ success: false, msg: '该模型当前未启用，无法计费' });
-  }
-
-  const modelId  = model.id;
-  const isFree   = model.is_free;
-  const priceIn  = Number(model.price_input_per_1k_tokens);
-  const priceOut = Number(model.price_output_per_1k_tokens);
 
   const promptTk  = parseOptionalNonNegInt(rawPromptTokens);
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
-  // ── 免费模型路径 ──────────────────────────────────────────
-  // 免费模型不需要幂等键（无金额扣减，重复记录只影响日计数）
-  if (isFree) {
-    const dailyCheck = await incrFreeDailyUsage(userEmail);
-    if (!dailyCheck.allowed) {
-      return res.status(429).json({
-        success: false, is_free: true,
-        msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
-        daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
-      });
-    }
-    try {
-      await db.query(
-        `INSERT INTO api_usage
-             (user_email, api_model_id, api_provider, model_name,
-              is_free, input_tokens, output_tokens, charged_fen, status)
-           VALUES ($1,$2,$3,$4,true,$5,$6,0,'ok')`,
-        [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens]
-      );
-    } catch (err) {
-      logger.error('Free usage DB insert failed, attempting Redis counter rollback', { err: err.message });
-      await tryDecrFreeDailyUsage(dailyCheck.key);
-      return res.status(500).json({ success: false, msg: '服务器内部错误' });
-    }
-    return res.json({
-      success: true, is_free: true, charged_fen: 0, balance_fen: null,
-      daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
-    });
-  }
-
-  // ── 付费模型路径：幂等键预检（事务外，快速路径）─────────────
-  // 在开启事务前先检查，避免不必要的行锁和事务开销
+  // ── 幂等键快速路径（事务外，减少锁争用）─────────────────
   if (normalizedIdempKey) {
     try {
       const idempRes = await db.query(
@@ -807,16 +863,70 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         });
       }
     } catch (err) {
-      // 预检失败不阻断流程，继续正常扣费（最坏情况：可能重复扣费，但唯一索引会兜底）
       logger.warn('Idempotency pre-check error, continuing with normal billing', { err: err.message });
     }
   }
 
-  // ── 付费模型路径：事务扣费 ────────────────────────────────
+  // ── 开启事务 ──────────────────────────────────────────────
   const client = await db.connect();
   try {
     await client.query('BEGIN');
 
+    // FIX-5.7-2: 在事务内用 FOR SHARE 锁查询模型，防止 TOCTOU 竞态
+    // 模型的 is_active / price 在本事务存续期间不会被管理员并发修改
+    const model = await lookupModelInTx(client, modelName);
+
+    if (!model) {
+      await safeRollback(client, '/billing/record model not found');
+      logger.warn('Model not registered in api_models', { modelName, apiProvider });
+      return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
+    }
+    if (!model.is_active) {
+      await safeRollback(client, '/billing/record model inactive');
+      return res.status(400).json({ success: false, msg: '该模型当前未启用，无法计费' });
+    }
+
+    const modelId  = model.id;
+    const isFree   = model.is_free;
+    const priceIn  = Number(model.price_input_per_1k_tokens);
+    const priceOut = Number(model.price_output_per_1k_tokens);
+
+    // ── 免费模型路径 ──────────────────────────────────────
+    if (isFree) {
+      // 免费模型无金额风险，不需要 FOR SHARE，但已在事务中，继续使用 client
+      const dailyCheck = await incrFreeDailyUsage(userEmail);
+      if (!dailyCheck.allowed) {
+        await safeRollback(client, '/billing/record free daily limit');
+        return res.status(429).json({
+          success: false, is_free: true,
+          msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
+          daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
+        });
+      }
+      try {
+        await client.query(
+          `INSERT INTO api_usage
+               (user_email, api_model_id, api_provider, model_name,
+                is_free, input_tokens, output_tokens, charged_fen, status)
+             VALUES ($1,$2,$3,$4,true,$5,$6,0,'ok')`,
+          [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens]
+        );
+        await client.query('COMMIT');
+      } catch (err) {
+        logger.error('Free usage DB insert failed, attempting Redis counter rollback', { err: err.message });
+        await safeRollback(client, '/billing/record free insert failed');
+        await tryDecrFreeDailyUsage(dailyCheck.key);
+        return res.status(500).json({ success: false, msg: '服务器内部错误' });
+      }
+      return res.json({
+        success: true, is_free: true, charged_fen: 0,
+        // FIX-5.7-5: 返回 0 而非 null
+        balance_fen: 0,
+        daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
+      });
+    }
+
+    // ── 付费模型路径 ──────────────────────────────────────
     await ensureUser(client, userEmail);
 
     const userRes = await client.query(
@@ -826,7 +936,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     const u = userRes.rows[0];
 
     if (u.is_suspended) {
-      await client.query('ROLLBACK');
+      await safeRollback(client, '/billing/record suspended');
       return res.status(403).json({ success: false, msg: '账户已被暂停' });
     }
 
@@ -840,7 +950,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     });
 
     if (chargedFen > MAX_SINGLE_REQUEST_FEN) {
-      await client.query('ROLLBACK');
+      await safeRollback(client, '/billing/record over safety limit');
       return res.status(402).json({
         success:  false,
         msg:      'Single request cost exceeds safety limit. Please start a new thread or reduce context.',
@@ -850,7 +960,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     }
 
     if (Number(u.balance_fen) < chargedFen) {
-      await client.query('ROLLBACK');
+      await safeRollback(client, '/billing/record insufficient balance');
       return res.status(402).json({
         success:      false,
         msg:          '余额不足，请充值后继续使用',
@@ -869,9 +979,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     );
     const newBalance = Number(deductRes.rows[0].balance_fen);
 
-    // 写入 api_usage，包含 idempotency_key
-    // ON CONFLICT DO NOTHING：处理并发竞态（两个相同 key 同时进入事务）
-    // 若 INSERT 被跳过（返回 0 行），说明另一并发请求已成功，回滚当前事务
+    // INSERT api_usage，ON CONFLICT DO NOTHING 处理并发竞态
     const usageRes = await client.query(
       `INSERT INTO api_usage
            (user_email, api_model_id, api_provider, model_name,
@@ -884,11 +992,10 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens, chargedFen, normalizedIdempKey]
     );
 
-    // 并发竞态：INSERT 被跳过，回滚事务（余额恢复），返回幂等响应
+    // 并发竞态：INSERT 被 DO NOTHING 跳过，回滚本事务，返回原始结果
     if (usageRes.rows.length === 0 && normalizedIdempKey) {
-      await client.query('ROLLBACK');
+      await safeRollback(client, '/billing/record idempotency conflict');
       logger.info('Idempotent billing record (conflict resolution)', { idempotencyKey: normalizedIdempKey, userEmail });
-      // 查询原始记录
       const existingRes = await db.query(
         `SELECT au.charged_fen, ub.balance_fen
            FROM api_usage au
@@ -906,6 +1013,15 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       });
     }
 
+    // FIX-5.7-6: 防御性检查，非幂等路径下 RETURNING 应始终有一行
+    const usageId = usageRes.rows[0]?.id;
+    if (!usageId) {
+      // 理论上不应发生，记录错误并回滚
+      logger.error('api_usage INSERT returned no rows (non-idempotent path)', { userEmail, modelName });
+      await safeRollback(client, '/billing/record no usage id');
+      return res.status(500).json({ success: false, msg: '服务器内部错误' });
+    }
+
     await client.query(
       `INSERT INTO billing_transactions
            (user_email, type, amount_fen, balance_after_fen, description, ref_id)
@@ -915,7 +1031,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         chargedFen,
         newBalance,
         `${modelName}（输入 ${inputTokens} Token / 输出 ${outputTokens} Token）`,
-        String(usageRes.rows[0].id),
+        String(usageId),
       ]
     );
 
@@ -925,7 +1041,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await safeRollback(client, '/billing/record unhandled error');
     logger.error('Billing record error', { err: err.message, userEmail });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
@@ -1037,7 +1153,6 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   const updates = [];
   const values  = [];
 
-  // 本次请求的有效 is_free 值
   const effectiveIsFree = (typeof isFree === 'boolean') ? isFree : currentModel.is_free;
 
   if (typeof isFree === 'boolean') {
@@ -1051,7 +1166,6 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     }
   }
 
-  // v5.5 FIX-5.5-1: 允许付费模型传入 priceInput=0
   if (!effectiveIsFree && typeof priceInput === 'number') {
     if (!Number.isFinite(priceInput) || priceInput < 0) {
       return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
@@ -1126,6 +1240,66 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   }
 });
 
+// ─── 管理员：Provider 配置管理 ────────────────────────────────
+// FIX-5.7-4: 新增端点，通过 admin API 管理 provider base URL，
+// 实现"数据库统一调用"——无需修改 .env 文件即可更新 provider 配置。
+
+app.get('/admin/providers', adminLimiter, requireAdmin, async (_req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, provider_name, display_name, base_url, is_enabled, description, created_at, updated_at
+         FROM api_providers ORDER BY provider_name`
+    ).catch((err) => {
+      if (err.code === '42P01') {
+        return { rows: [] };
+      }
+      throw err;
+    });
+    res.json({ success: true, providers: result.rows });
+  } catch (err) {
+    logger.error('Admin providers query error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
+  const { providerName, displayName, baseUrl, isEnabled, description } = req.body ?? {};
+
+  if (!providerName || !displayName || !baseUrl) {
+    return res.status(400).json({ success: false, msg: '缺少必填字段：providerName、displayName、baseUrl' });
+  }
+  if (typeof providerName !== 'string' || providerName.length > 32) {
+    return res.status(400).json({ success: false, msg: 'providerName 长度不能超过 32 字符' });
+  }
+  if (typeof baseUrl !== 'string' || baseUrl.length > 256) {
+    return res.status(400).json({ success: false, msg: 'baseUrl 长度不能超过 256 字符' });
+  }
+  if (!/^https?:\/\/.+/.test(baseUrl)) {
+    return res.status(400).json({ success: false, msg: 'baseUrl 必须以 http:// 或 https:// 开头' });
+  }
+
+  try {
+    const result = await db.query(
+      `INSERT INTO api_providers
+           (provider_name, display_name, base_url, is_enabled, description)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (provider_name) DO UPDATE SET
+           display_name = EXCLUDED.display_name,
+           base_url     = EXCLUDED.base_url,
+           is_enabled   = EXCLUDED.is_enabled,
+           description  = EXCLUDED.description
+         RETURNING *`,
+      [providerName, displayName, baseUrl, isEnabled !== false, description || null]
+    );
+    logger.info('Provider upserted', { providerName });
+    res.json({ success: true, provider: result.rows[0] });
+  } catch (err) {
+    logger.error('Provider upsert error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+// ─── 管理员：余额调整 ────────────────────────────────────────
 app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   let { userEmail, amount_fen, type, description } = req.body ?? {};
 
@@ -1181,7 +1355,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     logger.info('Admin balance adjusted', { userEmail, amount_fen, actualApplied, type });
     res.json({ success: true, balance_fen: newBalance, actual_applied_fen: actualApplied });
   } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
+    await safeRollback(client, '/admin/adjust error');
     logger.error('Admin adjust error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
@@ -1209,13 +1383,15 @@ const server = app.listen(PORT, HOST, () => {
   logger.info(`Webhook 服务已启动 http://${HOST}:${PORT}`);
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
-  } else if (ADMIN_TOKEN.length < 32) {
-    logger.warn('ADMIN_TOKEN 过短（< 32 字符），建议执行 openssl rand -hex 32 重新生成');
+  } else if (ADMIN_TOKEN.length < 64) {
+    // FIX-5.7-1: 正确阈值为 64（openssl rand -hex 32 = 32字节 = 64个十六进制字符）
+    logger.warn('ADMIN_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成（生成 64 字符的强令牌）');
   }
   if (!SERVICE_TOKEN) {
     logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口无内部服务鉴权（建议通过环境变量配置）');
-  } else if (SERVICE_TOKEN.length < 32) {
-    logger.warn('SERVICE_TOKEN 过短（< 32 字符），建议执行 openssl rand -hex 32 重新生成');
+  } else if (SERVICE_TOKEN.length < 64) {
+    // FIX-5.7-1: 正确阈值为 64
+    logger.warn('SERVICE_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   logger.info('运行时配置', {
     freeDailyLimit: getFreeDailyLimit(),
