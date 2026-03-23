@@ -544,6 +544,7 @@ npm install --omit=dev
 ```bash
 # 生成随机 ADMIN_TOKEN（32字节 = 64个十六进制字符）
 # 生成 SERVICE_TOKEN
+ADMIN_TOKEN_VAL="$(openssl rand -hex 32)"
 SERVICE_TOKEN_VAL="$(openssl rand -hex 32)"
 
 cat > /opt/ai/webhook/.env <<EOF
