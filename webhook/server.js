@@ -1,21 +1,19 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.3
+ * Anima 灵枢 · Webhook 服务 v5.4
  * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.3 相对于 v5.2）：
- *   #BUG-1  INCR_EXPIRE_LUA：新建 key 时 TTL=-2，旧逻辑只处理 TTL=-1，
- *           导致新 key 永远没有过期时间。修复：INCR 后若 new_c==1，
- *           表明是新创建的 key，立即执行 EXPIRE。
- *           同时将 early-return 分支也纳入 TTL 守护，彻底消除漏网场景。
- *   #BUG-7  与 BUG-1 配合：确保 early-return 路径不会绕过 TTL 守护。
- *   #BUG-8  /billing/record 同时警告旧版 outputChars 字段使用。
- *   #BUG-9  /billing/check 使用独立限速器（120次/分），避免正常 AI 对话
- *           预检被 readLimiter 的 20次/分 误限。
- */
-
-/**
- * 之前修复记录（v5.0 → v5.2）保留供溯源：
+ * 修复记录（v5.4 相对于 v5.3）：
+ *   #BUG-NEW-1  peekFreeDailyUsage / incrFreeDailyUsage 中的日期计算
+ *               原使用 new Date().toISOString().slice(0,10)（UTC），
+ *               导致北京时间 00:00–07:59 期间日期仍为前一天，
+ *               每日限额实际在 08:00 CST 而非 00:00 CST 重置。
+ *               修复：使用 sv-SE locale + Asia/Shanghai 时区获取本地日期。
+ *   #BUG-NEW-4  移除 package.json 中未使用的 tiktoken 依赖（server.js
+ *               从未 require tiktoken，token 计数由 OpenClaw 侧完成并
+ *               作为参数传入）。
+ *
+ * 历史修复记录（v5.0 → v5.3）保留供溯源：
  *   v5.1 #1  移除 /billing/check 的 requireServiceToken（公开只读接口）
  *   v5.1 #5  Redis Lua 脚本增加 TTL 守护（FIX-B）
  *   v5.1 #6  /billing/record 增加独立限速（600次/分）
@@ -26,6 +24,10 @@
  *   v5.2 FIX-C  calculateChargedFen inputTokens=0 但 partitionSum>0 时回退
  *   v5.2 FIX-D  免费模型 DB 插入失败时尝试 Redis DECR 回滚
  *   v5.2 FIX-E  PUT /admin/models/:id 先查 DB is_free 再验证价格字段
+ *   v5.3 #BUG-1  INCR_EXPIRE_LUA：新建 key 时 TTL=-2，修复 TTL 丢失
+ *   v5.3 #BUG-7  确保 early-return 路径不绕过 TTL 守护
+ *   v5.3 #BUG-8  /billing/record 同时警告旧版 outputChars 字段使用
+ *   v5.3 #BUG-9  /billing/check 使用独立限速器（120次/分）
  */
 
 const crypto    = require('crypto');
@@ -85,33 +87,25 @@ redis.connect().catch((err) => logger.warn('Redis connect error (free daily limi
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // ─────────────────────────────────────────────────────────────
-// BUG-1 修复：完整的 INCR+EXPIRE Lua 脚本
+// BUG-1 / BUG-7 修复：完整的 INCR+EXPIRE Lua 脚本
 // ─────────────────────────────────────────────────────────────
-// 问题：原脚本 TTL 守护只检查 ttl==-1（key 存在但无 TTL）。
-// 当 key 不存在时 TTL==-2，守护不生效，INCR 创建的新 key 没有过期时间，
-// 导致计数器永不过期，用户首次使用免费模型后该 key 会永久存在。
-//
-// 修复方案：
-//   1. 先执行 TTL 守护（修复 ttl==-1 的已有 key）
-//   2. early-return 分支（超限）直接返回前也通过步骤1保证 TTL
-//   3. INCR 后检查 new_c==1：若为1表明是新创建的 key，立即设置 TTL
-//
-// 保证所有路径下的 key 都有 TTL，彻底消除计数器永不过期问题。
+// 1. TTL 守护（步骤1）：修复 ttl==-1 已有 key 丢失 TTL 的情况
+// 2. early-return（步骤2a）：超限时直接返回，步骤1已保证 TTL
+// 3. 新 key 处理（步骤3a）：INCR 后 new_c==1 则立即设置 TTL
 // ─────────────────────────────────────────────────────────────
 const INCR_EXPIRE_LUA =
   'local key = KEYS[1]\n' +
   'local limit = tonumber(ARGV[1])\n' +
-  // 步骤1：TTL 守护 —— 修复已有 key 丢失 TTL 的情况（如 PERSIST 命令或故障恢复）
-  // 注：ttl==-2 表示 key 不存在，此时 EXPIRE 无效但 INCR 后新 key 由步骤3处理
+  // 步骤1：TTL 守护 —— 修复已有 key 丢失 TTL 的情况
   'local ttl = redis.call("TTL", key)\n' +
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
-  // 步骤2：读当前值（GET 对不存在的 key 返回 nil，or "0" 保证 tonumber 成功）
+  // 步骤2：读当前值
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
-  // 步骤2a：已超限 —— 不递增，直接返回当前值，防止计数器无限增长
+  // 步骤2a：已超限 —— 不递增，直接返回，防止计数器无限增长
   'if c > limit then return c end\n' +
   // 步骤3：递增
   'local new_c = redis.call("INCR", key)\n' +
-  // 步骤3a：BUG-1 核心修复 —— new_c==1 表明 key 是刚被 INCR 新创建的，立即设置 TTL
+  // 步骤3a：BUG-1 核心修复 —— 新 key 立即设置 TTL
   'if new_c == 1 then redis.call("EXPIRE", key, 86400) end\n' +
   'return new_c';
 
@@ -143,6 +137,21 @@ function getUsdToCnyRate() {
   return v;
 }
 
+// ─────────────────────────────────────────────────────────────
+// BUG-NEW-1 修复：使用上海时区获取本地日期，确保每日限额在
+// 北京时间 00:00 准时重置，而非 UTC 00:00（即 CST 08:00）。
+//
+// 原写法：new Date().toISOString().slice(0, 10)  → UTC 日期
+// 修复后：使用 sv-SE locale + Asia/Shanghai 时区  → CST 日期
+//
+// 示例：北京时间 2024-01-15 01:00
+//   原写法返回 "2024-01-14"（前一天 UTC 日期，错误）
+//   修复后返回 "2024-01-15"（正确的北京日期）
+// ─────────────────────────────────────────────────────────────
+function getShanghaiDate() {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
+}
+
 /**
  * 查询免费用户当日已使用次数（只读，不递增）。
  */
@@ -152,7 +161,7 @@ async function peekFreeDailyUsage(userEmail) {
     if (redis.status !== 'ready') {
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
     }
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getShanghaiDate(); // BUG-NEW-1 修复：使用上海时区
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = parseInt(await redis.get(key) || '0', 10);
     return { allowed: count < FREE_DAILY_LIMIT, used: Math.min(count, FREE_DAILY_LIMIT), limit: FREE_DAILY_LIMIT };
@@ -172,7 +181,7 @@ async function incrFreeDailyUsage(userEmail) {
     if (redis.status !== 'ready') {
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
     }
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getShanghaiDate(); // BUG-NEW-1 修复：使用上海时区
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = await redis.eval(INCR_EXPIRE_LUA, 1, key, FREE_DAILY_LIMIT);
     return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT, key };
@@ -242,10 +251,9 @@ const readLimiter = rateLimit({
   message: { success: false, msg: '查询过于频繁，请稍后再试' },
 });
 
-// BUG-9 修复：/billing/check 使用独立限速器
-// 原因：/billing/check 是每次 AI 对话前的预检，正常使用场景下
-// 每分钟可能调用数十次（用户连续对话），readLimiter 的 20次/分
-// 会误限合法用户。设为 120次/分（2次/秒），足够应对正常对话。
+// BUG-9 修复：/billing/check 使用独立限速器（120次/分）
+// 原因：每次 AI 对话前的预检，正常使用每分钟可能数十次，
+// readLimiter 的 20次/分 会误限合法用户。
 const billingCheckLimiter = rateLimit({
   windowMs: 60_000,
   max:      120,
