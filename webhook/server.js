@@ -1,31 +1,42 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.8
+ * Anima 灵枢 · Webhook 服务 v5.9
  * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.8 相对于 v5.7）：
+ * 修复记录（v5.9 相对于 v5.8）：
  *
- *   #FIX-5.8-1  BUG-1 admin/adjust 零金额崩溃修复
- *               余额为 0 时执行扣减：actualApplied = GREATEST(0,0-N) - 0 = 0。
- *               旧代码将 0 插入 billing_transactions.amount_fen，
- *               违反 CHECK(amount_fen != 0) 约束，抛出 DB 错误返回 500。
- *               修复：actualApplied === 0 时跳过流水 INSERT，
- *               在响应中携带 note 字段说明原因。
+ *   #FIX-5.9-1  /health 端点新增 Redis 连通状态字段
+ *               原实现仅检查 DB，Redis 断连时运维无法通过健康检查感知。
+ *               修复：检查 redis.status 并执行 PING；Redis 不可用时
+ *               返回 redis:'disconnected' 但 HTTP 仍为 200（服务可降级运行）；
+ *               DB 故障仍返回 HTTP 503。
  *
- *   #FIX-5.8-2  BUG-2 幂等键预检 is_free 硬编码错误
- *               旧代码预检命中时始终返回 is_free: false，
- *               免费模型重试会被前端误判为付费模型。
- *               修复：预检 SQL 增加 au.is_free 字段，
- *               响应使用真实的 existRec.is_free 值。
+ *   #FIX-5.9-2  模型查询内存缓存（60s TTL）
+ *               /billing/check 在高频场景下每次都查 DB，
+ *               在并发 AI 调用时产生大量 SELECT。
+ *               修复：引入 modelCache Map，read-only 路径使用
+ *               lookupModelCached()；管理员更新/创建模型时自动清除对应缓存。
+ *               事务路径（billing/record）仍使用 lookupModelInTx FOR SHARE。
  *
- *   #FIX-5.8-3  BUG-3 免费模型不存储幂等键
- *               网络重试时 daily 计数器被重复递增，
- *               用户免费次数被提前耗尽。
- *               修复：免费模型 INSERT 加入 idempotency_key 列，
- *               ON CONFLICT DO NOTHING 处理并发重试；
- *               并发冲突时回滚日计数器后返回幂等结果。
+ *   #FIX-5.9-3  IDEMPOTENCY_KEY_RE 字符类修正
+ *               原: /^[a-zA-Z0-9\-:_]+$/ — 转义多余
+ *               修: /^[a-zA-Z0-9:_-]+$/ — 连字符置末尾，语义清晰
  *
- * 历史修复记录（v5.0 → v5.7）见内嵌注释。
+ *   #FIX-5.9-4  POST /admin/providers 新增 description 长度校验
+ *               原实现缺少此校验，超长字符串将被数据库 TEXT 类型接受
+ *               但可能导致日志和响应体异常膨胀。
+ *               修复：限制 description ≤ 500 字符（与 admin/models 一致）。
+ *
+ *   #FIX-5.9-5  新增 PUT /admin/providers/:id 端点
+ *               原实现只有 POST（upsert），无法按 ID 精确更新单个字段。
+ *               修复：添加完整的 PUT 端点，支持 displayName/baseUrl/
+ *               isEnabled/description 的按需更新。
+ *
+ *   #FIX-5.9-6  POST /admin/models 及 PUT /admin/models/:id 清除模型缓存
+ *               原实现未在管理员操作后清除 modelCache，导致旧价格在
+ *               缓存 TTL 内继续被 /billing/check 使用。
+ *
+ * 历史修复记录（v5.0 → v5.8）见下方内嵌注释。
  */
 
 const crypto    = require('crypto');
@@ -63,10 +74,10 @@ const db = new Pool({
   database: process.env.PG_DATABASE || 'librechat',
   ssl:      { rejectUnauthorized: true },
   max:      parseInt(process.env.PG_POOL_MAX || '15', 10),
-  idleTimeoutMillis:   30_000,
-  connectionTimeoutMillis: 5_000,
-  statement_timeout:  10_000,
-  keepAlive:          true,
+  idleTimeoutMillis:           30_000,
+  connectionTimeoutMillis:      5_000,
+  statement_timeout:           10_000,
+  keepAlive:                    true,
   keepAliveInitialDelayMillis: 10_000,
 });
 
@@ -81,7 +92,9 @@ const redis = new Redis(REDIS_URL, {
   },
   lazyConnect: true,
 });
-redis.connect().catch((err) => logger.warn('Redis connect error (free daily limits disabled)', { err: err.message }));
+redis.connect().catch((err) =>
+  logger.warn('Redis connect error (free daily limits disabled)', { err: err.message })
+);
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // ─────────────────────────────────────────────────────────────
@@ -91,12 +104,35 @@ const INCR_EXPIRE_LUA =
   'local key = KEYS[1]\n' +
   'local limit = tonumber(ARGV[1])\n' +
   'local ttl = redis.call("TTL", key)\n' +
+  // 若 key 存在但无 TTL（edge case），补设 24h 防止永久有效
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
+  // 已超限：不再递增，直接返回当前计数
   'if c > limit then return c end\n' +
   'local new_c = redis.call("INCR", key)\n' +
+  // 首次写入：设置 24h TTL（北京时间每日 00:00 通过 key 日期前缀自然重置）
   'if new_c == 1 then redis.call("EXPIRE", key, 86400) end\n' +
   'return new_c';
+
+// ─── 模型内存缓存（FIX-5.9-2）────────────────────────────────
+// 仅用于只读路径（/billing/check、/models）；事务路径不用此缓存
+const MODEL_CACHE_TTL_MS = 60_000; // 60 秒
+const modelCache = new Map();
+
+function modelCacheGet(modelName) {
+  const entry = modelCache.get(modelName);
+  if (!entry) return null;
+  if (Date.now() >= entry.exp) { modelCache.delete(modelName); return null; }
+  return entry.data;
+}
+
+function modelCacheSet(modelName, data) {
+  modelCache.set(modelName, { data, exp: Date.now() + MODEL_CACHE_TTL_MS });
+}
+
+function modelCacheDelete(modelName) {
+  modelCache.delete(modelName);
+}
 
 // ─── 运行时读取配置（热更新无需重启）──────────────────────────
 function getFreeDailyLimit() {
@@ -140,7 +176,11 @@ async function peekFreeDailyUsage(userEmail) {
     const today = getShanghaiDate();
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = parseInt(await redis.get(key) || '0', 10);
-    return { allowed: count < FREE_DAILY_LIMIT, used: Math.min(count, FREE_DAILY_LIMIT), limit: FREE_DAILY_LIMIT };
+    return {
+      allowed: count < FREE_DAILY_LIMIT,
+      used:    Math.min(count, FREE_DAILY_LIMIT),
+      limit:   FREE_DAILY_LIMIT,
+    };
   } catch (err) {
     logger.warn('Redis daily peek failed, allowing request', { err: err.message });
     return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
@@ -151,7 +191,7 @@ async function incrFreeDailyUsage(userEmail) {
   const FREE_DAILY_LIMIT = getFreeDailyLimit();
   try {
     if (redis.status !== 'ready') {
-      logger.warn('Redis unavailable: free daily limit NOT enforced for request', { userEmail });
+      logger.warn('Redis unavailable: free daily limit NOT enforced', { userEmail });
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
     }
     const today = getShanghaiDate();
@@ -248,7 +288,7 @@ const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 function safeCompare(a, b) {
   const aBuf = Buffer.from(typeof a === 'string' ? a : '');
   const bBuf = Buffer.from(typeof b === 'string' ? b : '');
-  const len = Math.max(aBuf.length, bBuf.length);
+  const len  = Math.max(aBuf.length, bBuf.length);
   const paddedA = Buffer.concat([aBuf, Buffer.alloc(len - aBuf.length)]);
   const paddedB = Buffer.concat([bBuf, Buffer.alloc(len - bBuf.length)]);
   const equal = crypto.timingSafeEqual(paddedA, paddedB);
@@ -259,7 +299,7 @@ function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
     return res.status(503).json({ success: false, msg: '管理员接口未启用（未设置 ADMIN_TOKEN）' });
   }
-  const auth = req.headers['authorization'] || '';
+  const auth  = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   if (!safeCompare(token, ADMIN_TOKEN)) {
     logger.warn('Admin auth failed', { ip: req.ip, path: req.path });
@@ -284,7 +324,8 @@ function requireServiceToken(req, res, next) {
 // ─── 工具函数 ─────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL_LEN = 254;
-const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9\-:_]+$/;
+// FIX-5.9-3: 连字符置末尾，语义清晰，避免与范围操作符混淆
+const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
 
 function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
@@ -297,7 +338,13 @@ function normalizeEmail(email) {
 const MAX_TOKEN_VALUE = 10_000_000;
 
 function parseOptionalNonNegInt(value) {
-  if (typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0 && value <= MAX_TOKEN_VALUE) {
+  if (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= MAX_TOKEN_VALUE
+  ) {
     return value;
   }
   return undefined;
@@ -312,7 +359,7 @@ async function ensureUser(client, userEmail) {
 }
 
 /**
- * 在连接池（非事务）中查找模型，用于只读路径（/billing/check, /models）。
+ * 只读模型查询（不带缓存），用于直接 DB 访问。
  */
 async function lookupModel(modelName) {
   const res = await db.query(
@@ -325,7 +372,21 @@ async function lookupModel(modelName) {
 }
 
 /**
- * 在事务中查找模型并加 FOR SHARE 锁，防止 TOCTOU 竞态。
+ * 只读模型查询（带 60s 内存缓存）。
+ * 用于 /billing/check 等高频只读路径，减少 DB 压力。
+ * 管理员更新/创建模型后会自动清除对应缓存（FIX-5.9-2）。
+ */
+async function lookupModelCached(modelName) {
+  const cached = modelCacheGet(modelName);
+  if (cached !== null) return cached;
+  const model = await lookupModel(modelName);
+  if (model) modelCacheSet(modelName, model);
+  return model;
+}
+
+/**
+ * 事务内模型查询（FOR SHARE 锁），防止 TOCTOU 竞态。
+ * 用于 /billing/record 等写路径，确保读到最新数据。
  */
 async function lookupModelInTx(client, modelName) {
   const res = await client.query(
@@ -340,7 +401,7 @@ async function lookupModelInTx(client, modelName) {
 
 // ─── 缓存感知分层计费 ─────────────────────────────────────────
 const CACHE_THRESHOLD_TOKENS = 2000;
-const CACHE_DISCOUNT = 0.1;
+const CACHE_DISCOUNT         = 0.1;
 
 function calculateChargedFen({
   inputTokens, outputTokens, priceIn, priceOut, currency,
@@ -400,15 +461,38 @@ async function safeRollback(client, context) {
 // ─── 路由 ────────────────────────────────────────────────────
 // =============================================================
 
-// ─── 健康检查 ──────────────────────────────────────────────
+// ─── 健康检查（FIX-5.9-1: 新增 Redis 状态）───────────────────
 app.get('/health', async (_req, res) => {
+  const status  = { db: 'ok', redis: 'ok', ts: new Date().toISOString() };
+  let httpStatus = 200;
+
+  // DB 检查（必须健康，否则 HTTP 503）
   try {
     await db.query('SELECT 1');
-    res.json({ status: 'ok', db: 'ok', ts: new Date().toISOString() });
   } catch (err) {
     logger.error('Health check DB error', { err: err.message });
-    res.status(503).json({ status: 'degraded', db: 'error' });
+    status.db = 'error';
+    httpStatus = 503;
   }
+
+  // Redis 检查（降级运行不影响 HTTP 状态码，但运维需感知）
+  try {
+    if (redis.status === 'ready') {
+      await redis.ping();
+      status.redis = 'ok';
+    } else {
+      // 连接中断或重连中——服务可降级运行（免费限额暂不生效）
+      status.redis = 'disconnected';
+    }
+  } catch (err) {
+    status.redis = 'error';
+    logger.warn('Health check Redis error', { err: err.message });
+  }
+
+  res.status(httpStatus).json({
+    status: httpStatus === 200 ? 'ok' : 'degraded',
+    ...status,
+  });
 });
 
 // ─── 模型列表（公开）──────────────────────────────────────
@@ -441,6 +525,7 @@ app.get('/providers', readLimiter, async (_req, res) => {
         ORDER BY provider_name`
     ).catch((err) => {
       if (err.code === '42P01') {
+        // 表不存在（旧 schema），返回空列表兼容旧环境
         logger.warn('api_providers 表不存在，请执行 db/schema.sql 升级');
         return { rows: [] };
       }
@@ -552,10 +637,10 @@ app.get('/billing/balance/:email', readLimiter, async (req, res) => {
     }
     const r = result.rows[0];
     res.json({
-      success:          true,
-      balance_fen:      Number(r.balance_fen),
+      success:           true,
+      balance_fen:       Number(r.balance_fen),
       total_charged_fen: Number(r.total_charged_fen),
-      is_suspended:     r.is_suspended,
+      is_suspended:      r.is_suspended,
     });
   } catch (err) {
     logger.error('Balance query error', { err: err.message, email });
@@ -570,8 +655,8 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
 
-  const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20,  1), 100);
-  const offset = Math.max(parseInt(req.query.offset || '0',  10) || 0, 0);
+  const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20, 1), 100);
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
 
   try {
     const [result, countRes] = await Promise.all([
@@ -597,9 +682,12 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
 
 // ─── 余额预检（只读，无需服务鉴权）──────────────────────────
 app.post('/billing/check', billingCheckLimiter, async (req, res) => {
-  let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
-          estimatedInputChars, estimatedOutputChars,
-          estimatedPromptTokens, estimatedHistoryTokens } = req.body ?? {};
+  let {
+    userEmail, modelName,
+    estimatedInputTokens, estimatedOutputTokens,
+    estimatedInputChars, estimatedOutputChars,
+    estimatedPromptTokens, estimatedHistoryTokens,
+  } = req.body ?? {};
 
   userEmail = normalizeEmail(userEmail || '');
   if (!isValidEmail(userEmail)) {
@@ -612,9 +700,10 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
 
+  // FIX-5.9-2: 使用带缓存的查询（60s TTL），减少高频场景 DB 压力
   let model;
   try {
-    model = await lookupModel(modelName);
+    model = await lookupModelCached(modelName);
   } catch (err) {
     logger.error('Model lookup error in /billing/check', { err: err.message, modelName });
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -646,11 +735,11 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   const inTokens  = Math.max(0, parseInt(estimatedInputTokens  ?? estimatedInputChars  ?? '0', 10) || 0);
   const outTokens = Math.max(0, parseInt(estimatedOutputTokens ?? estimatedOutputChars ?? '0', 10) || 0);
   if (inTokens > MAX_TOKEN_VALUE || outTokens > MAX_TOKEN_VALUE) {
-    return res.status(400).json({ success: false, msg: 'estimatedInputTokens/estimatedOutputTokens 单次上限为 10,000,000' });
+    return res.status(400).json({ success: false, msg: 'estimatedInputTokens/outputTokens 单次上限为 10,000,000' });
   }
+
   const priceIn  = Number(model.price_input_per_1k_tokens);
   const priceOut = Number(model.price_output_per_1k_tokens);
-
   const promptTk  = parseOptionalNonNegInt(estimatedPromptTokens);
   const historyTk = parseOptionalNonNegInt(estimatedHistoryTokens);
 
@@ -666,7 +755,7 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   if (estimatedFen > MAX_SINGLE_REQUEST_FEN) {
     return res.status(402).json({
       success:  false,
-      msg:      'Single request cost exceeds safety limit. Please start a new thread or reduce context.',
+      msg:      '预估费用超过单次安全上限，请新建对话或减少上下文。',
       estimated_fen: estimatedFen,
       limit_fen:     MAX_SINGLE_REQUEST_FEN,
     });
@@ -705,6 +794,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     idempotencyKey,
   } = req.body ?? {};
 
+  // 向后兼容旧版 inputChars/outputChars 字段名
   const inputTokens  = rawInputTokens  ?? inputChars  ?? 0;
   const outputTokens = rawOutputTokens ?? outputChars ?? 0;
 
@@ -715,6 +805,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     logger.warn('billing/record: 调用方使用旧版 outputChars 字段，请迁移到 outputTokens', { userEmail, modelName });
   }
 
+  // ── 参数校验 ──────────────────────────────────────────────
   if (!userEmail || !apiProvider || !modelName) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
   }
@@ -728,13 +819,15 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   if (typeof modelName !== 'string' || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
-  if (typeof inputTokens !== 'number' || typeof outputTokens !== 'number'
-      || !Number.isFinite(inputTokens) || !Number.isFinite(outputTokens)
-      || !Number.isInteger(inputTokens) || !Number.isInteger(outputTokens)
-      || inputTokens < 0 || outputTokens < 0) {
+  if (
+    typeof inputTokens !== 'number' || typeof outputTokens !== 'number' ||
+    !Number.isFinite(inputTokens)   || !Number.isFinite(outputTokens) ||
+    !Number.isInteger(inputTokens)  || !Number.isInteger(outputTokens) ||
+    inputTokens < 0 || outputTokens < 0
+  ) {
     return res.status(400).json({ success: false, msg: 'inputTokens/outputTokens 必须为有限的非负整数' });
   }
-  if (inputTokens > 10_000_000 || outputTokens > 10_000_000) {
+  if (inputTokens > MAX_TOKEN_VALUE || outputTokens > MAX_TOKEN_VALUE) {
     return res.status(400).json({ success: false, msg: 'inputTokens/outputTokens 单次上限为 10,000,000' });
   }
 
@@ -747,7 +840,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     ) {
       return res.status(400).json({
         success: false,
-        msg: 'idempotencyKey 不合法：必须为 1-128 字符，仅允许字母、数字、-:_ 字符',
+        msg: 'idempotencyKey 不合法：必须为 1-128 字符，仅允许字母、数字、- : _ 字符',
       });
     }
   }
@@ -757,7 +850,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
   // ── 幂等键快速路径（事务外，减少锁争用）─────────────────
-  // FIX-5.8-2：预检查询增加 au.is_free 字段，响应使用真实值而非硬编码 false
+  // FIX-5.8-2: 预检查询包含 au.is_free，响应使用真实值
   if (normalizedIdempKey) {
     try {
       const idempRes = await db.query(
@@ -772,7 +865,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         const existRec = idempRes.rows[0];
         return res.json({
           success:     true,
-          // FIX-5.8-2：使用数据库真实值，不再硬编码 false
           is_free:     existRec.is_free,
           charged_fen: existRec.is_free ? 0 : Number(existRec.charged_fen),
           balance_fen: existRec.balance_fen !== null ? Number(existRec.balance_fen) : 0,
@@ -788,6 +880,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   try {
     await client.query('BEGIN');
 
+    // 事务内使用 FOR SHARE 锁，防止并发 TOCTOU
     const model = await lookupModelInTx(client, modelName);
 
     if (!model) {
@@ -818,8 +911,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       }
 
       try {
-        // FIX-5.8-3：免费模型 INSERT 加入 idempotency_key 列 + ON CONFLICT DO NOTHING
-        // 防止网络重试时重复递增日计数器
+        // FIX-5.8-3: 免费模型 INSERT 含幂等键 + ON CONFLICT DO NOTHING
         const freeInsertRes = await client.query(
           `INSERT INTO api_usage
                (user_email, api_model_id, api_provider, model_name,
@@ -832,17 +924,16 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
           [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens, normalizedIdempKey]
         );
 
-        // FIX-5.8-3：并发幂等冲突（另一个请求已提交相同 key）
+        // 并发幂等冲突：另一请求已提交相同 key，本次 INSERT 被忽略
         if (freeInsertRes.rows.length === 0 && normalizedIdempKey) {
           await safeRollback(client, '/billing/record free concurrent idempotent');
-          // 回滚 Redis 日计数器（本次递增是多余的）
           await tryDecrFreeDailyUsage(dailyCheck.key);
           return res.json({
-            success:    true,
-            is_free:    true,
+            success:     true,
+            is_free:     true,
             charged_fen: 0,
             balance_fen: 0,
-            idempotent: true,
+            idempotent:  true,
             daily_used:  Math.max(0, dailyCheck.used - 1),
             daily_limit: dailyCheck.limit,
           });
@@ -892,8 +983,8 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     if (chargedFen > MAX_SINGLE_REQUEST_FEN) {
       await safeRollback(client, '/billing/record over safety limit');
       return res.status(402).json({
-        success:  false,
-        msg:      'Single request cost exceeds safety limit. Please start a new thread or reduce context.',
+        success:     false,
+        msg:         '单次请求费用超过安全上限，请新建对话或减少上下文。',
         charged_fen: chargedFen,
         limit_fen:   MAX_SINGLE_REQUEST_FEN,
       });
@@ -931,6 +1022,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens, chargedFen, normalizedIdempKey]
     );
 
+    // 并发幂等冲突（付费模型）：回滚已扣费的事务，返回已有记录
     if (usageRes.rows.length === 0 && normalizedIdempKey) {
       await safeRollback(client, '/billing/record idempotency conflict');
       logger.info('Idempotent billing record (conflict resolution)', { idempotencyKey: normalizedIdempKey, userEmail });
@@ -985,7 +1077,11 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   }
 });
 
+// =============================================================
 // ─── 管理员接口 ───────────────────────────────────────────────
+// =============================================================
+
+// ── 模型管理 ─────────────────────────────────────────────────
 
 app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
   try {
@@ -1004,7 +1100,8 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
 });
 
 app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
-  const { provider, modelName, displayName, isFree, priceInput, priceOutput, currency, supportsCache, description } = req.body ?? {};
+  const { provider, modelName, displayName, isFree, priceInput, priceOutput,
+          currency, supportsCache, description } = req.body ?? {};
 
   if (!provider || !modelName || !displayName) {
     return res.status(400).json({ success: false, msg: '缺少必填字段：provider、modelName、displayName' });
@@ -1021,12 +1118,18 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof isFree !== 'boolean') {
     return res.status(400).json({ success: false, msg: 'isFree 必须为布尔值' });
   }
-  if (!isFree && (typeof priceInput !== 'number' || typeof priceOutput !== 'number'
-        || !Number.isFinite(priceInput) || !Number.isFinite(priceOutput))) {
-    return res.status(400).json({ success: false, msg: '付费模型必须提供有限数值的 priceInput 和 priceOutput' });
-  }
-  if (!isFree && (priceInput < 0 || priceOutput < 0)) {
-    return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
+  if (!isFree) {
+    if (typeof priceInput !== 'number' || typeof priceOutput !== 'number' ||
+        !Number.isFinite(priceInput) || !Number.isFinite(priceOutput)) {
+      return res.status(400).json({ success: false, msg: '付费模型必须提供有限数值的 priceInput 和 priceOutput' });
+    }
+    if (priceInput < 0 || priceOutput < 0) {
+      return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
+    }
+    // 单价上限：100 元/千 Token 已远超任何现实 API 定价
+    if (priceInput > 100 || priceOutput > 100) {
+      return res.status(400).json({ success: false, msg: 'priceInput/priceOutput 不得超过 100（元/千 Token）' });
+    }
   }
   const currencyVal = currency ?? 'CNY';
   if (!['USD', 'CNY'].includes(currencyVal)) {
@@ -1043,20 +1146,25 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
             price_input_per_1k_tokens, price_output_per_1k_tokens, currency, supports_cache, description)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (model_name) DO UPDATE SET
-           provider    = EXCLUDED.provider,
+           provider     = EXCLUDED.provider,
            display_name = EXCLUDED.display_name,
-           is_free     = EXCLUDED.is_free,
+           is_free      = EXCLUDED.is_free,
            price_input_per_1k_tokens  = EXCLUDED.price_input_per_1k_tokens,
            price_output_per_1k_tokens = EXCLUDED.price_output_per_1k_tokens,
-           currency    = EXCLUDED.currency,
+           currency     = EXCLUDED.currency,
            supports_cache = EXCLUDED.supports_cache,
-           description = EXCLUDED.description,
-           is_active   = true
+           description  = EXCLUDED.description,
+           is_active    = true
          RETURNING id, provider, model_name, display_name, is_free,
                    price_input_per_1k_tokens, price_output_per_1k_tokens,
                    currency, supports_cache, is_active`,
-      [provider, modelName, displayName, isFree, isFree ? 0 : priceInput, isFree ? 0 : priceOutput, currencyVal, !!supportsCache, description || null]
+      [provider, modelName, displayName, isFree,
+       isFree ? 0 : priceInput, isFree ? 0 : priceOutput,
+       currencyVal, !!supportsCache, description || null]
     );
+
+    // FIX-5.9-6: 清除模型缓存，确保 /billing/check 立即读到新价格
+    modelCacheDelete(modelName);
 
     logger.info('Model upserted', { modelName, isFree });
     res.json({ success: true, model: result.rows[0] });
@@ -1074,7 +1182,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
 
   let currentModel;
   try {
-    const cur = await db.query('SELECT is_free FROM api_models WHERE id=$1', [id]);
+    const cur = await db.query('SELECT is_free, model_name FROM api_models WHERE id=$1', [id]);
     if (cur.rows.length === 0) {
       return res.status(404).json({ success: false, msg: '模型不存在' });
     }
@@ -1084,7 +1192,8 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 
-  const { isFree, priceInput, priceOutput, currency, isActive, supportsCache, displayName, description } = req.body ?? {};
+  const { isFree, priceInput, priceOutput, currency, isActive,
+          supportsCache, displayName, description } = req.body ?? {};
   const updates = [];
   const values  = [];
 
@@ -1105,6 +1214,9 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     if (!Number.isFinite(priceInput) || priceInput < 0) {
       return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
     }
+    if (priceInput > 100) {
+      return res.status(400).json({ success: false, msg: 'priceInput 不得超过 100（元/千 Token）' });
+    }
     updates.push(`price_input_per_1k_tokens = $${values.length + 1}`);
     values.push(priceInput);
   } else if (effectiveIsFree && typeof priceInput === 'number' && priceInput !== 0) {
@@ -1114,6 +1226,9 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   if (!effectiveIsFree && typeof priceOutput === 'number') {
     if (!Number.isFinite(priceOutput) || priceOutput < 0) {
       return res.status(400).json({ success: false, msg: 'priceOutput 必须为有限的非负数' });
+    }
+    if (priceOutput > 100) {
+      return res.status(400).json({ success: false, msg: 'priceOutput 不得超过 100（元/千 Token）' });
     }
     updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
     values.push(priceOutput);
@@ -1167,7 +1282,11 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, msg: '模型不存在' });
     }
-    logger.info('Model updated', { id, updates: req.body });
+
+    // FIX-5.9-6: 清除模型缓存
+    modelCacheDelete(currentModel.model_name);
+
+    logger.info('Model updated', { id, modelName: currentModel.model_name, updates: req.body });
     res.json({ success: true, model: result.rows[0] });
   } catch (err) {
     logger.error('Model update error', { err: err.message });
@@ -1175,16 +1294,16 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   }
 });
 
-// ─── 管理员：Provider 配置管理 ────────────────────────────────
+// ── Provider 配置管理 ─────────────────────────────────────────
+
 app.get('/admin/providers', adminLimiter, requireAdmin, async (_req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, provider_name, display_name, base_url, is_enabled, description, created_at, updated_at
+      `SELECT id, provider_name, display_name, base_url, is_enabled,
+              description, created_at, updated_at
          FROM api_providers ORDER BY provider_name`
     ).catch((err) => {
-      if (err.code === '42P01') {
-        return { rows: [] };
-      }
+      if (err.code === '42P01') { return { rows: [] }; }
       throw err;
     });
     res.json({ success: true, providers: result.rows });
@@ -1203,11 +1322,18 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof providerName !== 'string' || providerName.length > 32) {
     return res.status(400).json({ success: false, msg: 'providerName 长度不能超过 32 字符' });
   }
+  if (typeof displayName !== 'string' || displayName.length > 64) {
+    return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 64 字符' });
+  }
   if (typeof baseUrl !== 'string' || baseUrl.length > 256) {
     return res.status(400).json({ success: false, msg: 'baseUrl 长度不能超过 256 字符' });
   }
   if (!/^https?:\/\/.+/.test(baseUrl)) {
     return res.status(400).json({ success: false, msg: 'baseUrl 必须以 http:// 或 https:// 开头' });
+  }
+  // FIX-5.9-4: 新增 description 长度校验
+  if (description != null && (typeof description !== 'string' || description.length > 500)) {
+    return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
   }
 
   try {
@@ -1231,7 +1357,66 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
   }
 });
 
-// ─── 管理员：余额调整 ────────────────────────────────────────
+// FIX-5.9-5: 新增 PUT /admin/providers/:id 端点
+app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ success: false, msg: 'Provider ID 无效' });
+  }
+
+  const { displayName, baseUrl, isEnabled, description } = req.body ?? {};
+  const updates = [];
+  const values  = [];
+
+  if (typeof displayName === 'string') {
+    if (displayName.trim().length === 0 || displayName.length > 64) {
+      return res.status(400).json({ success: false, msg: 'displayName 不能为空且长度不超过 64 字符' });
+    }
+    updates.push(`display_name = $${values.length + 1}`);
+    values.push(displayName);
+  }
+  if (typeof baseUrl === 'string') {
+    if (baseUrl.length > 256 || !/^https?:\/\/.+/.test(baseUrl)) {
+      return res.status(400).json({ success: false, msg: 'baseUrl 格式不正确（长度 ≤ 256，必须以 http/https 开头）' });
+    }
+    updates.push(`base_url = $${values.length + 1}`);
+    values.push(baseUrl);
+  }
+  if (typeof isEnabled === 'boolean') {
+    updates.push(`is_enabled = $${values.length + 1}`);
+    values.push(isEnabled);
+  }
+  if (typeof description === 'string') {
+    if (description.length > 500) {
+      return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
+    }
+    updates.push(`description = $${values.length + 1}`);
+    values.push(description);
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ success: false, msg: '没有任何要更新的字段' });
+  }
+
+  values.push(id);
+  try {
+    const result = await db.query(
+      `UPDATE api_providers SET ${updates.join(', ')} WHERE id=$${values.length} RETURNING *`,
+      values
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, msg: 'Provider 不存在' });
+    }
+    logger.info('Provider updated', { id, updates: req.body });
+    res.json({ success: true, provider: result.rows[0] });
+  } catch (err) {
+    logger.error('Provider update error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+// ── 余额调整 ──────────────────────────────────────────────────
+
 app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   let { userEmail, amount_fen, type, description } = req.body ?? {};
 
@@ -1275,12 +1460,9 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     const newBalance    = Number(result.rows[0].balance_fen);
     const actualApplied = newBalance - oldBalance;
 
-    // FIX-5.8-1：actualApplied 为 0 时跳过流水 INSERT
-    // 场景：余额已为 0，执行扣减 → GREATEST(0, 0-N)=0 → actualApplied=0
-    // 旧代码将 0 插入 billing_transactions.amount_fen 违反 CHECK(amount_fen!=0)，
-    // 导致整个事务失败返回 500。
-    // 修复：仅在有实际变动时写流水；零变动时事务仍提交（balance_fen 不变），
-    // 通过响应 note 字段告知调用方。
+    // FIX-5.8-1: actualApplied 为 0 时跳过流水 INSERT
+    // 场景：余额为 0 时执行负数扣减 → GREATEST(0,0-N)=0 → 无实际变动
+    // 旧代码插入 amount_fen=0 会违反 CHECK(amount_fen != 0) 约束
     if (actualApplied !== 0) {
       await client.query(
         `INSERT INTO billing_transactions
@@ -1299,7 +1481,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
       balance_fen:        newBalance,
       actual_applied_fen: actualApplied,
     };
-    // 如果扣减被截断为 0（余额不足），携带提示信息
+    // 扣减被截断到 0 时附带说明（余额不足以完全扣减）
     if (actualApplied === 0 && amount_fen < 0) {
       response.note = `余额已为 0，扣减无效（请求扣减 ${Math.abs(amount_fen)} 分，实际扣减 0 分）`;
     }
@@ -1343,9 +1525,10 @@ const server = app.listen(PORT, HOST, () => {
     logger.warn('SERVICE_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   logger.info('运行时配置', {
-    freeDailyLimit: getFreeDailyLimit(),
+    freeDailyLimit:      getFreeDailyLimit(),
     maxSingleRequestFen: getMaxSingleRequestFen(),
-    usdToCnyRate: getUsdToCnyRate(),
+    usdToCnyRate:        getUsdToCnyRate(),
+    modelCacheTtlSec:    MODEL_CACHE_TTL_MS / 1000,
   });
 });
 
