@@ -1,19 +1,18 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.4
+ * Anima 灵枢 · Webhook 服务 v5.5
  * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.4 相对于 v5.3）：
- *   #BUG-NEW-1  peekFreeDailyUsage / incrFreeDailyUsage 中的日期计算
- *               原使用 new Date().toISOString().slice(0,10)（UTC），
- *               导致北京时间 00:00–07:59 期间日期仍为前一天，
- *               每日限额实际在 08:00 CST 而非 00:00 CST 重置。
- *               修复：使用 sv-SE locale + Asia/Shanghai 时区获取本地日期。
- *   #BUG-NEW-4  移除 package.json 中未使用的 tiktoken 依赖（server.js
- *               从未 require tiktoken，token 计数由 OpenClaw 侧完成并
- *               作为参数传入）。
+ * 修复记录（v5.5 相对于 v5.4）：
+ *   #FIX-5.5-1  PUT /admin/models/:id 允许免费模型传入 priceInput=0/priceOutput=0
+ *               原代码对任何数值都拒绝（包括 0），导致管理员无法显式确认价格为 0。
+ *               修复：仅拒绝非零值，允许传入 0（与免费模型语义一致）。
+ *   #FIX-5.5-2  calculateChargedFen 偏差阈值从 1% 放宽到 5%
+ *               tokenizer 实现差异（OpenClaw tiktoken vs API 实际）在长对话中
+ *               频繁触发 1% 阈值回退，导致缓存折扣失效，用户被多收费。
+ *               5% 阈值更符合实际 tokenizer 误差范围。
  *
- * 历史修复记录（v5.0 → v5.3）保留供溯源：
+ * 历史修复记录（v5.0 → v5.4）保留供溯源：
  *   v5.1 #1  移除 /billing/check 的 requireServiceToken（公开只读接口）
  *   v5.1 #5  Redis Lua 脚本增加 TTL 守护（FIX-B）
  *   v5.1 #6  /billing/record 增加独立限速（600次/分）
@@ -28,6 +27,8 @@
  *   v5.3 #BUG-7  确保 early-return 路径不绕过 TTL 守护
  *   v5.3 #BUG-8  /billing/record 同时警告旧版 outputChars 字段使用
  *   v5.3 #BUG-9  /billing/check 使用独立限速器（120次/分）
+ *   v5.4 #BUG-NEW-1  免费用户日期计算改用上海时区（原 UTC 导致 00:00-07:59 CST 限额不重置）
+ *   v5.4 #BUG-NEW-4  移除未使用的 tiktoken 依赖
  */
 
 const crypto    = require('crypto');
@@ -87,25 +88,26 @@ redis.connect().catch((err) => logger.warn('Redis connect error (free daily limi
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // ─────────────────────────────────────────────────────────────
-// BUG-1 / BUG-7 修复：完整的 INCR+EXPIRE Lua 脚本
-// ─────────────────────────────────────────────────────────────
-// 1. TTL 守护（步骤1）：修复 ttl==-1 已有 key 丢失 TTL 的情况
-// 2. early-return（步骤2a）：超限时直接返回，步骤1已保证 TTL
-// 3. 新 key 处理（步骤3a）：INCR 后 new_c==1 则立即设置 TTL
+// INCR+EXPIRE Lua 脚本（原子操作，防止计数器丢失 TTL）
+//
+// 加载顺序说明：
+//   步骤1：TTL 守护 —— 修复已有 key 丢失 TTL 的情况（ttl==-1）
+//   步骤2：读取当前值，超限时直接返回（不递增，防止计数器无限增长）
+//   步骤3：递增；若 new_c==1（新 key）立即设置 TTL
 // ─────────────────────────────────────────────────────────────
 const INCR_EXPIRE_LUA =
   'local key = KEYS[1]\n' +
   'local limit = tonumber(ARGV[1])\n' +
-  // 步骤1：TTL 守护 —— 修复已有 key 丢失 TTL 的情况
+  // 步骤1：TTL 守护
   'local ttl = redis.call("TTL", key)\n' +
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
   // 步骤2：读当前值
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
-  // 步骤2a：已超限 —— 不递增，直接返回，防止计数器无限增长
+  // 步骤2a：已超限 —— 不递增，直接返回
   'if c > limit then return c end\n' +
   // 步骤3：递增
   'local new_c = redis.call("INCR", key)\n' +
-  // 步骤3a：BUG-1 核心修复 —— 新 key 立即设置 TTL
+  // 步骤3a：新 key 立即设置 TTL
   'if new_c == 1 then redis.call("EXPIRE", key, 86400) end\n' +
   'return new_c';
 
@@ -138,15 +140,10 @@ function getUsdToCnyRate() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// BUG-NEW-1 修复：使用上海时区获取本地日期，确保每日限额在
-// 北京时间 00:00 准时重置，而非 UTC 00:00（即 CST 08:00）。
-//
-// 原写法：new Date().toISOString().slice(0, 10)  → UTC 日期
-// 修复后：使用 sv-SE locale + Asia/Shanghai 时区  → CST 日期
-//
-// 示例：北京时间 2024-01-15 01:00
-//   原写法返回 "2024-01-14"（前一天 UTC 日期，错误）
-//   修复后返回 "2024-01-15"（正确的北京日期）
+// 使用上海时区获取本地日期，确保每日限额在北京时间 00:00 准时重置。
+// sv-SE locale 输出 "YYYY-MM-DD HH:MM:SS"，.slice(0,10) 得到日期部分。
+// 原写法 new Date().toISOString().slice(0,10) 使用 UTC，导致
+// 北京时间 00:00-07:59 期间日期仍为前一天（8小时误差窗口）。
 // ─────────────────────────────────────────────────────────────
 function getShanghaiDate() {
   return new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 10);
@@ -154,6 +151,7 @@ function getShanghaiDate() {
 
 /**
  * 查询免费用户当日已使用次数（只读，不递增）。
+ * peek 使用严格小于（<），确保第 limit 次仍可通过 incr 成功。
  */
 async function peekFreeDailyUsage(userEmail) {
   const FREE_DAILY_LIMIT = getFreeDailyLimit();
@@ -161,9 +159,10 @@ async function peekFreeDailyUsage(userEmail) {
     if (redis.status !== 'ready') {
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
     }
-    const today = getShanghaiDate(); // BUG-NEW-1 修复：使用上海时区
+    const today = getShanghaiDate();
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = parseInt(await redis.get(key) || '0', 10);
+    // count < limit：第 limit 次（count=limit-1）仍允许，给 incr 留空间
     return { allowed: count < FREE_DAILY_LIMIT, used: Math.min(count, FREE_DAILY_LIMIT), limit: FREE_DAILY_LIMIT };
   } catch (err) {
     logger.warn('Redis daily peek failed, allowing request', { err: err.message });
@@ -181,9 +180,10 @@ async function incrFreeDailyUsage(userEmail) {
     if (redis.status !== 'ready') {
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
     }
-    const today = getShanghaiDate(); // BUG-NEW-1 修复：使用上海时区
+    const today = getShanghaiDate();
     const key = `anima:free_daily:${userEmail}:${today}`;
     const count = await redis.eval(INCR_EXPIRE_LUA, 1, key, FREE_DAILY_LIMIT);
+    // count <= limit：Lua INCR 后 count=limit 仍允许（第 limit 次合法调用）
     return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT, key };
   } catch (err) {
     logger.warn('Redis daily limit incr failed, allowing request', { err: err.message });
@@ -251,9 +251,9 @@ const readLimiter = rateLimit({
   message: { success: false, msg: '查询过于频繁，请稍后再试' },
 });
 
-// BUG-9 修复：/billing/check 使用独立限速器（120次/分）
-// 原因：每次 AI 对话前的预检，正常使用每分钟可能数十次，
-// readLimiter 的 20次/分 会误限合法用户。
+// /billing/check 独立限速器（120次/分）
+// 每次 AI 对话前的预检，正常使用每分钟可能数十次，
+// 不能与 readLimiter(20次/分) 共用，否则误限合法用户。
 const billingCheckLimiter = rateLimit({
   windowMs: 60_000,
   max:      120,
@@ -365,6 +365,11 @@ const CACHE_DISCOUNT = 0.1;
 
 /**
  * 计算本次请求的费用（分），支持缓存感知分层定价。
+ *
+ * 偏差阈值说明（v5.5 修复）：
+ *   从 1% 放宽到 5%，原因：不同 tokenizer 实现（OpenClaw tiktoken vs 上游 API）
+ *   在长对话中存在固有误差，1% 阈值过严，导致缓存折扣频繁失效，用户被多收费。
+ *   5% 阈值更符合实际 tokenizer 误差范围，同时仍能检测出明显的数据异常（>5%）。
  */
 function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, currency, supportsCache, promptTokens, historyTokens }) {
   const fxRate = (currency === 'USD') ? getUsdToCnyRate() : 1;
@@ -384,8 +389,9 @@ function calculateChargedFen({ inputTokens, outputTokens, priceIn, priceOut, cur
       inputCostYuan = 0;
     } else {
       const deviation = inputTokens > 0 ? Math.abs(partitionSum - inputTokens) / inputTokens : 0;
-      if (deviation > 0.01) {
-        logger.warn('calculateChargedFen: promptTokens+historyTokens 与 inputTokens 偏差超过 1%，回退到标准计费', {
+      // v5.5 FIX-5.5-2: 阈值从 1% 放宽到 5%，容忍 tokenizer 实现差异
+      if (deviation > 0.05) {
+        logger.warn('calculateChargedFen: promptTokens+historyTokens 与 inputTokens 偏差超过 5%，回退到标准计费', {
           inputTokens, promptTokens, historyTokens, partitionSum,
           deviation: `${(deviation * 100).toFixed(2)}%`,
         });
@@ -577,7 +583,7 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
 
 /**
  * POST /billing/check — 公开只读预检接口，无需服务鉴权
- * BUG-9 修复：使用独立的 billingCheckLimiter（120次/分）
+ * 使用独立的 billingCheckLimiter（120次/分），避免误限 AI 对话前的高频预检
  */
 app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
@@ -686,7 +692,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const inputTokens  = rawInputTokens  ?? inputChars  ?? 0;
   const outputTokens = rawOutputTokens ?? outputChars ?? 0;
 
-  // BUG-8 修复：同时警告 inputChars 和 outputChars 旧版字段
+  // 兼容旧版字段名，记录警告
   if (rawInputTokens == null && inputChars != null) {
     logger.warn('billing/record: 调用方使用旧版 inputChars 字段，请迁移到 inputTokens', { userEmail, modelName });
   }
@@ -949,6 +955,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: '模型 ID 无效' });
   }
 
+  // 先查询当前模型，获取 is_free 状态，用于后续价格字段校验
   let currentModel;
   try {
     const cur = await db.query('SELECT is_free FROM api_models WHERE id=$1', [id]);
@@ -965,12 +972,14 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
   const updates = [];
   const values  = [];
 
+  // 本次请求的有效 is_free 值：优先使用请求中的值，否则保持数据库中的值
   const effectiveIsFree = (typeof isFree === 'boolean') ? isFree : currentModel.is_free;
 
   if (typeof isFree === 'boolean') {
     updates.push(`is_free = $${values.length + 1}`);
     values.push(isFree);
     if (isFree) {
+      // 切换为免费模型时，同步清零价格
       updates.push(`price_input_per_1k_tokens = $${values.length + 1}`);
       values.push(0);
       updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
@@ -978,14 +987,18 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     }
   }
 
+  // v5.5 FIX-5.5-1: 允许免费模型传入 priceInput=0（原代码对任何数值都拒绝，包括 0）
+  // 原因：管理员可能显式传 0 以确认价格，语义上合法，不应拒绝。
+  // 修复：仅拒绝非零值（priceInput > 0），允许 priceInput=0。
   if (!effectiveIsFree && typeof priceInput === 'number') {
     if (!Number.isFinite(priceInput) || priceInput < 0) {
       return res.status(400).json({ success: false, msg: 'priceInput 必须为有限的非负数' });
     }
     updates.push(`price_input_per_1k_tokens = $${values.length + 1}`);
     values.push(priceInput);
-  } else if (effectiveIsFree && typeof priceInput === 'number') {
-    return res.status(400).json({ success: false, msg: '免费模型的价格必须为 0，不能修改 priceInput' });
+  } else if (effectiveIsFree && typeof priceInput === 'number' && priceInput !== 0) {
+    // 免费模型不允许设置非零价格
+    return res.status(400).json({ success: false, msg: '免费模型不能设置非零输入价格' });
   }
 
   if (!effectiveIsFree && typeof priceOutput === 'number') {
@@ -994,8 +1007,9 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     }
     updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
     values.push(priceOutput);
-  } else if (effectiveIsFree && typeof priceOutput === 'number') {
-    return res.status(400).json({ success: false, msg: '免费模型的价格必须为 0，不能修改 priceOutput' });
+  } else if (effectiveIsFree && typeof priceOutput === 'number' && priceOutput !== 0) {
+    // 免费模型不允许设置非零价格
+    return res.status(400).json({ success: false, msg: '免费模型不能设置非零输出价格' });
   }
 
   if (typeof isActive === 'boolean') {
