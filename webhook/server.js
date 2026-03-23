@@ -1,41 +1,31 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.7
+ * Anima 灵枢 · Webhook 服务 v5.8
  * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.7 相对于 v5.6）：
- *   #FIX-5.7-1  ADMIN_TOKEN / SERVICE_TOKEN 长度警告阈值：32 → 64
- *               openssl rand -hex 32 生成 64 个十六进制字符（32字节），
- *               原代码 length < 32 实际上对 32~63 字符的弱令牌不告警，
- *               存在安全隐患。
+ * 修复记录（v5.8 相对于 v5.7）：
  *
- *   #FIX-5.7-2  TOCTOU 竞态修复：将 lookupModel 移入 /billing/record 事务内，
- *               使用 FOR SHARE 行级锁。原代码在事务外查询模型，模型价格/状态
- *               在检查与扣费之间可能被管理员修改，导致按旧价格扣费或
- *               对已停用模型继续计费。FOR SHARE 允许并发读，但阻止
- *               管理员并发 UPDATE 直到事务提交。
- *               注意：/billing/check 为只读预检，无需锁，保留原逻辑。
+ *   #FIX-5.8-1  BUG-1 admin/adjust 零金额崩溃修复
+ *               余额为 0 时执行扣减：actualApplied = GREATEST(0,0-N) - 0 = 0。
+ *               旧代码将 0 插入 billing_transactions.amount_fen，
+ *               违反 CHECK(amount_fen != 0) 约束，抛出 DB 错误返回 500。
+ *               修复：actualApplied === 0 时跳过流水 INSERT，
+ *               在响应中携带 note 字段说明原因。
  *
- *   #FIX-5.7-3  ROLLBACK 失败不再静默吞掉：改为 logger.warn 记录错误，
- *               便于生产环境排查数据库连接泄漏。
+ *   #FIX-5.8-2  BUG-2 幂等键预检 is_free 硬编码错误
+ *               旧代码预检命中时始终返回 is_free: false，
+ *               免费模型重试会被前端误判为付费模型。
+ *               修复：预检 SQL 增加 au.is_free 字段，
+ *               响应使用真实的 existRec.is_free 值。
  *
- *   #FIX-5.7-4  新增 api_providers 数据库表支持：
- *               新增 GET /providers 端点，返回已启用的 provider 配置
- *               （base_url、display_name），不含 API Key（Key 仍在 .env）。
- *               配合 db/schema.sql v5.3 中新增的 api_providers 表使用。
+ *   #FIX-5.8-3  BUG-3 免费模型不存储幂等键
+ *               网络重试时 daily 计数器被重复递增，
+ *               用户免费次数被提前耗尽。
+ *               修复：免费模型 INSERT 加入 idempotency_key 列，
+ *               ON CONFLICT DO NOTHING 处理并发重试；
+ *               并发冲突时回滚日计数器后返回幂等结果。
  *
- *   #FIX-5.7-5  免费模型返回 balance_fen: 0（整数）替代 null，
- *               避免前端未处理 null 导致的 NaN 错误。
- *
- *   #FIX-5.7-6  /billing/record 中 ROLLBACK 之后的 billing_transactions
- *               INSERT 使用 usageRes.rows[0].id 前增加防御检查，
- *               避免理论上的 undefined 引用错误。
- *
- *   #FIX-5.7-7  calculateChargedFen 增加 JSDoc 注释，明确说明
- *               这是简化的缓存定价模型，与 Anthropic 实际
- *               cache write/read 分层计费有细微差异。
- *
- * 历史修复记录（v5.0 → v5.6）见 CHANGELOG.md。
+ * 历史修复记录（v5.0 → v5.7）见内嵌注释。
  */
 
 const crypto    = require('crypto');
@@ -96,10 +86,6 @@ redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // ─────────────────────────────────────────────────────────────
 // INCR+EXPIRE Lua 脚本（原子操作，防止计数器丢失 TTL）
-// 加载顺序：
-//   步骤1：TTL 守护 —— 修复已有 key 丢失 TTL（ttl==-1）
-//   步骤2：读取当前值，超限时直接返回（不递增）
-//   步骤3：递增；若 new_c==1（新 key）立即设置 TTL
 // ─────────────────────────────────────────────────────────────
 const INCR_EXPIRE_LUA =
   'local key = KEYS[1]\n' +
@@ -205,7 +191,6 @@ app.use((_req, res, next) => {
 
 // ─── 限速器 ──────────────────────────────────────────────────
 
-// 全局通用限速：60次/分（跳过内部服务路由 /billing/record）
 app.use(rateLimit({
   windowMs: 60_000,
   max:      60,
@@ -215,7 +200,6 @@ app.use(rateLimit({
   skip: (req) => req.path === '/billing/record',
 }));
 
-// 激活接口限速：5 次/10 分（防暴力枚举卡密）
 const activateLimiter = rateLimit({
   windowMs: 10 * 60_000,
   max:      5,
@@ -224,7 +208,6 @@ const activateLimiter = rateLimit({
   message: { success: false, msg: '激活尝试过于频繁，请 10 分钟后再试' },
 });
 
-// 只读查询限速：20 次/分（余额查询、消费历史等低频接口）
 const readLimiter = rateLimit({
   windowMs: 60_000,
   max:      20,
@@ -233,8 +216,6 @@ const readLimiter = rateLimit({
   message: { success: false, msg: '查询过于频繁，请稍后再试' },
 });
 
-// /billing/check 独立限速器（120次/分）
-// 每次 AI 对话前的预检，高频使用不能与 readLimiter 共用
 const billingCheckLimiter = rateLimit({
   windowMs: 60_000,
   max:      120,
@@ -243,7 +224,6 @@ const billingCheckLimiter = rateLimit({
   message: { success: false, msg: '预检请求过于频繁，请稍后再试' },
 });
 
-// /billing/record 独立限速：600 次/分（内部服务 ~10次/秒）
 const billingRecordLimiter = rateLimit({
   windowMs: 60_000,
   max:      600,
@@ -253,7 +233,6 @@ const billingRecordLimiter = rateLimit({
   message: { success: false, msg: '计费记录请求过于频繁' },
 });
 
-// 管理员接口限速：10 次/15 分
 const adminLimiter = rateLimit({
   windowMs: 15 * 60_000,
   max:      10,
@@ -266,11 +245,6 @@ const adminLimiter = rateLimit({
 const ADMIN_TOKEN   = process.env.ADMIN_TOKEN;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 
-/**
- * 常量时间字符串比较，防止时序攻击（Timing Attack）。
- * 使用 Node.js 内置 crypto.timingSafeEqual，两端补齐后比较，
- * 同时严格检查原始长度相等，避免不等长字符串因补齐产生假阳性。
- */
 function safeCompare(a, b) {
   const aBuf = Buffer.from(typeof a === 'string' ? a : '');
   const bBuf = Buffer.from(typeof b === 'string' ? b : '');
@@ -310,7 +284,6 @@ function requireServiceToken(req, res, next) {
 // ─── 工具函数 ─────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL_LEN = 254;
-// 幂等键允许的字符：字母、数字、连字符、冒号、下划线
 const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9\-:_]+$/;
 
 function isValidEmail(email) {
@@ -340,8 +313,6 @@ async function ensureUser(client, userEmail) {
 
 /**
  * 在连接池（非事务）中查找模型，用于只读路径（/billing/check, /models）。
- * ⚠️ 不要在需要价格一致性保证的事务中使用本函数。
- *    /billing/record 事务内使用带 FOR SHARE 锁的 lookupModelForUpdate。
  */
 async function lookupModel(modelName) {
   const res = await db.query(
@@ -354,12 +325,7 @@ async function lookupModel(modelName) {
 }
 
 /**
- * 在事务中查找模型并加 FOR SHARE 锁，防止 TOCTOU 竞态：
- * 确保从模型查询到余额扣减整个事务期间，模型价格和状态不会被
- * 管理员并发修改（UPDATE api_models 会等待本事务提交后再执行）。
- *
- * @param {object} client - pg 事务 client
- * @param {string} modelName
+ * 在事务中查找模型并加 FOR SHARE 锁，防止 TOCTOU 竞态。
  */
 async function lookupModelInTx(client, modelName) {
   const res = await client.query(
@@ -376,33 +342,6 @@ async function lookupModelInTx(client, modelName) {
 const CACHE_THRESHOLD_TOKENS = 2000;
 const CACHE_DISCOUNT = 0.1;
 
-/**
- * 计算本次请求费用（单位：分）。
- *
- * 缓存定价说明（简化模型）：
- *   当 supportsCache=true 且 historyTokens > CACHE_THRESHOLD_TOKENS 时：
- *   - promptTokens（新输入）+ 前 CACHE_THRESHOLD_TOKENS 条历史 → 全价
- *   - 超出阈值的历史 Token → 全价 × CACHE_DISCOUNT（10%）
- *
- *   ⚠️ 这是对 Anthropic/DeepSeek Prompt Cache 定价的简化：
- *     实际 Anthropic 区分 cache_write（较贵）和 cache_read（便宜），
- *     本模型将两者均视为 cache_read 折扣，略有低估 cache_write 成本。
- *     对于 B2C 场景可接受；若需精确成本核算，应传入 write/read 分类。
- *
- * 偏差阈值 5%（FIX-5.5-2）：
- *   不同 tokenizer 实现在长对话中有固有误差，5% 是合理容忍范围。
- *
- * @param {object} params
- * @param {number} params.inputTokens   - 总输入 token 数
- * @param {number} params.outputTokens  - 总输出 token 数
- * @param {number} params.priceIn       - 输入价格（元/1K token）
- * @param {number} params.priceOut      - 输出价格（元/1K token）
- * @param {string} params.currency      - 'USD' | 'CNY'
- * @param {boolean} params.supportsCache - 模型是否支持 Prompt Cache
- * @param {number|undefined} params.promptTokens  - 新提示 token 数（可选）
- * @param {number|undefined} params.historyTokens - 历史上下文 token 数（可选）
- * @returns {number} 费用（分，向上取整）
- */
 function calculateChargedFen({
   inputTokens, outputTokens, priceIn, priceOut, currency,
   supportsCache, promptTokens, historyTokens,
@@ -446,10 +385,6 @@ function calculateChargedFen({
 }
 
 // ─── 安全的 ROLLBACK 辅助函数 ────────────────────────────────
-/**
- * 在 catch/finally 中安全地执行 ROLLBACK，失败时记录警告而不是静默吞掉。
- * 静默吞掉 ROLLBACK 错误会隐藏数据库连接故障，导致连接泄漏难以排查。
- */
 async function safeRollback(client, context) {
   try {
     await client.query('ROLLBACK');
@@ -495,20 +430,17 @@ app.get('/models', readLimiter, async (_req, res) => {
 });
 
 // ─── Provider 配置列表（公开，不含 API Key）─────────────────
-// FIX-5.7-4: 新增端点，供 OpenClaw/LibreChat 动态获取 provider 配置，
-// 实现"数据库统一调用"——provider base URL 集中存储在 DB 中，
-// 而非分散在各服务的配置文件里。
-// API Key 仍在 .env（符合 PCI-DSS 3.x，不允许将密钥存入数据库明文）。
+// 数据库统一调用：OpenClaw/LibreChat 从此接口动态获取 provider base URL。
+// API Key 仍在各服务 .env（PCI-DSS 3.x 要求，不允许密钥入库）。
 app.get('/providers', readLimiter, async (_req, res) => {
   try {
-    // 若 api_providers 表不存在（旧版部署），优雅降级返回空列表
     const result = await db.query(
       `SELECT provider_name, display_name, base_url, is_enabled, description
          FROM api_providers
         WHERE is_enabled = true
         ORDER BY provider_name`
     ).catch((err) => {
-      if (err.code === '42P01') { // undefined_table
+      if (err.code === '42P01') {
         logger.warn('api_providers 表不存在，请执行 db/schema.sql 升级');
         return { rows: [] };
       }
@@ -664,12 +596,6 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
 });
 
 // ─── 余额预检（只读，无需服务鉴权）──────────────────────────
-/**
- * POST /billing/check — 公开只读预检接口
- * 调用方（LibreChat/OpenClaw）在每次 AI 请求前调用，估算费用并确认余额充足。
- * 不扣费，不需要 SERVICE_TOKEN。
- * 注意：使用 lookupModel（非事务版本），只读路径无需 FOR SHARE 锁。
- */
 app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   let { userEmail, modelName, estimatedInputTokens, estimatedOutputTokens,
           estimatedInputChars, estimatedOutputChars,
@@ -712,7 +638,6 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     }
     return res.json({
       success: true, can_proceed: true, is_free: true, estimated_fen: 0,
-      // FIX-5.7-5: 返回 0 而非 null，避免前端 NaN
       balance_fen: 0, is_suspended: false,
       daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
     });
@@ -771,14 +696,6 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
 });
 
 // ─── 计费记录（内部服务专用）──────────────────────────────
-/**
- * POST /billing/record — 需要 SERVICE_TOKEN（x-service-token 请求头）
- *
- * 关键设计原则：
- *   1. lookupModel 在事务内执行（lookupModelInTx + FOR SHARE），防止 TOCTOU。
- *   2. idempotencyKey 去重：相同 key 的第二次请求直接返回原始结果，不重复扣费。
- *   3. ROLLBACK 失败记录 warning 日志，不静默吞掉。
- */
 app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (req, res) => {
   let {
     userEmail, apiProvider, modelName,
@@ -791,7 +708,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const inputTokens  = rawInputTokens  ?? inputChars  ?? 0;
   const outputTokens = rawOutputTokens ?? outputChars ?? 0;
 
-  // 兼容旧版字段名，记录警告
   if (rawInputTokens == null && inputChars != null) {
     logger.warn('billing/record: 调用方使用旧版 inputChars 字段，请迁移到 inputTokens', { userEmail, modelName });
   }
@@ -799,7 +715,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     logger.warn('billing/record: 调用方使用旧版 outputChars 字段，请迁移到 outputTokens', { userEmail, modelName });
   }
 
-  // ── 基础参数校验 ──────────────────────────────────────────
   if (!userEmail || !apiProvider || !modelName) {
     return res.status(400).json({ success: false, msg: '参数缺失：需要 userEmail、apiProvider、modelName' });
   }
@@ -823,7 +738,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     return res.status(400).json({ success: false, msg: 'inputTokens/outputTokens 单次上限为 10,000,000' });
   }
 
-  // ── 幂等键校验 ────────────────────────────────────────────
   if (idempotencyKey !== undefined) {
     if (
       typeof idempotencyKey !== 'string' ||
@@ -843,10 +757,11 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
   // ── 幂等键快速路径（事务外，减少锁争用）─────────────────
+  // FIX-5.8-2：预检查询增加 au.is_free 字段，响应使用真实值而非硬编码 false
   if (normalizedIdempKey) {
     try {
       const idempRes = await db.query(
-        `SELECT au.charged_fen, ub.balance_fen
+        `SELECT au.charged_fen, au.is_free, ub.balance_fen
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
           WHERE au.idempotency_key = $1`,
@@ -854,12 +769,14 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       );
       if (idempRes.rows.length > 0) {
         logger.info('Idempotent billing record (pre-check hit)', { idempotencyKey: normalizedIdempKey, userEmail });
+        const existRec = idempRes.rows[0];
         return res.json({
-          success:      true,
-          is_free:      false,
-          charged_fen:  Number(idempRes.rows[0].charged_fen),
-          balance_fen:  idempRes.rows[0].balance_fen !== null ? Number(idempRes.rows[0].balance_fen) : 0,
-          idempotent:   true,
+          success:     true,
+          // FIX-5.8-2：使用数据库真实值，不再硬编码 false
+          is_free:     existRec.is_free,
+          charged_fen: existRec.is_free ? 0 : Number(existRec.charged_fen),
+          balance_fen: existRec.balance_fen !== null ? Number(existRec.balance_fen) : 0,
+          idempotent:  true,
         });
       }
     } catch (err) {
@@ -867,13 +784,10 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     }
   }
 
-  // ── 开启事务 ──────────────────────────────────────────────
   const client = await db.connect();
   try {
     await client.query('BEGIN');
 
-    // FIX-5.7-2: 在事务内用 FOR SHARE 锁查询模型，防止 TOCTOU 竞态
-    // 模型的 is_active / price 在本事务存续期间不会被管理员并发修改
     const model = await lookupModelInTx(client, modelName);
 
     if (!model) {
@@ -893,7 +807,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     // ── 免费模型路径 ──────────────────────────────────────
     if (isFree) {
-      // 免费模型无金额风险，不需要 FOR SHARE，但已在事务中，继续使用 client
       const dailyCheck = await incrFreeDailyUsage(userEmail);
       if (!dailyCheck.allowed) {
         await safeRollback(client, '/billing/record free daily limit');
@@ -903,14 +816,38 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
           daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
         });
       }
+
       try {
-        await client.query(
+        // FIX-5.8-3：免费模型 INSERT 加入 idempotency_key 列 + ON CONFLICT DO NOTHING
+        // 防止网络重试时重复递增日计数器
+        const freeInsertRes = await client.query(
           `INSERT INTO api_usage
                (user_email, api_model_id, api_provider, model_name,
-                is_free, input_tokens, output_tokens, charged_fen, status)
-             VALUES ($1,$2,$3,$4,true,$5,$6,0,'ok')`,
-          [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens]
+                is_free, input_tokens, output_tokens, charged_fen, status, idempotency_key)
+             VALUES ($1,$2,$3,$4,true,$5,$6,0,'ok',$7)
+             ON CONFLICT (idempotency_key)
+               WHERE idempotency_key IS NOT NULL
+               DO NOTHING
+             RETURNING id`,
+          [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens, normalizedIdempKey]
         );
+
+        // FIX-5.8-3：并发幂等冲突（另一个请求已提交相同 key）
+        if (freeInsertRes.rows.length === 0 && normalizedIdempKey) {
+          await safeRollback(client, '/billing/record free concurrent idempotent');
+          // 回滚 Redis 日计数器（本次递增是多余的）
+          await tryDecrFreeDailyUsage(dailyCheck.key);
+          return res.json({
+            success:    true,
+            is_free:    true,
+            charged_fen: 0,
+            balance_fen: 0,
+            idempotent: true,
+            daily_used:  Math.max(0, dailyCheck.used - 1),
+            daily_limit: dailyCheck.limit,
+          });
+        }
+
         await client.query('COMMIT');
       } catch (err) {
         logger.error('Free usage DB insert failed, attempting Redis counter rollback', { err: err.message });
@@ -918,11 +855,14 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         await tryDecrFreeDailyUsage(dailyCheck.key);
         return res.status(500).json({ success: false, msg: '服务器内部错误' });
       }
+
       return res.json({
-        success: true, is_free: true, charged_fen: 0,
-        // FIX-5.7-5: 返回 0 而非 null
+        success:     true,
+        is_free:     true,
+        charged_fen: 0,
         balance_fen: 0,
-        daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
+        daily_used:  dailyCheck.used,
+        daily_limit: dailyCheck.limit,
       });
     }
 
@@ -979,7 +919,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     );
     const newBalance = Number(deductRes.rows[0].balance_fen);
 
-    // INSERT api_usage，ON CONFLICT DO NOTHING 处理并发竞态
     const usageRes = await client.query(
       `INSERT INTO api_usage
            (user_email, api_model_id, api_provider, model_name,
@@ -992,12 +931,11 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       [userEmail, modelId, apiProvider, modelName, inputTokens, outputTokens, chargedFen, normalizedIdempKey]
     );
 
-    // 并发竞态：INSERT 被 DO NOTHING 跳过，回滚本事务，返回原始结果
     if (usageRes.rows.length === 0 && normalizedIdempKey) {
       await safeRollback(client, '/billing/record idempotency conflict');
       logger.info('Idempotent billing record (conflict resolution)', { idempotencyKey: normalizedIdempKey, userEmail });
       const existingRes = await db.query(
-        `SELECT au.charged_fen, ub.balance_fen
+        `SELECT au.charged_fen, au.is_free, ub.balance_fen
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
           WHERE au.idempotency_key = $1`,
@@ -1005,7 +943,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       );
       return res.json({
         success:     true,
-        is_free:     false,
+        is_free:     existingRes.rows.length > 0 ? existingRes.rows[0].is_free : false,
         charged_fen: existingRes.rows.length > 0 ? Number(existingRes.rows[0].charged_fen) : chargedFen,
         balance_fen: existingRes.rows.length > 0 && existingRes.rows[0].balance_fen !== null
           ? Number(existingRes.rows[0].balance_fen) : 0,
@@ -1013,10 +951,8 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       });
     }
 
-    // FIX-5.7-6: 防御性检查，非幂等路径下 RETURNING 应始终有一行
     const usageId = usageRes.rows[0]?.id;
     if (!usageId) {
-      // 理论上不应发生，记录错误并回滚
       logger.error('api_usage INSERT returned no rows (non-idempotent path)', { userEmail, modelName });
       await safeRollback(client, '/billing/record no usage id');
       return res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -1136,7 +1072,6 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: '模型 ID 无效' });
   }
 
-  // 先查询当前模型，获取 is_free 状态
   let currentModel;
   try {
     const cur = await db.query('SELECT is_free FROM api_models WHERE id=$1', [id]);
@@ -1241,9 +1176,6 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
 });
 
 // ─── 管理员：Provider 配置管理 ────────────────────────────────
-// FIX-5.7-4: 新增端点，通过 admin API 管理 provider base URL，
-// 实现"数据库统一调用"——无需修改 .env 文件即可更新 provider 配置。
-
 app.get('/admin/providers', adminLimiter, requireAdmin, async (_req, res) => {
   try {
     const result = await db.query(
@@ -1340,20 +1272,39 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
         RETURNING balance_fen`,
       [amount_fen, userEmail]
     );
-    const newBalance = Number(result.rows[0].balance_fen);
+    const newBalance    = Number(result.rows[0].balance_fen);
     const actualApplied = newBalance - oldBalance;
 
-    await client.query(
-      `INSERT INTO billing_transactions
-           (user_email, type, amount_fen, balance_after_fen, description)
-         VALUES ($1,$2,$3,$4,$5)`,
-      [userEmail, type, actualApplied, newBalance, description || '管理员调整']
-    );
+    // FIX-5.8-1：actualApplied 为 0 时跳过流水 INSERT
+    // 场景：余额已为 0，执行扣减 → GREATEST(0, 0-N)=0 → actualApplied=0
+    // 旧代码将 0 插入 billing_transactions.amount_fen 违反 CHECK(amount_fen!=0)，
+    // 导致整个事务失败返回 500。
+    // 修复：仅在有实际变动时写流水；零变动时事务仍提交（balance_fen 不变），
+    // 通过响应 note 字段告知调用方。
+    if (actualApplied !== 0) {
+      await client.query(
+        `INSERT INTO billing_transactions
+             (user_email, type, amount_fen, balance_after_fen, description)
+           VALUES ($1,$2,$3,$4,$5)`,
+        [userEmail, type, actualApplied, newBalance, description || '管理员调整']
+      );
+    }
 
     await client.query('COMMIT');
 
     logger.info('Admin balance adjusted', { userEmail, amount_fen, actualApplied, type });
-    res.json({ success: true, balance_fen: newBalance, actual_applied_fen: actualApplied });
+
+    const response = {
+      success:            true,
+      balance_fen:        newBalance,
+      actual_applied_fen: actualApplied,
+    };
+    // 如果扣减被截断为 0（余额不足），携带提示信息
+    if (actualApplied === 0 && amount_fen < 0) {
+      response.note = `余额已为 0，扣减无效（请求扣减 ${Math.abs(amount_fen)} 分，实际扣减 0 分）`;
+    }
+
+    res.json(response);
   } catch (err) {
     await safeRollback(client, '/admin/adjust error');
     logger.error('Admin adjust error', { err: err.message });
@@ -1384,13 +1335,11 @@ const server = app.listen(PORT, HOST, () => {
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
   } else if (ADMIN_TOKEN.length < 64) {
-    // FIX-5.7-1: 正确阈值为 64（openssl rand -hex 32 = 32字节 = 64个十六进制字符）
-    logger.warn('ADMIN_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成（生成 64 字符的强令牌）');
+    logger.warn('ADMIN_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   if (!SERVICE_TOKEN) {
     logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口无内部服务鉴权（建议通过环境变量配置）');
   } else if (SERVICE_TOKEN.length < 64) {
-    // FIX-5.7-1: 正确阈值为 64
     logger.warn('SERVICE_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   logger.info('运行时配置', {
