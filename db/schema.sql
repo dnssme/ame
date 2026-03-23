@@ -1,20 +1,22 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v5.1
+-- Anima 灵枢 · 数据库 Schema v5.2
 -- 数据库: librechat (Azure PostgreSQL)
+-- 变更记录（v5.2）：
+--   · 将 Migration 004 (idempotency_key) 合并进基础 Schema，
+--     确保新部署无需额外执行迁移文件即可具备幂等计费防护。
+--     新增 api_usage.idempotency_key VARCHAR(128)（可 NULL，向后兼容）
+--     新增部分唯一索引 idx_api_usage_idempotency（仅对非 NULL 值生效）
 -- 变更记录（v5.1）：
---   · BUG-NEW-2：v_today_model_usage 视图改用上海时区，与
---                Migration 003 保持一致（原 CURRENT_DATE 为 UTC，
---                导致北京时间 00:00-08:00 统计前一天数据）
---   · BUG-NEW-5：api_usage.input_tokens/output_tokens 改为 BIGINT，
---                防止未来统计视图 SUM 溢出（INT 最大约 21 亿）
+--   · BUG-NEW-2：v_today_model_usage 视图改用上海时区
+--   · BUG-NEW-5：api_usage.input_tokens/output_tokens 改为 BIGINT
 -- =============================================================
 
 -- ─── 启用必要扩展 ──────────────────────────────────────────────
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";       -- gen_random_uuid(), gen_random_bytes()
-CREATE EXTENSION IF NOT EXISTS "pg_stat_statements"; -- 慢查询监控
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
 
 -- =============================================================
--- 1. API 模型定价表（核心：管理员按模型设价，用户自选）
+-- 1. API 模型定价表
 -- =============================================================
 CREATE TABLE IF NOT EXISTS api_models (
     id           SERIAL       PRIMARY KEY,
@@ -357,7 +359,7 @@ VALUES
 ON CONFLICT (model_name) DO NOTHING;
 
 -- =============================================================
--- 2. 用户账户表（纯余额，无套餐绑定）
+-- 2. 用户账户表
 -- =============================================================
 CREATE TABLE IF NOT EXISTS user_billing (
     id                BIGSERIAL    PRIMARY KEY,
@@ -373,7 +375,7 @@ CREATE INDEX IF NOT EXISTS idx_user_billing_email
     ON user_billing(user_email);
 
 -- =============================================================
--- 3. 充值卡密表（纯充值卡，无套餐绑定）
+-- 3. 充值卡密表
 -- =============================================================
 CREATE TABLE IF NOT EXISTS recharge_cards (
     id          BIGSERIAL     PRIMARY KEY,
@@ -393,9 +395,10 @@ CREATE INDEX IF NOT EXISTS idx_recharge_cards_unused
 
 -- =============================================================
 -- 4. API 调用记录（计费核心）
--- BUG-NEW-5 修复：input_tokens/output_tokens 改为 BIGINT
--- 原因：SUM 聚合在统计视图中可能超出 INT 最大值（约 21 亿），
---       BIGINT 上限约 922 亿亿，完全消除溢出风险。
+-- v5.2 新增 idempotency_key：防止网络重试重复计费
+--   · 调用方（OpenClaw）生成，格式建议：<conv_id>:<msg_id>:<model>
+--   · 相同 key 的第二次请求，webhook 返回第一次结果，不重复扣费
+--   · NULL 表示调用方未提供（兼容旧版 OpenClaw）
 -- =============================================================
 CREATE TABLE IF NOT EXISTS api_usage (
     id              BIGSERIAL     PRIMARY KEY,
@@ -404,12 +407,13 @@ CREATE TABLE IF NOT EXISTS api_usage (
     api_provider    VARCHAR(32)   NOT NULL,
     model_name      VARCHAR(128)  NOT NULL,
     is_free         BOOLEAN       NOT NULL,
-    -- BUG-NEW-5：改为 BIGINT 防止统计视图 SUM 溢出
     input_tokens    BIGINT        NOT NULL DEFAULT 0,
     output_tokens   BIGINT        NOT NULL DEFAULT 0,
     charged_fen     NUMERIC(10,4) NOT NULL DEFAULT 0,
     status          VARCHAR(16)   NOT NULL DEFAULT 'ok',
     error_msg       TEXT,
+    -- v5.2: 幂等键，仅对非 NULL 值强制唯一
+    idempotency_key VARCHAR(128),
     created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
@@ -418,6 +422,16 @@ CREATE INDEX IF NOT EXISTS idx_api_usage_user_date
 
 CREATE INDEX IF NOT EXISTS idx_api_usage_model
     ON api_usage(api_model_id, created_at DESC);
+
+-- 部分唯一索引：仅对非 NULL 的 idempotency_key 强制唯一
+-- NULL != NULL，故多个 NULL 不会触发冲突（兼容旧版调用方）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_usage_idempotency
+    ON api_usage(idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+COMMENT ON COLUMN api_usage.idempotency_key IS
+  '调用方提供的幂等键（如 <conv_id>:<msg_id>:<model>）。
+   用于防止网络重试重复扣费。NULL 兼容未提供幂等键的旧版调用方。';
 
 -- =============================================================
 -- 5. 充值/扣费流水
@@ -461,7 +475,6 @@ CREATE TRIGGER trg_api_models_updated
 -- 7. 辅助视图
 -- =============================================================
 
--- 7-A. 用户账户余额概览
 CREATE OR REPLACE VIEW v_user_balance AS
 SELECT
     user_email,
@@ -471,11 +484,7 @@ SELECT
     created_at
 FROM user_billing;
 
--- 7-B. 当日各模型调用量汇总（用于监控 / 运营）
--- BUG-NEW-2 修复：使用北京时间（Asia/Shanghai）作为"今天"的起始时刻。
--- 原写法 CURRENT_DATE 使用 UTC，导致北京时间 00:00-08:00 期间
--- 统计的仍是"昨天"的数据，运营监控有 8 小时误差窗口。
--- 与 Migration 003 (003_fix_today_view_timezone.sql) 保持一致。
+-- 当日（北京时间）各模型调用量汇总
 CREATE OR REPLACE VIEW v_today_model_usage AS
 SELECT
     am.provider,
@@ -491,12 +500,11 @@ WHERE au.created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'Asia/Shanghai') AT 
 GROUP BY am.provider, am.model_name, am.display_name;
 
 COMMENT ON VIEW v_today_model_usage IS
-  '当日（北京时间）各模型调用量汇总。使用 Asia/Shanghai 时区计算"今天"起始点，
-   避免 Azure PostgreSQL 默认 UTC 时区导致北京时间午夜前 8 小时统计数据错误。
-   此视图已在 schema.sql v5.1 中修复，与 Migration 003 保持一致。';
+  '当日（北京时间）各模型调用量汇总。使用 Asia/Shanghai 时区，
+   避免 Azure PostgreSQL 默认 UTC 导致北京时间午夜前 8 小时统计前一天数据。';
 
 -- =============================================================
--- 8. 最小权限角色（安全加固：服务专用角色）
+-- 8. 最小权限角色
 -- =============================================================
 
 DO $$
