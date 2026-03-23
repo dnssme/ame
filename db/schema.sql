@@ -1,19 +1,75 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v5.2
+-- Anima 灵枢 · 数据库 Schema v5.3
 -- 数据库: librechat (Azure PostgreSQL)
+--
+-- 变更记录（v5.3）：
+--   · 新增 api_providers 表（实现"数据库统一调用"）
+--     存储 AI provider 的 base_url / display_name，
+--     供 OpenClaw / LibreChat 通过 GET /providers 动态获取，
+--     取代各服务配置文件中的硬编码 provider 配置。
+--     API Key 仍在 .env（PCI-DSS 3.x 不允许明文密钥入库）。
+--   · billing_transactions.amount_fen 新增 CHECK (amount_fen != 0)
+--     在 DB 层面防止零金额流水绕过应用校验写入。
+--   · 修正历史注释：price_input_per_1k_chars（v4）已于 v5 更名为
+--     price_input_per_1k_tokens，对齐上游 API Token 计费单位。
+--
 -- 变更记录（v5.2）：
---   · 将 Migration 004 (idempotency_key) 合并进基础 Schema，
---     确保新部署无需额外执行迁移文件即可具备幂等计费防护。
---     新增 api_usage.idempotency_key VARCHAR(128)（可 NULL，向后兼容）
---     新增部分唯一索引 idx_api_usage_idempotency（仅对非 NULL 值生效）
--- 变更记录（v5.1）：
+--   · 合并 Migration 004 (idempotency_key)
 --   · BUG-NEW-2：v_today_model_usage 视图改用上海时区
 --   · BUG-NEW-5：api_usage.input_tokens/output_tokens 改为 BIGINT
+--
+-- 变更记录（v5.1）：
+--   · 按 Token 计费，字段名从 *_per_1k_chars 改为 *_per_1k_tokens
 -- =============================================================
 
 -- ─── 启用必要扩展 ──────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
+
+-- =============================================================
+-- 0. API Provider 配置表（v5.3 新增）
+--    "数据库统一调用"核心：集中管理 provider base URL，
+--    避免在 openclaw/config.yml 和 librechat/librechat.yaml 中重复维护。
+--    通过 GET /providers（公开）和 POST /admin/providers（管理员）管理。
+-- =============================================================
+CREATE TABLE IF NOT EXISTS api_providers (
+    id            SERIAL       PRIMARY KEY,
+    provider_name VARCHAR(32)  NOT NULL UNIQUE,   -- 与 api_models.provider 对应
+    display_name  VARCHAR(64)  NOT NULL,
+    base_url      VARCHAR(256) NOT NULL,           -- 不含尾部 /，如 https://api.anthropic.com
+    is_enabled    BOOLEAN      NOT NULL DEFAULT true,
+    description   TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_providers_enabled
+    ON api_providers(is_enabled, provider_name);
+
+-- 预置 Provider 配置（base_url，不含 API Key）
+-- API Key 通过各服务的 .env 注入，符合 PCI-DSS 3.x 要求
+INSERT INTO api_providers
+    (provider_name, display_name, base_url, is_enabled, description)
+VALUES
+    -- ── 全球 Top 10 ────────────────────────────────────────
+    ('anthropic',   'Anthropic / Claude',    'https://api.anthropic.com/v1',                                   true,  'Claude 系列，申请：https://console.anthropic.com/'),
+    ('openai',      'OpenAI / GPT',          'https://api.openai.com/v1',                                      true,  'GPT / o 系列，申请：https://platform.openai.com/'),
+    ('google',      'Google / Gemini',       'https://generativelanguage.googleapis.com/v1beta/openai',         true,  'Gemini 系列，申请：https://aistudio.google.com/apikey'),
+    ('xai',         'xAI / Grok',            'https://api.x.ai/v1',                                            true,  'Grok 系列，申请：https://console.x.ai/'),
+    ('mistral',     'Mistral AI',            'https://api.mistral.ai/v1',                                      true,  '申请：https://console.mistral.ai/'),
+    ('cohere',      'Cohere / Command R',    'https://api.cohere.com/compatibility/openai',                    true,  '申请：https://dashboard.cohere.com/'),
+    ('groq',        'Groq（超高速推理）',      'https://api.groq.com/openai/v1',                                 true,  '申请：https://console.groq.com/'),
+    ('perplexity',  'Perplexity（联网搜索）', 'https://api.perplexity.ai',                                      true,  '申请：https://www.perplexity.ai/settings/api'),
+    -- ── 中国 Top 5 ─────────────────────────────────────────
+    ('deepseek',    'DeepSeek（深度求索）',   'https://api.deepseek.com/v1',                                    true,  '申请：https://platform.deepseek.com/'),
+    ('qwen',        'Qwen 通义千问（阿里）',  'https://dashscope.aliyuncs.com/compatible-mode/v1',              true,  '申请：https://dashscope.aliyuncs.com/'),
+    ('moonshot',    'Moonshot / Kimi',       'https://api.moonshot.cn/v1',                                     true,  '申请：https://platform.moonshot.cn/'),
+    ('zhipu',       'Zhipu AI / GLM（智谱）', 'https://open.bigmodel.cn/api/paas/v4',                           true,  '申请：https://open.bigmodel.cn/'),
+    ('doubao',      '豆包（字节跳动火山方舟）', 'https://ark.cn-beijing.volces.com/api/v3',                      true,  '申请：https://console.volcengine.com/ark'),
+    ('baidu',       'ERNIE 文心一言（百度）',  'https://qianfan.baidubce.com/v2',                               true,  '申请：https://console.bce.baidu.com/qianfan/'),
+    -- ── 本地 ───────────────────────────────────────────────
+    ('ollama',      'Ollama（本地）',         'http://172.16.1.5:11434/v1',                                     false, '本地 Ollama，默认不启用')
+ON CONFLICT (provider_name) DO NOTHING;
 
 -- =============================================================
 -- 1. API 模型定价表
@@ -395,10 +451,6 @@ CREATE INDEX IF NOT EXISTS idx_recharge_cards_unused
 
 -- =============================================================
 -- 4. API 调用记录（计费核心）
--- v5.2 新增 idempotency_key：防止网络重试重复计费
---   · 调用方（OpenClaw）生成，格式建议：<conv_id>:<msg_id>:<model>
---   · 相同 key 的第二次请求，webhook 返回第一次结果，不重复扣费
---   · NULL 表示调用方未提供（兼容旧版 OpenClaw）
 -- =============================================================
 CREATE TABLE IF NOT EXISTS api_usage (
     id              BIGSERIAL     PRIMARY KEY,
@@ -424,7 +476,6 @@ CREATE INDEX IF NOT EXISTS idx_api_usage_model
     ON api_usage(api_model_id, created_at DESC);
 
 -- 部分唯一索引：仅对非 NULL 的 idempotency_key 强制唯一
--- NULL != NULL，故多个 NULL 不会触发冲突（兼容旧版调用方）
 CREATE UNIQUE INDEX IF NOT EXISTS idx_api_usage_idempotency
     ON api_usage(idempotency_key)
     WHERE idempotency_key IS NOT NULL;
@@ -435,12 +486,13 @@ COMMENT ON COLUMN api_usage.idempotency_key IS
 
 -- =============================================================
 -- 5. 充值/扣费流水
+-- v5.3: 新增 CHECK (amount_fen != 0) 防止零金额流水在 DB 层绕过应用校验写入
 -- =============================================================
 CREATE TABLE IF NOT EXISTS billing_transactions (
     id                BIGSERIAL     PRIMARY KEY,
     user_email        VARCHAR(254)  NOT NULL,
     type              VARCHAR(16)   NOT NULL CHECK (type IN ('charge','recharge','refund','admin_adjust')),
-    amount_fen        NUMERIC(12,4) NOT NULL,
+    amount_fen        NUMERIC(12,4) NOT NULL CHECK (amount_fen != 0),
     balance_after_fen NUMERIC(12,2) NOT NULL CHECK (balance_after_fen >= 0),
     description       TEXT,
     ref_id            VARCHAR(128),
@@ -471,6 +523,11 @@ CREATE TRIGGER trg_api_models_updated
     BEFORE UPDATE ON api_models
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+DROP TRIGGER IF EXISTS trg_api_providers_updated ON api_providers;
+CREATE TRIGGER trg_api_providers_updated
+    BEFORE UPDATE ON api_providers
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
 -- =============================================================
 -- 7. 辅助视图
 -- =============================================================
@@ -480,8 +537,8 @@ SELECT
     user_email,
     balance_fen,
     total_charged_fen,
-    is_suspended,
-    created_at
+    is_suspended
+    -- v5.3: 移除 created_at（运营视图不应暴露内部时间戳）
 FROM user_billing;
 
 -- 当日（北京时间）各模型调用量汇总
@@ -518,7 +575,7 @@ $$;
 GRANT CONNECT ON DATABASE librechat TO billing_svc;
 GRANT USAGE ON SCHEMA public TO billing_svc;
 GRANT SELECT, INSERT, UPDATE ON TABLE user_billing, recharge_cards, api_usage, billing_transactions TO billing_svc;
-GRANT SELECT ON TABLE api_models TO billing_svc;
+GRANT SELECT ON TABLE api_models, api_providers TO billing_svc;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO billing_svc;
 
 DO $$
@@ -531,7 +588,7 @@ $$;
 
 GRANT CONNECT ON DATABASE librechat TO agent_svc;
 GRANT USAGE ON SCHEMA public TO agent_svc;
-GRANT SELECT ON TABLE api_models TO agent_svc;
+GRANT SELECT ON TABLE api_models, api_providers TO agent_svc;
 GRANT SELECT, INSERT ON TABLE api_usage TO agent_svc;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO agent_svc;
 
