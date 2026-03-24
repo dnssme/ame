@@ -12,6 +12,9 @@
  *            checkStartTime，导致 IMAP 失败时 T1~T2 期间的邮件永久丢失。
  *            修复：失败时不更新 lastCheck，保留上次成功时间，
  *            下次运行重试时仍从正确时间点开始。
+ *   #FIX-E3  IMAP logout cleanup 日志级别从 debug 提升为 warn
+ *            原实现用 debug 级别，生产环境通常不显示 debug 日志，
+ *            运维无法感知 logout 清理失败（可能暗示连接泄漏）。
  */
 
 const http           = require('http');
@@ -193,8 +196,11 @@ async function checkNewEmails() {
     // 原代码在此处执行 lastCheck = checkStartTime，将 lastCheck 推进到本次
     // 失败检查的开始时间，导致上次成功到本次失败之间的邮件（T1~T2）永久丢失。
     // 修复：保持 lastCheck 不变，下次运行仍从上次成功时间重试，不遗漏邮件。
-    try { await client.logout(); } catch (logoutErr) {
-      logger.debug('IMAP logout cleanup failed', { err: logoutErr.message });
+    try {
+      await client.logout();
+    } catch (logoutErr) {
+      // FIX-E3：从 debug 提升为 warn，运维可感知潜在的连接泄漏
+      logger.warn('IMAP logout cleanup failed（可能存在连接泄漏）', { err: logoutErr.message });
     }
   }
 }
