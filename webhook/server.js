@@ -1,42 +1,45 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.9
+ * Anima 灵枢 · Webhook 服务 v5.10
  * ─────────────────────────────────────────────────────────────
- * 修复记录（v5.9 相对于 v5.8）：
+ * 修复记录（v5.10 相对于 v5.9）：
  *
- *   #FIX-5.9-1  /health 端点新增 Redis 连通状态字段
- *               原实现仅检查 DB，Redis 断连时运维无法通过健康检查感知。
- *               修复：检查 redis.status 并执行 PING；Redis 不可用时
- *               返回 redis:'disconnected' 但 HTTP 仍为 200（服务可降级运行）；
- *               DB 故障仍返回 HTTP 503。
+ *   #FIX-5.10-1  幂等键预检查询新增 AND au.user_email = $2 用户隔离
+ *                原实现仅按 idempotency_key 查询，理论上不同用户使用相同
+ *                key 时（极低概率）会返回另一用户的计费记录，绕过计费。
+ *                修复：预检查询（两处）均添加 user_email 约束。
  *
- *   #FIX-5.9-2  模型查询内存缓存（60s TTL）
- *               /billing/check 在高频场景下每次都查 DB，
- *               在并发 AI 调用时产生大量 SELECT。
- *               修复：引入 modelCache Map，read-only 路径使用
- *               lookupModelCached()；管理员更新/创建模型时自动清除对应缓存。
- *               事务路径（billing/record）仍使用 lookupModelInTx FOR SHARE。
+ *   #FIX-5.10-2  INCR_EXPIRE_LUA 修正超限判断条件
+ *                原：if c > limit（c=limit 时仍做 INCR 到 limit+1，再判断）
+ *                修：if c >= limit（c=limit 时直接返回，避免无效 INCR）
+ *                效果：消除第 limit+1 次请求时的多余 Redis 写操作。
  *
- *   #FIX-5.9-3  IDEMPOTENCY_KEY_RE 字符类修正
- *               原: /^[a-zA-Z0-9\-:_]+$/ — 转义多余
- *               修: /^[a-zA-Z0-9:_-]+$/ — 连字符置末尾，语义清晰
+ *   #FIX-5.10-3  modelCache 新增最大条目限制（MAX_MODEL_CACHE_SIZE=1000）
+ *                防止长期运行后缓存无限增长（尤其是已停用模型的条目）。
+ *                淘汰策略：超限时清除最早写入的条目（FIFO）。
  *
+ *   #FIX-5.10-4  email processor 级别对齐：logout cleanup 改为 warn
+ *                （此修复在 processor.js，server.js 无需改动）
+ *
+ * 历史修复记录（v5.0 → v5.9）见下方内嵌注释。
+ *
+ * v5.9 修复：
+ *   #FIX-5.9-1  /health 新增 Redis 状态字段
+ *   #FIX-5.9-2  /billing/check 模型查询内存缓存（60s TTL）
+ *   #FIX-5.9-3  IDEMPOTENCY_KEY_RE 字符类修正（连字符置末尾）
  *   #FIX-5.9-4  POST /admin/providers 新增 description 长度校验
- *               原实现缺少此校验，超长字符串将被数据库 TEXT 类型接受
- *               但可能导致日志和响应体异常膨胀。
- *               修复：限制 description ≤ 500 字符（与 admin/models 一致）。
- *
  *   #FIX-5.9-5  新增 PUT /admin/providers/:id 端点
- *               原实现只有 POST（upsert），无法按 ID 精确更新单个字段。
- *               修复：添加完整的 PUT 端点，支持 displayName/baseUrl/
- *               isEnabled/description 的按需更新。
+ *   #FIX-5.9-6  模型写操作后清除 modelCache
  *
- *   #FIX-5.9-6  POST /admin/models 及 PUT /admin/models/:id 清除模型缓存
- *               原实现未在管理员操作后清除 modelCache，导致旧价格在
- *               缓存 TTL 内继续被 /billing/check 使用。
+ * v5.8 修复：
+ *   #FIX-5.8-1  admin/adjust 余额截断为 0 时跳过零金额流水 INSERT
+ *   #FIX-5.8-2  幂等预检响应包含真实 is_free 字段
+ *   #FIX-5.8-3  免费模型 INSERT 含幂等键 + ON CONFLICT DO NOTHING
  *
- * 历史修复记录（v5.0 → v5.8）见下方内嵌注释。
+ * v5.7 修复：
+ *   TOCTOU 竞态（lookupModelInTx FOR SHARE）、safeRollback 辅助函数、
+ *   validateChargedFen 安全熔断、Redis Lua 原子操作等
  */
 
 const crypto    = require('crypto');
@@ -98,7 +101,8 @@ redis.connect().catch((err) =>
 redis.on('error', (err) => logger.error('Redis error', { err: err.message }));
 
 // ─────────────────────────────────────────────────────────────
-// INCR+EXPIRE Lua 脚本（原子操作，防止计数器丢失 TTL）
+// FIX-5.10-2: INCR+EXPIRE Lua 脚本（原子操作）
+// 修正：if c >= limit（原为 c > limit，多余一次 INCR）
 // ─────────────────────────────────────────────────────────────
 const INCR_EXPIRE_LUA =
   'local key = KEYS[1]\n' +
@@ -107,16 +111,18 @@ const INCR_EXPIRE_LUA =
   // 若 key 存在但无 TTL（edge case），补设 24h 防止永久有效
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
-  // 已超限：不再递增，直接返回当前计数
-  'if c > limit then return c end\n' +
+  // FIX-5.10-2: >= limit（原为 > limit，在 c=limit 时会多做一次 INCR）
+  'if c >= limit then return c end\n' +
   'local new_c = redis.call("INCR", key)\n' +
-  // 首次写入：设置 24h TTL（北京时间每日 00:00 通过 key 日期前缀自然重置）
+  // 首次写入：设置 24h TTL（北京时间日期前缀确保次日自然重置）
   'if new_c == 1 then redis.call("EXPIRE", key, 86400) end\n' +
   'return new_c';
 
-// ─── 模型内存缓存（FIX-5.9-2）────────────────────────────────
+// ─── 模型内存缓存（FIX-5.9-2 / FIX-5.10-3）───────────────────
 // 仅用于只读路径（/billing/check、/models）；事务路径不用此缓存
-const MODEL_CACHE_TTL_MS = 60_000; // 60 秒
+// FIX-5.10-3：新增最大条目限制，防止长期运行后无限增长
+const MODEL_CACHE_TTL_MS   = 60_000; // 60 秒
+const MAX_MODEL_CACHE_SIZE = 1000;   // 最多缓存 1000 个模型条目
 const modelCache = new Map();
 
 function modelCacheGet(modelName) {
@@ -127,6 +133,11 @@ function modelCacheGet(modelName) {
 }
 
 function modelCacheSet(modelName, data) {
+  // FIX-5.10-3：超限时删除最早写入的条目（Map 按插入顺序迭代）
+  if (modelCache.size >= MAX_MODEL_CACHE_SIZE) {
+    const firstKey = modelCache.keys().next().value;
+    if (firstKey !== undefined) modelCache.delete(firstKey);
+  }
   modelCache.set(modelName, { data, exp: Date.now() + MODEL_CACHE_TTL_MS });
 }
 
@@ -230,7 +241,6 @@ app.use((_req, res, next) => {
 });
 
 // ─── 限速器 ──────────────────────────────────────────────────
-
 app.use(rateLimit({
   windowMs: 60_000,
   max:      60,
@@ -324,7 +334,7 @@ function requireServiceToken(req, res, next) {
 // ─── 工具函数 ─────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL_LEN = 254;
-// FIX-5.9-3: 连字符置末尾，语义清晰，避免与范围操作符混淆
+// 连字符置末尾，语义清晰，避免与字符范围操作符混淆
 const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
 
 function isValidEmail(email) {
@@ -374,7 +384,7 @@ async function lookupModel(modelName) {
 /**
  * 只读模型查询（带 60s 内存缓存）。
  * 用于 /billing/check 等高频只读路径，减少 DB 压力。
- * 管理员更新/创建模型后会自动清除对应缓存（FIX-5.9-2）。
+ * 管理员更新/创建模型后会自动清除对应缓存（FIX-5.9-6）。
  */
 async function lookupModelCached(modelName) {
   const cached = modelCacheGet(modelName);
@@ -387,6 +397,7 @@ async function lookupModelCached(modelName) {
 /**
  * 事务内模型查询（FOR SHARE 锁），防止 TOCTOU 竞态。
  * 用于 /billing/record 等写路径，确保读到最新数据。
+ * FOR SHARE：允许并发读，阻止并发写（admin 更新模型价格时需等待）。
  */
 async function lookupModelInTx(client, modelName) {
   const res = await client.query(
@@ -461,7 +472,7 @@ async function safeRollback(client, context) {
 // ─── 路由 ────────────────────────────────────────────────────
 // =============================================================
 
-// ─── 健康检查（FIX-5.9-1: 新增 Redis 状态）───────────────────
+// ─── 健康检查（FIX-5.9-1: 含 Redis 状态）────────────────────
 app.get('/health', async (_req, res) => {
   const status  = { db: 'ok', redis: 'ok', ts: new Date().toISOString() };
   let httpStatus = 200;
@@ -495,7 +506,7 @@ app.get('/health', async (_req, res) => {
   });
 });
 
-// ─── 模型列表（公开）──────────────────────────────────────
+// ─── 模型列表（公开）──────────────────────────────────────────
 app.get('/models', readLimiter, async (_req, res) => {
   try {
     const result = await db.query(
@@ -513,7 +524,7 @@ app.get('/models', readLimiter, async (_req, res) => {
   }
 });
 
-// ─── Provider 配置列表（公开，不含 API Key）─────────────────
+// ─── Provider 配置列表（公开，不含 API Key）───────────────────
 // 数据库统一调用：OpenClaw/LibreChat 从此接口动态获取 provider base URL。
 // API Key 仍在各服务 .env（PCI-DSS 3.x 要求，不允许密钥入库）。
 app.get('/providers', readLimiter, async (_req, res) => {
@@ -538,7 +549,7 @@ app.get('/providers', readLimiter, async (_req, res) => {
   }
 });
 
-// ─── 充值卡激活 ──────────────────────────────────────────
+// ─── 充值卡激活 ───────────────────────────────────────────────
 app.post('/activate', activateLimiter, async (req, res) => {
   let { cardKey, userEmail } = req.body ?? {};
 
@@ -619,7 +630,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
   }
 });
 
-// ─── 余额查询 ──────────────────────────────────────────────
+// ─── 余额查询 ─────────────────────────────────────────────────
 app.get('/billing/balance/:email', readLimiter, async (req, res) => {
   const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
@@ -648,7 +659,7 @@ app.get('/billing/balance/:email', readLimiter, async (req, res) => {
   }
 });
 
-// ─── 消费历史 ──────────────────────────────────────────────
+// ─── 消费历史 ─────────────────────────────────────────────────
 app.get('/billing/history/:email', readLimiter, async (req, res) => {
   const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
@@ -700,7 +711,7 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
 
-  // FIX-5.9-2: 使用带缓存的查询（60s TTL），减少高频场景 DB 压力
+  // 使用带缓存的查询（60s TTL），减少高频场景 DB 压力（FIX-5.9-2）
   let model;
   try {
     model = await lookupModelCached(modelName);
@@ -784,7 +795,7 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   }
 });
 
-// ─── 计费记录（内部服务专用）──────────────────────────────
+// ─── 计费记录（内部服务专用）──────────────────────────────────
 app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (req, res) => {
   let {
     userEmail, apiProvider, modelName,
@@ -850,14 +861,15 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
 
   // ── 幂等键快速路径（事务外，减少锁争用）─────────────────
-  // FIX-5.8-2: 预检查询包含 au.is_free，响应使用真实值
+  // FIX-5.10-1：查询新增 AND au.user_email = $2，防止跨用户 key 碰撞
   if (normalizedIdempKey) {
     try {
       const idempRes = await db.query(
         `SELECT au.charged_fen, au.is_free, ub.balance_fen
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
-          WHERE au.idempotency_key = $1`,
+          WHERE au.idempotency_key = $1
+            AND au.user_email = $2`,
         [normalizedIdempKey, userEmail]
       );
       if (idempRes.rows.length > 0) {
@@ -911,7 +923,6 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       }
 
       try {
-        // FIX-5.8-3: 免费模型 INSERT 含幂等键 + ON CONFLICT DO NOTHING
         const freeInsertRes = await client.query(
           `INSERT INTO api_usage
                (user_email, api_model_id, api_provider, model_name,
@@ -1023,6 +1034,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     );
 
     // 并发幂等冲突（付费模型）：回滚已扣费的事务，返回已有记录
+    // FIX-5.10-1：查询新增 AND au.user_email = $2，防止跨用户 key 碰撞
     if (usageRes.rows.length === 0 && normalizedIdempKey) {
       await safeRollback(client, '/billing/record idempotency conflict');
       logger.info('Idempotent billing record (conflict resolution)', { idempotencyKey: normalizedIdempKey, userEmail });
@@ -1030,7 +1042,8 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         `SELECT au.charged_fen, au.is_free, ub.balance_fen
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
-          WHERE au.idempotency_key = $1`,
+          WHERE au.idempotency_key = $1
+            AND au.user_email = $2`,
         [normalizedIdempKey, userEmail]
       );
       return res.json({
@@ -1126,7 +1139,6 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     if (priceInput < 0 || priceOutput < 0) {
       return res.status(400).json({ success: false, msg: 'priceInput 和 priceOutput 必须为非负数' });
     }
-    // 单价上限：100 元/千 Token 已远超任何现实 API 定价
     if (priceInput > 100 || priceOutput > 100) {
       return res.status(400).json({ success: false, msg: 'priceInput/priceOutput 不得超过 100（元/千 Token）' });
     }
@@ -1163,7 +1175,7 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
        currencyVal, !!supportsCache, description || null]
     );
 
-    // FIX-5.9-6: 清除模型缓存，确保 /billing/check 立即读到新价格
+    // 清除模型缓存，确保 /billing/check 立即读到新价格（FIX-5.9-6）
     modelCacheDelete(modelName);
 
     logger.info('Model upserted', { modelName, isFree });
@@ -1283,7 +1295,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
       return res.status(404).json({ success: false, msg: '模型不存在' });
     }
 
-    // FIX-5.9-6: 清除模型缓存
+    // 清除模型缓存（FIX-5.9-6）
     modelCacheDelete(currentModel.model_name);
 
     logger.info('Model updated', { id, modelName: currentModel.model_name, updates: req.body });
@@ -1331,7 +1343,7 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
   if (!/^https?:\/\/.+/.test(baseUrl)) {
     return res.status(400).json({ success: false, msg: 'baseUrl 必须以 http:// 或 https:// 开头' });
   }
-  // FIX-5.9-4: 新增 description 长度校验
+  // FIX-5.9-4: description 长度校验
   if (description != null && (typeof description !== 'string' || description.length > 500)) {
     return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
   }
@@ -1357,7 +1369,7 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
   }
 });
 
-// FIX-5.9-5: 新增 PUT /admin/providers/:id 端点
+// FIX-5.9-5: PUT /admin/providers/:id 端点
 app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) {
@@ -1460,9 +1472,8 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     const newBalance    = Number(result.rows[0].balance_fen);
     const actualApplied = newBalance - oldBalance;
 
-    // FIX-5.8-1: actualApplied 为 0 时跳过流水 INSERT
+    // FIX-5.8-1: actualApplied 为 0 时跳过流水 INSERT（避免违反 CHECK amount_fen != 0）
     // 场景：余额为 0 时执行负数扣减 → GREATEST(0,0-N)=0 → 无实际变动
-    // 旧代码插入 amount_fen=0 会违反 CHECK(amount_fen != 0) 约束
     if (actualApplied !== 0) {
       await client.query(
         `INSERT INTO billing_transactions
@@ -1481,7 +1492,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
       balance_fen:        newBalance,
       actual_applied_fen: actualApplied,
     };
-    // 扣减被截断到 0 时附带说明（余额不足以完全扣减）
+    // 扣减被截断到 0 时附带说明
     if (actualApplied === 0 && amount_fen < 0) {
       response.note = `余额已为 0，扣减无效（请求扣减 ${Math.abs(amount_fen)} 分，实际扣减 0 分）`;
     }
@@ -1520,7 +1531,7 @@ const server = app.listen(PORT, HOST, () => {
     logger.warn('ADMIN_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   if (!SERVICE_TOKEN) {
-    logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口无内部服务鉴权（建议通过环境变量配置）');
+    logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口将拒绝所有请求（fail-closed）');
   } else if (SERVICE_TOKEN.length < 64) {
     logger.warn('SERVICE_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
@@ -1529,6 +1540,7 @@ const server = app.listen(PORT, HOST, () => {
     maxSingleRequestFen: getMaxSingleRequestFen(),
     usdToCnyRate:        getUsdToCnyRate(),
     modelCacheTtlSec:    MODEL_CACHE_TTL_MS / 1000,
+    modelCacheMaxSize:   MAX_MODEL_CACHE_SIZE,
   });
 });
 
