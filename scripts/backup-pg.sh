@@ -7,6 +7,11 @@
 #   #FIX-B1  Python3 可用性检查：先尝试 python3，失败则用 grep+sed
 #            兜底，确保在 python3 未安装的环境中也能正确读取密码
 #   #FIX-B2  明确使用 set -euo pipefail，并增加 PGPASSWORD 来源日志
+#   #FIX-B3  新增数据库存在性验证：跳过不存在的数据库而非报错退出
+#            原实现在 nextcloud 数据库未部署时 pg_dump 失败会使整个
+#            脚本以 FAIL=1 退出，造成 cron 误报。
+#            修复：连接前先查询 pg_database，仅备份存在的数据库；
+#            跳过的数据库以 WARN 级别记录，不影响整体退出码。
 #
 # 用法：
 #   bash scripts/backup-pg.sh
@@ -46,7 +51,7 @@ with open('${ENV_FILE}') as f:
 " 2>/dev/null || true)"
     fi
 
-    # FIX-B1 降级：python3 不可用时使用 grep+sed（不支持值中有引号的情况，但覆盖常见场景）
+    # FIX-B1 降级：python3 不可用时使用 grep+sed
     if [ -z "${PGPASSWORD:-}" ]; then
       PGPASSWORD="$(grep -E '^(PGPASSWORD|PG_PASSWORD)=' "${ENV_FILE}" | head -1 | sed 's/^[^=]*=//' | sed "s/^['\"]//;s/['\"]$//" || true)"
     fi
@@ -68,12 +73,39 @@ if ! command -v pg_dump &>/dev/null; then
   exit 1
 fi
 
-# ─── 创建备份目录 ───────────────────────────────────────────
+# ─── 创建备份目录 ────────────────────────────────────────────
 mkdir -p "${BACKUP_DIR}"
 
-# ─── 逐库备份 ───────────────────────────────────────────────
+# ─── FIX-B3：查询数据库实例中实际存在的数据库列表 ─────────────
+# 原实现直接对所有配置的数据库调用 pg_dump，nextcloud 等可选库
+# 未部署时会导致 pg_dump 失败并使脚本以错误码退出、触发 cron 报警。
+# 修复：先查询 pg_database，仅备份确实存在的数据库。
+echo "[INFO]  $(date '+%F %T') 查询数据库实例中的可备份数据库..."
+EXISTING_DBS="$(PGPASSWORD="${PGPASSWORD}" PGSSLMODE="${PGSSLMODE}" psql \
+  -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" \
+  -d postgres \
+  -t -A \
+  -c "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;" \
+  2>/dev/null || true)"
+
+if [ -z "${EXISTING_DBS}" ]; then
+  echo "[ERROR] $(date '+%F %T') 无法连接到 PostgreSQL 或查询数据库列表失败" >&2
+  exit 1
+fi
+
+# ─── 逐库备份 ────────────────────────────────────────────────
 FAIL=0
+SKIPPED=0
+BACKED_UP=0
+
 for DB in ${DATABASES}; do
+  # 检查数据库是否存在（跳过不存在的数据库，避免误报）
+  if ! echo "${EXISTING_DBS}" | grep -qx "${DB}"; then
+    echo "[WARN]  $(date '+%F %T') 数据库 '${DB}' 不存在，跳过备份（若已部署请检查数据库名称）"
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
+
   BACKUP_FILE="${BACKUP_DIR}/${DB}_${TIMESTAMP}.sql.gz"
   echo "[INFO]  $(date '+%F %T') 开始备份: ${DB} → ${BACKUP_FILE}"
 
@@ -84,6 +116,7 @@ for DB in ${DATABASES}; do
     chmod 600 "${BACKUP_FILE}"
     SIZE=$(du -h "${BACKUP_FILE}" | cut -f1)
     echo "[INFO]  $(date '+%F %T') 备份完成: ${DB} (${SIZE})"
+    BACKED_UP=$((BACKED_UP + 1))
   else
     echo "[ERROR] $(date '+%F %T') 备份失败: ${DB}" >&2
     rm -f "${BACKUP_FILE}"
@@ -100,6 +133,7 @@ echo "[INFO]  $(date '+%F %T') 已清理 ${CLEANED} 个旧备份文件"
 TOTAL=$(find "${BACKUP_DIR}" -name "*.sql.gz" | wc -l)
 TOTAL_SIZE=$(du -sh "${BACKUP_DIR}" 2>/dev/null | cut -f1)
 echo "[INFO]  $(date '+%F %T') 备份目录: ${BACKUP_DIR} (${TOTAL} 个文件, ${TOTAL_SIZE})"
+echo "[INFO]  $(date '+%F %T') 本次结果: 成功 ${BACKED_UP} 个, 跳过 ${SKIPPED} 个（数据库不存在）"
 
 if [ "${FAIL}" -ne 0 ]; then
   echo "[WARN]  $(date '+%F %T') 部分数据库备份失败，请检查日志" >&2
