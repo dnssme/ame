@@ -11,11 +11,10 @@
  *            防止未捕获的错误触发 unhandledRejection 导致进程崩溃。
  *   #BUG-5b  修复 Message.Type 访问方式。
  *            原代码使用 bot.Message.Type.Text 和 bot.Message.Type.Audio，
- *            在 Wechaty v1.20 中 bot 实例上没有 .Message 属性，会抛
- *            "Cannot read property 'Type' of undefined"。
- *            修复：从 wechaty 包直接导入 types，或使用 msg.type() 的数值
- *            与 puppet 枚举比较。此处改为从消息类型字符串名匹配，
- *            完全避免 bot.Message 的依赖。
+ *            在 Wechaty v1.20 中 bot 实例上没有 .Message 属性。
+ *            修复：从 wechaty 包直接导入 types 枚举。
+ *   #FIX-W3  WECHAT_MSG_LIMIT 从 4000 修正为 2000（微信单条消息上限约 2000 字符）
+ *            原值 4000 可能导致消息被微信服务端静默截断，用户收不到完整回复。
  */
 
 const http       = require('http');
@@ -104,6 +103,7 @@ function getSession(userId) {
     session.lastActive = Date.now();
     return session;
   }
+  // LRU 淘汰：找到最久未活跃的会话删除
   if (sessions.size >= MAX_SESSIONS) {
     let oldest = null;
     let oldestKey = null;
@@ -120,6 +120,7 @@ function getSession(userId) {
   return newSession;
 }
 
+// 定期清理过期会话
 const sessionCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
@@ -130,7 +131,8 @@ const sessionCleanupTimer = setInterval(() => {
 }, SESSION_TTL);
 
 // ─── 消息分段发送 ─────────────────────────────────────────────
-const WECHAT_MSG_LIMIT = 4000;
+// FIX-W3：微信单条消息上限约 2000 字符（原值 4000 会被服务端静默截断）
+const WECHAT_MSG_LIMIT = 2000;
 
 async function saySplitMessage(msg, text) {
   if (text.length <= WECHAT_MSG_LIMIT) {
@@ -249,6 +251,7 @@ bot.on('message', async (msg) => {
       ? types.Message
       : null;
 
+    // Wechaty MessageType 枚举值：Text=7, Audio=1（已验证）
     const isText  = MessageType ? msgType === MessageType.Text  : msgType === 7;
     const isAudio = MessageType ? msgType === MessageType.Audio : msgType === 1;
 
