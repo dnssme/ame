@@ -1,8 +1,37 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.26
+ * Anima 灵枢 · Webhook 服务 v5.27
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.27 相对于 v5.26）：
+ *
+ *   #FIX-5.27-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - 新增 server.maxConnections（默认 1024），限制并发
+ *                  TCP 连接数，防止连接洪水耗尽文件描述符导致服务拒绝
+ *                  （CIS 资源保护 / DoS 缓解）。
+ *                - 启动时检测 Redis 是否使用 TLS（rediss:// 协议），
+ *                  非 TLS 连接输出警告日志（PCI-DSS 4.1 传输加密）。
+ *                - 新增 stripControlChars() 工具函数，对文本输入字段
+ *                  （description、label、displayName）剥离 ASCII 控制
+ *                  字符（0x00-0x1F / 0x7F，保留 \t\n\r），防止控制
+ *                  字符注入日志或数据库（PCI-DSS 6.5 输入净化纵深防御）。
+ *                - process.exit() 前增加 100ms 延迟，确保 winston
+ *                  最终日志条目落盘（CIS 日志完整性——致命错误日志不丢失）。
+ *                - PG_POOL_MAX 环境变量新增上限校验（1-100），
+ *                  防止误配置导致连接数爆炸（CIS 资源保护）。
+ *
+ *   #FIX-5.27-2  企业生产级速度优化
+ *                - 高频 SQL 查询改用命名预备语句（name 参数），
+ *                  连接复用时跳过 SQL 解析阶段，减少 DB CPU 开销
+ *                  （lookupModel / lookupModelInTx / ensureUser / balance 查询）。
+ *                - /health 端点 DB 与 Redis 检查改为 Promise.all()
+ *                  并行执行，健康检查延迟从串行 2×RTT 降至 1×RTT。
+ *                - 静态 JSON 错误响应预序列化为 Buffer，高频拒绝路径
+ *                  （415/405/404）跳过重复 JSON.stringify + Buffer 转换。
+ *
+ *   #FIX-5.27-3  前端版本号同步
+ *                - admin.html 侧边栏及 JS 注释版本号对齐至 v5.27。
+ *
  * 修复记录（v5.26 相对于 v5.25）：
  *
  *   #FIX-5.26-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -445,6 +474,10 @@ const logger = winston.createLogger({
 });
 
 // ─── 数据库连接池 ─────────────────────────────────────────────
+// FIX-5.27-1: CIS 资源保护——PG_POOL_MAX 上限校验，防止误配置导致连接数爆炸
+const PG_POOL_MAX_RAW = parseInt(process.env.PG_POOL_MAX || '15', 10);
+const PG_POOL_MAX = (Number.isFinite(PG_POOL_MAX_RAW) && PG_POOL_MAX_RAW >= 1 && PG_POOL_MAX_RAW <= 100)
+  ? PG_POOL_MAX_RAW : 15;
 const db = new Pool({
   host:     process.env.PG_HOST     || 'anima-db.postgres.database.azure.com',
   port:     parseInt(process.env.PG_PORT || '5432', 10),
@@ -452,7 +485,7 @@ const db = new Pool({
   password: process.env.PG_PASSWORD,
   database: process.env.PG_DATABASE || 'librechat',
   ssl:      { rejectUnauthorized: true },
-  max:      parseInt(process.env.PG_POOL_MAX || '15', 10),
+  max:      PG_POOL_MAX,
   idleTimeoutMillis:           30_000,
   connectionTimeoutMillis:      5_000,
   statement_timeout:           10_000,
@@ -467,6 +500,10 @@ db.on('error', (err) => logger.error('DB pool error', { err: err.message }));
 
 // ─── Redis 连接 ───────────────────────────────────────────────
 const REDIS_URL = process.env.REDIS_URL || 'redis://172.16.1.6:6379';
+// FIX-5.27-1: PCI-DSS 4.1——检测 Redis 传输层是否加密
+if (!REDIS_URL.startsWith('rediss://')) {
+  logger.warn('Redis 连接未使用 TLS（rediss://），生产环境建议启用加密传输（PCI-DSS 4.1）');
+}
 const redis = new Redis(REDIS_URL, {
   maxRetriesPerRequest: 3,
   retryStrategy(times) {
@@ -628,6 +665,11 @@ app.set('trust proxy', process.env.TRUST_PROXY || '172.16.1.1');
 // 注：管理面板 /admin/dashboard 使用自定义 SHA-256 ETag，不受影响
 app.disable('etag');
 
+// FIX-5.27-2: 预序列化高频静态 JSON 错误响应为 Buffer，跳过重复 JSON.stringify
+const RESP_405 = Buffer.from(JSON.stringify({ success: false, msg: 'Method Not Allowed' }));
+const RESP_415 = Buffer.from(JSON.stringify({ success: false, msg: 'Content-Type 必须为 application/json' }));
+const RESP_404 = Buffer.from(JSON.stringify({ success: false, msg: '接口不存在' }));
+
 // FIX-5.20-2 + FIX-5.24-1: 严格 helmet 配置，满足 PCI-DSS & CIS 安全基线
 app.use(helmet({
   // HSTS: PCI-DSS 要求强制 HTTPS，预加载列表
@@ -699,21 +741,25 @@ app.use((_req, res, next) => {
 });
 
 // FIX-5.20-2: CIS 要求禁用 TRACE/TRACK 方法
+// FIX-5.27-2: 使用预序列化 Buffer 响应，跳过运行时 JSON.stringify
 app.use((req, res, next) => {
   if (req.method === 'TRACE' || req.method === 'TRACK') {
-    return res.status(405).json({ success: false, msg: 'Method Not Allowed' });
+    res.status(405).setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.end(RESP_405);
   }
   next();
 });
 
 // FIX-5.26-1: PCI-DSS 6.5 输入校验——POST/PUT/PATCH 请求必须携带 JSON Content-Type
 // 防止非 JSON 负载绕过 express.json() 解析器导致 req.body 为 undefined
+// FIX-5.27-2: 使用预序列化 Buffer 响应
 app.use((req, res, next) => {
   if (
     (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') &&
     !( req.headers['content-type'] && req.headers['content-type'].startsWith('application/json') )
   ) {
-    return res.status(415).json({ success: false, msg: 'Content-Type 必须为 application/json' });
+    res.status(415).setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.end(RESP_415);
   }
   next();
 });
@@ -833,6 +879,12 @@ const API_PROVIDER_RE = /^[a-zA-Z0-9._-]+$/;
 // FIX-5.24-1: modelName 字符集校验——仅允许字母、数字、连字符、下划线、点、冒号、斜杠
 // 模型名称含 provider:model 或 org/model 命名惯例（如 openai/gpt-4、claude-3:opus）
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
+// FIX-5.27-1: PCI-DSS 6.5 输入净化——剥离 ASCII 控制字符，防止日志/DB 注入
+// 保留 \t (0x09)、\n (0x0A)、\r (0x0D)，这些在 description 等多行字段中有合法用途
+const CONTROL_CHARS_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+function stripControlChars(s) {
+  return typeof s === 'string' ? s.replace(CONTROL_CHARS_RE, '') : s;
+}
 
 function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
@@ -876,24 +928,28 @@ function parseOptionalNonNegInt(value) {
   return undefined;
 }
 
+// FIX-5.27-2: 高频 SQL 改用命名预备语句——连接复用时跳过 SQL 解析阶段
 async function ensureUser(client, userEmail) {
-  await client.query(
-    `INSERT INTO user_billing (user_email) VALUES ($1)
+  await client.query({
+    name: 'ensure_user',
+    text: `INSERT INTO user_billing (user_email) VALUES ($1)
      ON CONFLICT (user_email) DO NOTHING`,
-    [userEmail]
-  );
+    values: [userEmail],
+  });
 }
 
 /**
  * 只读模型查询（不带缓存），用于直接 DB 访问。
+ * FIX-5.27-2: 命名预备语句加速重复查询
  */
 async function lookupModel(modelName) {
-  const res = await db.query(
-    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens,
+  const res = await db.query({
+    name: 'lookup_model',
+    text: `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens,
             currency, is_active, supports_cache
        FROM api_models WHERE model_name = $1`,
-    [modelName]
-  );
+    values: [modelName],
+  });
   return res.rows[0] || null;
 }
 
@@ -914,15 +970,17 @@ async function lookupModelCached(modelName) {
  * 事务内模型查询（FOR SHARE 锁），防止 TOCTOU 竞态。
  * 用于 /billing/record 等写路径，确保读到最新数据。
  * FOR SHARE：允许并发读，阻止并发写（admin 更新模型价格时需等待）。
+ * FIX-5.27-2: 命名预备语句加速重复查询
  */
 async function lookupModelInTx(client, modelName) {
-  const res = await client.query(
-    `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens,
+  const res = await client.query({
+    name: 'lookup_model_tx',
+    text: `SELECT id, is_free, price_input_per_1k_tokens, price_output_per_1k_tokens,
             currency, is_active, supports_cache
        FROM api_models WHERE model_name = $1
        FOR SHARE`,
-    [modelName]
-  );
+    values: [modelName],
+  });
   return res.rows[0] || null;
 }
 
@@ -1001,27 +1059,28 @@ async function safeRollback(client, context) {
 
 // ─── 健康检查（FIX-5.9-1: 含 Redis 状态）────────────────────
 // FIX-5.25-1: CIS 2.3 信息最小化——不暴露 db/redis 内部组件状态
+// FIX-5.27-2: DB 与 Redis 并行检查，健康检查延迟从串行 2×RTT 降至 1×RTT
 app.get('/health', async (_req, res) => {
   let httpStatus = 200;
 
-  // DB 检查（必须健康，否则 HTTP 503）
-  try {
-    await db.query('SELECT 1');
-  } catch (err) {
+  const dbCheck = db.query('SELECT 1').catch((err) => {
     logger.error('Health check DB error', { err: err.message });
     httpStatus = 503;
-  }
+  });
 
-  // Redis 检查（降级运行不影响 HTTP 状态码，但运维需通过日志感知）
-  try {
-    if (redis.status === 'ready') {
-      await redis.ping();
-    } else {
-      logger.info('Health check: Redis disconnected (degraded mode)');
+  const redisCheck = (async () => {
+    try {
+      if (redis.status === 'ready') {
+        await redis.ping();
+      } else {
+        logger.info('Health check: Redis disconnected (degraded mode)');
+      }
+    } catch (err) {
+      logger.warn('Health check Redis error', { err: err.message });
     }
-  } catch (err) {
-    logger.warn('Health check Redis error', { err: err.message });
-  }
+  })();
+
+  await Promise.all([dbCheck, redisCheck]);
 
   // FIX-5.23-2: 健康检查禁止缓存——确保探针获取实时状态
   res.set('Cache-Control', 'no-store, max-age=0');
@@ -1898,9 +1957,9 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
          RETURNING id, provider, model_name, display_name, is_free,
                    price_input_per_1k_tokens, price_output_per_1k_tokens,
                    currency, supports_cache, is_active`,
-      [provider, modelName, displayName, isFree,
+      [provider, modelName, stripControlChars(displayName), isFree,
        isFree ? 0 : priceInput, isFree ? 0 : priceOutput,
-       currencyVal, !!supportsCache, description || null]
+       currencyVal, !!supportsCache, stripControlChars(description) || null]
     );
 
     // 清除模型缓存，确保 /billing/check 立即读到新价格（FIX-5.9-6）
@@ -1999,14 +2058,14 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
       return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 128 字符' });
     }
     updates.push(`display_name = $${values.length + 1}`);
-    values.push(displayName);
+    values.push(stripControlChars(displayName));
   }
   if (typeof description === 'string') {
     if (description.length > 1000) {
       return res.status(400).json({ success: false, msg: 'description 长度不能超过 1000 字符' });
     }
     updates.push(`description = $${values.length + 1}`);
-    values.push(description);
+    values.push(stripControlChars(description));
   }
 
   if (updates.length === 0) {
@@ -2120,7 +2179,7 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
            is_enabled   = EXCLUDED.is_enabled,
            description  = EXCLUDED.description
          RETURNING *`,
-      [providerName, displayName, baseUrl, isEnabled !== false, description || null]
+      [providerName, stripControlChars(displayName), baseUrl, isEnabled !== false, stripControlChars(description) || null]
     );
     auditLog('provider_upsert', { providerName }, req);
     res.json({ success: true, provider: result.rows[0] });
@@ -2146,7 +2205,7 @@ app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => 
       return res.status(400).json({ success: false, msg: 'displayName 不能为空且长度不超过 64 字符' });
     }
     updates.push(`display_name = $${values.length + 1}`);
-    values.push(displayName);
+    values.push(stripControlChars(displayName));
   }
   if (typeof baseUrl === 'string') {
     // FIX-5.21-1: SSRF 防护（同 POST /admin/providers）
@@ -2165,7 +2224,7 @@ app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => 
       return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
     }
     updates.push(`description = $${values.length + 1}`);
-    values.push(description);
+    values.push(stripControlChars(description));
   }
 
   if (updates.length === 0) {
@@ -2278,7 +2337,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
         `INSERT INTO billing_transactions
              (user_email, type, amount_fen, balance_after_fen, description)
            VALUES ($1,$2,$3,$4,$5)`,
-        [userEmail, type, actualApplied, newBalance, description || '管理员调整']
+        [userEmail, type, actualApplied, newBalance, stripControlChars(description) || '管理员调整']
       );
     }
 
@@ -2405,7 +2464,7 @@ app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
     const keys = [];
     const valuePlaceholders = [];
     const params = [];
-    const labelVal = label || null;
+    const labelVal = stripControlChars(label) || null;
     for (let i = 0; i < cardCount; i++) {
       const cardKey = crypto.randomBytes(16).toString('hex').toUpperCase();
       keys.push(cardKey);
@@ -2470,8 +2529,10 @@ app.get('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
 });
 
 // ─── 404 & 全局错误处理 ───────────────────────────────────────
+// FIX-5.27-2: 使用预序列化 Buffer 响应
 app.use((_req, res) => {
-  res.status(404).json({ success: false, msg: '接口不存在' });
+  res.status(404).setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(RESP_404);
 });
 
 // eslint-disable-next-line no-unused-vars
@@ -2521,6 +2582,7 @@ const server = app.listen(PORT, HOST, () => {
     usdToCnyRate:        getUsdToCnyRate(),
     modelCacheTtlSec:    MODEL_CACHE_TTL_MS / 1000,
     modelCacheMaxSize:   MAX_MODEL_CACHE_SIZE,
+    pgPoolMax:           PG_POOL_MAX,
   });
 });
 
@@ -2533,6 +2595,8 @@ server.headersTimeout    = 66_000; // 必须 > keepAliveTimeout
 server.requestTimeout    = 30_000;
 // 50: 标准浏览器/内部服务请求通常携带 10-20 个头，50 已含充分余量（Node 默认 2000 过于宽松）
 server.maxHeadersCount   = 50;
+// FIX-5.27-1: CIS 资源保护——限制并发 TCP 连接数，防止连接洪水耗尽文件描述符
+server.maxConnections    = 1024;
 
 // FIX-5.25-1: CIS 进程管理——优雅关闭超时可配置，便于 K8s terminationGracePeriodSeconds 对齐
 // 有效范围 5-60 秒，默认 10 秒
@@ -2569,13 +2633,15 @@ const shutdown = (signal) => {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 
+// FIX-5.27-1: CIS 日志完整性——致命错误处理器增加 100ms 延迟确保日志落盘
+// winston 异步写入日志文件，process.exit() 会截断尚未刷新的缓冲区
 process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled promise rejection, shutting down', { err: String(reason) });
-  process.exit(1);
+  setTimeout(() => process.exit(1), 100);
 });
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception, shutting down', { err: err.message, stack: err.stack });
-  process.exit(1);
+  setTimeout(() => process.exit(1), 100);
 });
 
 module.exports = app;

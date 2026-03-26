@@ -1,6 +1,6 @@
 {
   "name": "anima-webhook",
-  "version": "5.26.0",
+  "version": "5.27.0",
   "description": "Anima 灵枢 · 订阅激活 + API 计费 Webhook 服务",
   "main": "server.js",
   "engines": {
