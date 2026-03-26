@@ -11,10 +11,17 @@
  *   - 用户强隔离（独立 Redis 键空间、独立会话、独立计费）
  *   - 文字消息 → AI 对话
  *   - 语音消息 → Whisper STT → AI → TTS → 语音回复
- *   - 图片/文件 → 文件分析
+ *   - 图片消息 → AI 图片分析
+ *   - 视频/文件 → 文件分析
+ *   - 位置消息 → 位置相关 AI 服务
+ *   - 链接消息 → 链接内容分析
  *   - /model 切换模型
  *   - /balance 查询余额
  *   - /clear 清除对话上下文
+ *   - /search 网页搜索（DuckDuckGo）
+ *   - /calendar 日历管理（Nextcloud CalDAV）
+ *   - /home 智能家居控制（Home Assistant）
+ *   - /files 云存储信息（Nextcloud WebDAV）
  *   - /help 帮助信息
  *   - 长耗时任务异步回复
  *   - 消息分段发送（适配微信消息长度限制）
@@ -390,6 +397,216 @@ async function sendAsyncReply(openId, text) {
   }
 }
 
+// ─── 微信媒体 API ────────────────────────────────────────────
+
+/**
+ * 从微信服务器下载临时媒体文件（语音/图片/视频/文件）。
+ * @param {string} mediaId - 微信 MediaId
+ * @returns {Promise<{buffer: Buffer, contentType: string}|null>}
+ */
+async function downloadMedia(mediaId) {
+  const token = await getAccessToken();
+  if (!token) {
+    logger.error('下载媒体失败：access_token 不可用', { mediaId });
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const url = `https://api.weixin.qq.com/cgi-bin/media/get?access_token=${encodeURIComponent(token)}&media_id=${encodeURIComponent(mediaId)}`;
+    const { body, headers } = await request(url, {
+      bodyTimeout: 30_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const contentType = headers['content-type'] || '';
+    // 微信错误返回 JSON
+    if (contentType.includes('application/json') || contentType.includes('text/plain')) {
+      const errData = await body.json();
+      logger.error('下载媒体失败', { errcode: errData.errcode, errmsg: errData.errmsg, mediaId });
+      return null;
+    }
+
+    const chunks = [];
+    for await (const chunk of body) {
+      chunks.push(chunk);
+    }
+    return { buffer: Buffer.concat(chunks), contentType };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('下载媒体异常', { err: err.message, mediaId });
+    return null;
+  }
+}
+
+/**
+ * 上传临时媒体到微信服务器（用于回复语音消息）。
+ * @param {Buffer} audioBuffer - 音频文件 Buffer
+ * @param {string} type - 媒体类型 (voice/image/video/thumb)
+ * @returns {Promise<string>} 上传后的 media_id，失败返回空字符串
+ */
+async function uploadVoiceMedia(audioBuffer, type = 'voice') {
+  const token = await getAccessToken();
+  if (!token) return '';
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const boundary = `----WebKitFormBoundary${crypto.randomBytes(16).toString('hex')}`;
+    const filename = type === 'voice' ? 'reply.mp3' : 'media.bin';
+    const contentTypeMap = { voice: 'audio/mpeg', image: 'image/png', video: 'video/mp4' };
+    const mimeType = contentTypeMap[type] || 'application/octet-stream';
+
+    const head = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`
+    );
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const payload = Buffer.concat([head, audioBuffer, tail]);
+
+    const url = `https://api.weixin.qq.com/cgi-bin/media/upload?access_token=${encodeURIComponent(token)}&type=${type}`;
+    const { body } = await request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: payload,
+      bodyTimeout: 30_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const data = await body.json();
+    if (data.media_id) {
+      return data.media_id;
+    }
+    logger.error('上传媒体失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('上传媒体异常', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 调用 Whisper STT 服务将音频转文字。
+ * @param {Buffer} audioBuffer - 音频文件
+ * @param {string} format - 音频格式 (amr/mp3/wav)
+ * @returns {Promise<string>} 转录文本
+ */
+async function transcribeVoice(audioBuffer, format = 'amr') {
+  if (!VOICE_ENABLED) return '';
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const boundary = `----WhisperBoundary${crypto.randomBytes(16).toString('hex')}`;
+    const mimeMap = { amr: 'audio/amr', mp3: 'audio/mpeg', wav: 'audio/wav' };
+    const mimeType = mimeMap[format] || 'application/octet-stream';
+
+    const head = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${format}"\r\nContent-Type: ${mimeType}\r\n\r\n`
+    );
+    const langPart = Buffer.from(
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nzh\r\n--${boundary}--\r\n`
+    );
+    const payload = Buffer.concat([head, audioBuffer, langPart]);
+
+    const { body } = await request(WHISPER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: payload,
+      bodyTimeout: 60_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const data = await body.json();
+    return data.text || data.transcription || '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('Whisper STT 失败', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 调用 Coqui TTS 将文本合成语音。
+ * @param {string} text - 要合成的文本
+ * @returns {Promise<Buffer|null>} 音频 Buffer (WAV 格式)
+ */
+async function synthesizeSpeech(text) {
+  if (!VOICE_ENABLED) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const { body } = await request(TTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, language: 'zh' }),
+      bodyTimeout: 30_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const chunks = [];
+    for await (const chunk of body) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('TTS 合成失败', { err: err.message });
+    return null;
+  }
+}
+
+/**
+ * 通过客服消息接口发送语音回复。
+ */
+async function sendAsyncVoiceReply(openId, voiceMediaId) {
+  const token = await getAccessToken();
+  if (!token) return;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          touser: openId,
+          msgtype: 'voice',
+          voice: { media_id: voiceMediaId },
+        }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode && result.errcode !== 0) {
+      logger.error('语音客服消息发送失败', { errcode: result.errcode, errmsg: result.errmsg, openId });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('语音客服消息发送异常', { err: err.message, openId });
+  }
+}
+
 // ─── 输入验证 ────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
@@ -430,12 +647,23 @@ async function handleTextMessage(openId, rawText) {
   // /help — 帮助
   if (text === '/help') {
     return '📖 Anima 灵枢 · ClawBot 命令列表\n\n' +
+      '【基础】\n' +
       '/bind <邮箱> — 绑定邮箱（首次使用必须绑定）\n' +
       '/balance — 查询账户余额\n' +
       '/model <模型名> — 切换 AI 模型\n' +
-      '/clear — 清除对话上下文\n' +
-      '/help — 显示此帮助\n\n' +
-      '直接发送文字即可与 AI 对话。';
+      '/clear — 清除对话上下文\n\n' +
+      '【工具】\n' +
+      '/search <关键词> — 网页搜索\n' +
+      '/calendar [操作] — 日历管理\n' +
+      '/home [命令] — 智能家居控制\n' +
+      '/files — 云存储信息\n\n' +
+      '【消息类型】\n' +
+      '• 发送文字 — AI 对话\n' +
+      '• 发送语音 — 语音转文字 → AI 对话\n' +
+      '• 发送图片/文件 — AI 分析\n' +
+      '• 发送位置 — 位置相关 AI 服务\n' +
+      '• 发送链接 — 链接内容分析\n\n' +
+      '/help — 显示此帮助';
   }
 
   // ── 认证检查（/bind 和 /help 不需要认证）──
@@ -479,6 +707,74 @@ async function handleTextMessage(openId, rawText) {
     return '🗑 对话上下文已清除。';
   }
 
+  // /search <query> — 网页搜索（通过 Agent 调用 DuckDuckGo）
+  if (text.startsWith('/search ') || text.startsWith('/search\u3000')) {
+    const query = text.slice(8).trim();
+    if (!query || query.length > MAX_TEXT_LENGTH) {
+      return '❌ 请输入搜索关键词。\n\n用法：/search 关键词';
+    }
+    logger.info('用户发起搜索', { openId, query: query.substring(0, 50) });
+    const searchPrompt = `请帮我搜索以下内容并总结结果：${query}`;
+    // 搜索是长耗时任务，异步处理
+    callAgent(openId, searchPrompt)
+      .then(async (reply) => {
+        await sendAsyncReply(openId, `🔍 搜索结果：\n\n${reply}`);
+      })
+      .catch(async (err) => {
+        logger.error('Search task failed', { err: err.message, openId });
+        await sendAsyncReply(openId, '❌ 搜索失败，请稍后重试。');
+      });
+    return '🔍 正在搜索，请稍候...';
+  }
+
+  // /calendar [操作] — 日历管理（通过 Agent 调用 CalDAV）
+  if (text === '/calendar' || text.startsWith('/calendar ') || text.startsWith('/calendar\u3000')) {
+    if (text === '/calendar') {
+      return '📅 日历管理\n\n' +
+        '用法：\n' +
+        '/calendar 查看今天日程\n' +
+        '/calendar 明天下午3点开会\n' +
+        '/calendar 删除xxx事件\n\n' +
+        '也可以直接用自然语言描述日程安排。';
+    }
+    const calendarCmd = text.slice(10).trim();
+    if (!calendarCmd) {
+      return '请输入日历操作内容。\n\n用法：/calendar 查看今天日程';
+    }
+    logger.info('用户日历操作', { openId, cmd: calendarCmd.substring(0, 50) });
+    return await callAgent(openId, `请帮我处理以下日历操作：${calendarCmd}`);
+  }
+
+  // /home [命令] — 智能家居控制（通过 Agent 调用 Home Assistant）
+  if (text === '/home' || text.startsWith('/home ') || text.startsWith('/home\u3000')) {
+    if (text === '/home') {
+      return '🏠 智能家居控制\n\n' +
+        '用法：\n' +
+        '/home 打开客厅灯\n' +
+        '/home 空调设置26度\n' +
+        '/home 查看家里温度\n\n' +
+        '也可以直接用自然语言描述操作。';
+    }
+    const homeCmd = text.slice(6).trim();
+    if (!homeCmd) {
+      return '请输入智能家居操作。\n\n用法：/home 打开客厅灯';
+    }
+    logger.info('用户智能家居操作', { openId, cmd: homeCmd.substring(0, 50) });
+    return await callAgent(openId, `请帮我执行以下智能家居操作：${homeCmd}`);
+  }
+
+  // /files — 云存储信息
+  if (text === '/files') {
+    return '☁️ 云存储 (Nextcloud)\n\n' +
+      '你的私有云盘支持：\n' +
+      '• 文件上传/下载/管理\n' +
+      '• 多设备同步\n' +
+      '• 文件分享（生成共享链接）\n' +
+      '• 版本管理与回收站\n\n' +
+      '请通过 Nextcloud 客户端或 Web 界面访问云盘。\n' +
+      '发送图片/文件到本对话可以进行 AI 分析。';
+  }
+
   // ── 普通消息 → AI 对话 ──
   logger.info('收到文字消息', { openId, text: text.substring(0, 100) });
 
@@ -500,24 +796,213 @@ async function handleTextMessage(openId, rawText) {
 }
 
 /**
- * 处理语音消息（如已启用语音模块）
+ * 处理语音消息：下载语音 → Whisper STT → AI 对话 → 文字回复。
+ * 如果 VOICE_ENABLED，会异步通过客服接口回复语音。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} mediaId - 微信语音 MediaId
+ * @param {string} recognition - 微信自带语音识别结果（可能为空）
  */
-async function handleVoiceMessage(openId) {
-  if (!VOICE_ENABLED) {
-    return '语音功能暂未启用，请发送文字消息。';
-  }
-  return '语音处理中...（语音转文字 → AI 对话 → 语音回复）\n暂请先发送文字消息。';
-}
-
-/**
- * 处理图片/文件消息
- */
-async function handleImageMessage(openId) {
+async function handleVoiceMessage(openId, mediaId, recognition) {
+  // 认证检查
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
   }
-  return '📎 已收到文件。文件分析功能可通过 Web 界面使用，ClawBot 通道将在后续版本支持文件直传分析。';
+
+  // 优先使用微信自带语音识别结果
+  if (recognition && recognition.trim()) {
+    logger.info('使用微信语音识别结果', { openId, recognition: recognition.substring(0, 50) });
+    const reply = await callAgent(openId, recognition.trim());
+
+    // 如果语音模块可用，异步发送 TTS 语音回复
+    if (VOICE_ENABLED) {
+      setImmediate(async () => {
+        try {
+          const ttsBuffer = await synthesizeSpeech(reply.substring(0, 500));
+          if (ttsBuffer) {
+            const voiceMediaId = await uploadVoiceMedia(ttsBuffer);
+            if (voiceMediaId) {
+              await sendAsyncVoiceReply(openId, voiceMediaId);
+            }
+          }
+        } catch (err) {
+          logger.error('TTS 语音回复失败', { err: err.message, openId });
+        }
+      });
+    }
+    return reply;
+  }
+
+  // 如果没有微信语音识别结果且语音模块未启用
+  if (!VOICE_ENABLED) {
+    return '🎙 已收到语音消息。\n\n语音转文字功能暂未启用，请发送文字消息与 AI 对话。';
+  }
+
+  // 使用 Whisper STT 转录
+  if (!mediaId) {
+    return '语音消息格式异常，请重试。';
+  }
+
+  logger.info('开始处理语音消息', { openId, mediaId });
+
+  // 异步处理：下载 → 转录 → AI → 回复
+  setImmediate(async () => {
+    try {
+      // 1. 下载语音文件
+      const media = await downloadMedia(mediaId);
+      if (!media) {
+        await sendAsyncReply(openId, '❌ 语音下载失败，请重试。');
+        return;
+      }
+
+      // 2. Whisper 转录
+      const text = await transcribeVoice(media.buffer, 'amr');
+      if (!text) {
+        await sendAsyncReply(openId, '❌ 语音识别失败，请重试或发送文字消息。');
+        return;
+      }
+
+      logger.info('语音转录完成', { openId, text: text.substring(0, 50) });
+
+      // 3. AI 对话
+      const reply = await callAgent(openId, text);
+      await sendAsyncReply(openId, `🎙 语音识别：${text}\n\n${reply}`);
+
+      // 4. 可选 TTS 语音回复
+      const ttsBuffer = await synthesizeSpeech(reply.substring(0, 500));
+      if (ttsBuffer) {
+        const voiceMediaId = await uploadVoiceMedia(ttsBuffer);
+        if (voiceMediaId) {
+          await sendAsyncVoiceReply(openId, voiceMediaId);
+        }
+      }
+    } catch (err) {
+      logger.error('语音消息处理失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 语音处理失败，请稍后重试。');
+    }
+  });
+
+  return '🎙 语音处理中，稍后回复...';
+}
+
+/**
+ * 处理图片消息：下载图片 → AI 分析。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} picUrl - 微信图片 URL
+ * @param {string} mediaId - 微信 MediaId
+ */
+async function handleImageMessage(openId, picUrl, mediaId) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  if (!picUrl && !mediaId) {
+    return '图片消息格式异常，请重试。';
+  }
+
+  logger.info('收到图片消息', { openId, hasPicUrl: !!picUrl, hasMediaId: !!mediaId });
+
+  // 异步处理图片分析
+  setImmediate(async () => {
+    try {
+      // 通过 Agent 分析图片（使用图片 URL 或下载后描述）
+      const imageContext = picUrl
+        ? `用户发送了一张图片，图片URL：${picUrl}。请分析这张图片的内容。`
+        : '用户发送了一张图片，请提供可能的分析帮助。';
+
+      const reply = await callAgent(openId, imageContext);
+      await sendAsyncReply(openId, `🖼 图片分析结果：\n\n${reply}`);
+    } catch (err) {
+      logger.error('图片分析失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 图片分析失败，请稍后重试。');
+    }
+  });
+
+  return '🖼 图片分析中，稍后回复...';
+}
+
+/**
+ * 处理视频/文件消息：转发到 Agent 进行分析。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} mediaId - 微信 MediaId
+ * @param {string} fileName - 文件名（文件消息才有）
+ */
+async function handleFileMessage(openId, mediaId, fileName) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  logger.info('收到文件消息', { openId, mediaId, fileName });
+
+  const fileDesc = fileName ? `文件名：${fileName}` : '视频/文件';
+
+  // 异步处理文件分析
+  setImmediate(async () => {
+    try {
+      const reply = await callAgent(openId, `用户发送了一个文件（${fileDesc}），请提供分析帮助。如需详细分析文件内容，建议通过 Web 界面上传。`);
+      await sendAsyncReply(openId, `📎 文件分析：\n\n${reply}`);
+    } catch (err) {
+      logger.error('文件分析失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 文件处理失败，请稍后重试。');
+    }
+  });
+
+  return `📎 已收到${fileName ? `文件「${fileName}」` : '文件'}，分析中...`;
+}
+
+/**
+ * 处理位置消息：提取经纬度和标签发送给 Agent。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} locationX - 纬度
+ * @param {string} locationY - 经度
+ * @param {string} scale - 地图缩放
+ * @param {string} label - 位置名称
+ */
+async function handleLocationMessage(openId, locationX, locationY, scale, label) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  logger.info('收到位置消息', { openId, label, lat: locationX, lng: locationY });
+
+  const locationDesc = label
+    ? `用户分享了位置「${label}」（纬度：${locationX}，经度：${locationY}）。请提供该位置相关的信息或帮助。`
+    : `用户分享了一个位置（纬度：${locationX}，经度：${locationY}）。请提供该位置相关的信息或帮助。`;
+
+  return await callAgent(openId, locationDesc);
+}
+
+/**
+ * 处理链接消息：提取标题、描述和URL发送给 Agent 分析。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} title - 链接标题
+ * @param {string} description - 链接描述
+ * @param {string} url - 链接 URL
+ */
+async function handleLinkMessage(openId, title, description, url) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  logger.info('收到链接消息', { openId, title, url });
+
+  const linkDesc = `用户分享了一个链接：\n标题：${title || '无'}\n描述：${description || '无'}\nURL：${url || '无'}\n\n请分析该链接内容并提供摘要或相关帮助。`;
+
+  // 链接分析可能耗时较长
+  callAgent(openId, linkDesc)
+    .then(async (reply) => {
+      await sendAsyncReply(openId, `🔗 链接分析：\n\n${reply}`);
+    })
+    .catch(async (err) => {
+      logger.error('链接分析失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 链接分析失败，请稍后重试。');
+    });
+
+  return '🔗 正在分析链接内容，稍后回复...';
 }
 
 // ─── 构建微信 XML 被动回复 ──────────────────────────────────
@@ -660,6 +1145,9 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   const msgType      = getXmlValue(xmlBody, 'MsgType');
   const content      = getXmlValue(xmlBody, 'Content');
   const msgId        = getXmlValue(xmlBody, 'MsgId');
+  const mediaId      = getXmlValue(xmlBody, 'MediaId');
+  const picUrl       = getXmlValue(xmlBody, 'PicUrl');
+  const recognition  = getXmlValue(xmlBody, 'Recognition');   // 微信语音识别
 
   if (!fromUserName || !msgType) {
     res.status(400).send('Invalid message');
@@ -684,14 +1172,35 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         break;
 
       case 'voice':
-        replyText = await handleVoiceMessage(openId);
+        replyText = await handleVoiceMessage(openId, mediaId, recognition);
         break;
 
       case 'image':
-      case 'video':
-      case 'file':
-        replyText = await handleImageMessage(openId);
+        replyText = await handleImageMessage(openId, picUrl, mediaId);
         break;
+
+      case 'video':
+      case 'shortvideo':
+      case 'file':
+        replyText = await handleFileMessage(openId, mediaId, getXmlValue(xmlBody, 'FileName'));
+        break;
+
+      case 'location': {
+        const locationX = getXmlValue(xmlBody, 'Location_X');
+        const locationY = getXmlValue(xmlBody, 'Location_Y');
+        const scale     = getXmlValue(xmlBody, 'Scale');
+        const label     = getXmlValue(xmlBody, 'Label');
+        replyText = await handleLocationMessage(openId, locationX, locationY, scale, label);
+        break;
+      }
+
+      case 'link': {
+        const title       = getXmlValue(xmlBody, 'Title');
+        const description = getXmlValue(xmlBody, 'Description');
+        const url         = getXmlValue(xmlBody, 'Url');
+        replyText = await handleLinkMessage(openId, title, description, url);
+        break;
+      }
 
       case 'event': {
         const eventType = getXmlValue(xmlBody, 'Event');
@@ -699,7 +1208,8 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
             '首次使用请先绑定邮箱完成认证：\n' +
             '/bind 你的邮箱@example.com\n\n' +
-            '绑定后即可直接发送消息与 AI 对话。\n\n' +
+            '绑定后即可直接发送消息与 AI 对话。\n' +
+            '支持文字、语音、图片、文件、位置、链接等多种消息类型。\n\n' +
             '发送 /help 查看所有可用命令。';
         } else if (eventType === 'unsubscribe') {
           logger.info('用户取消关注', { openId });
@@ -708,7 +1218,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
       }
 
       default:
-        replyText = '暂不支持此类型消息，请发送文字消息。';
+        replyText = '暂不支持此类型消息，请发送文字或语音消息。';
         break;
     }
 
