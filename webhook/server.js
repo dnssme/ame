@@ -1,8 +1,36 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.16
+ * Anima 灵枢 · Webhook 服务 v5.17
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.17 相对于 v5.16）：
+ *
+ *   #FIX-5.17-1  新增 validateChargedFen 安全熔断
+ *                原：calculateChargedFen 的返回值未经校验即用于余额扣减。
+ *                若上游数据异常导致计算结果为 NaN / Infinity / 负数，
+ *                会直接写入 PostgreSQL NUMERIC 列，产生不可预期的余额状态。
+ *                修：在 /billing/check 和 /billing/record 的付费路径中，
+ *                对 calculateChargedFen 返回值进行有限非负整数校验，
+ *                异常时返回 HTTP 500 并记录详细上下文日志。
+ *
+ *   #FIX-5.17-2  tryDecrFreeDailyUsage 原子防负数
+ *                原：回滚时直接调用 Redis DECR，若 key 已过期或被清零，
+ *                会将计数器减至 -1，使用户次日多获得 1 次免费额度。
+ *                修：改用 Lua 脚本，仅当计数器 > 0 时才执行 DECR，
+ *                保证计数器永不低于 0。
+ *
+ *   #FIX-5.17-3  付费模型 chargedFen=0 时跳过无效余额 UPDATE
+ *                原：FIX-5.11-2 仅跳过了 billing_transactions INSERT，
+ *                但余额 UPDATE（balance_fen - 0 / total_charged_fen + 0）
+ *                仍执行无效写操作，触发 updated_at 触发器并占用行锁。
+ *                修：chargedFen=0 时整体跳过余额扣减与流水写入，
+ *                仅记录 api_usage 调用记录。
+ *
+ *   #FIX-5.17-4  .env.example SERVICE_TOKEN 注释修正
+ *                原注释称 /billing/check 也需携带 SERVICE_TOKEN，
+ *                实际 /billing/check 未使用 requireServiceToken 中间件。
+ *                修：注释改为仅列 /billing/record，避免部署误解。
+ *
  * 修复记录（v5.16 相对于 v5.15）：
  *
  *   #FIX-5.16-1  /billing/check 付费模型用户暂停时返回 HTTP 403
@@ -335,11 +363,17 @@ async function incrFreeDailyUsage(userEmail) {
   }
 }
 
+// FIX-5.17-2: 原子 DECR，仅当计数器 > 0 时才递减，防止减至负数
+const DECR_FLOOR_LUA =
+  'local c = tonumber(redis.call("GET", KEYS[1]) or "0")\n' +
+  'if c <= 0 then return 0 end\n' +
+  'return redis.call("DECR", KEYS[1])';
+
 async function tryDecrFreeDailyUsage(key) {
   if (!key) return;
   try {
     if (redis.status !== 'ready') return;
-    await redis.decr(key);
+    await redis.eval(DECR_FLOOR_LUA, 1, key);
   } catch (err) {
     logger.warn('Redis daily counter decr (rollback) failed', { err: err.message, key });
   }
@@ -574,6 +608,17 @@ function calculateChargedFen({
 
   const outputCostYuan = (outputTokens / 1000) * cnyPriceOut;
   return Math.ceil((inputCostYuan + outputCostYuan) * 100);
+}
+
+// FIX-5.17-1: 安全熔断——校验计费计算结果，防止 NaN/Infinity/负数写入 DB
+function validateChargedFen(chargedFen, context) {
+  if (!Number.isFinite(chargedFen) || chargedFen < 0) {
+    logger.error('validateChargedFen: 计算结果异常，拒绝计费', {
+      chargedFen, ...context,
+    });
+    return false;
+  }
+  return true;
 }
 
 // ─── 安全的 ROLLBACK 辅助函数 ────────────────────────────────
@@ -909,6 +954,11 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     promptTokens: promptTk, historyTokens: historyTk,
   });
 
+  // FIX-5.17-1: 安全熔断
+  if (!validateChargedFen(estimatedFen, { userEmail, modelName, inTokens, outTokens })) {
+    return res.status(500).json({ success: false, msg: '费用计算异常，请稍后重试' });
+  }
+
   // FIX-5.15-2: 将用户余额查询移至安全上限检查之前，确保 402 响应也包含
   //   balance_fen 和 is_suspended，与 /billing/record 402 响应格式对齐
   let balance     = 0;
@@ -1188,6 +1238,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       promptTokens: promptTk, historyTokens: historyTk,
     });
 
+    // FIX-5.17-1: 安全熔断
+    if (!validateChargedFen(chargedFen, { userEmail, modelName, inputTokens, outputTokens })) {
+      await safeRollback(client, '/billing/record chargedFen validation');
+      return res.status(500).json({ success: false, msg: '费用计算异常，请稍后重试' });
+    }
+
     if (chargedFen > MAX_SINGLE_REQUEST_FEN) {
       await safeRollback(client, '/billing/record over safety limit');
       return res.status(402).json({
@@ -1211,15 +1267,19 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       });
     }
 
-    const deductRes = await client.query(
-      `UPDATE user_billing
-          SET balance_fen       = balance_fen - $1,
-              total_charged_fen = total_charged_fen + $1
-        WHERE user_email = $2
-        RETURNING balance_fen`,
-      [chargedFen, userEmail]
-    );
-    const newBalance = Number(deductRes.rows[0].balance_fen);
+    // FIX-5.17-3: chargedFen=0 时跳过余额扣减，避免无效 UPDATE 占用行锁
+    let newBalance = Number(u.balance_fen);
+    if (chargedFen > 0) {
+      const deductRes = await client.query(
+        `UPDATE user_billing
+            SET balance_fen       = balance_fen - $1,
+                total_charged_fen = total_charged_fen + $1
+          WHERE user_email = $2
+          RETURNING balance_fen`,
+        [chargedFen, userEmail]
+      );
+      newBalance = Number(deductRes.rows[0].balance_fen);
+    }
 
     const usageRes = await client.query(
       `INSERT INTO api_usage
@@ -1264,9 +1324,8 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       return res.status(500).json({ success: false, msg: '服务器内部错误' });
     }
 
-    // FIX-5.11-2: chargedFen=0 时跳过流水 INSERT（避免违反 CHECK amount_fen != 0）
+    // FIX-5.11-2 + FIX-5.17-3: chargedFen=0 时跳过流水 INSERT（避免违反 CHECK amount_fen != 0）
     // 场景：管理员将付费模型的输入/输出价格均设为 0 但未标记 is_free
-    // 此时 chargedFen=0，INSERT 会违反 billing_transactions 的 CHECK 约束
     if (chargedFen > 0) {
       await client.query(
         `INSERT INTO billing_transactions
@@ -1281,7 +1340,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         ]
       );
     } else {
-      logger.warn('付费模型 chargedFen=0，跳过流水记录（请检查模型定价配置，考虑标记为 is_free）', {
+      logger.warn('付费模型 chargedFen=0，跳过余额扣减和流水记录（请检查模型定价配置，考虑标记为 is_free）', {
         userEmail, modelName, inputTokens, outputTokens, priceIn, priceOut,
       });
     }
