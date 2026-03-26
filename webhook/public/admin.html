@@ -461,7 +461,6 @@ tr:hover td{background:rgba(99,102,241,.06)}
 let TOKEN = '';
 let allModels = [];
 let allProviders = [];
-let cardKeysCache = {}; // PCI-DSS: store keys in JS memory, not DOM data attributes
 const BASE = location.origin;
 
 // ── PCI-DSS 8.1.8: 空闲超时 15 分钟自动登出 ──────────────
@@ -1085,8 +1084,7 @@ async function loadCards(page) {
     if (cards.length === 0) {
       tbody.innerHTML = '<tr><td colspan="8" class="no-data">暂无充值卡</td></tr>';
     } else {
-      // FIX-5.21-1: PCI-DSS 3.4——服务端已掩码，前端直接显示
-      cards.forEach(c => { cardKeysCache[c.id] = c.key; });
+      // FIX-5.22-1: 服务端已掩码（v5.21），前端直接显示掩码值
       tbody.innerHTML = cards.map(c => `<tr>
         <td>${c.id}</td>
         <td><code class="key-masked" title="服务端掩码">${esc(c.key)}</code></td>
@@ -1160,29 +1158,24 @@ function esc(s) {
   d.textContent = String(s);
   return d.innerHTML;
 }
+// FIX-5.22-1: PCI-DSS 6.5.7——完整双上下文转义（JS 字符串 + HTML 属性）
+// 防止 &quot; 等 HTML 实体注入突破属性边界
+// 顺序要点：& 必须在 "/</> 之前替换，避免 &quot; → &amp;quot; 双重编码
 function escAttr(s) {
-  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 function num(n) { return n != null ? Number(n).toFixed(4) : '—'; }
 function fmtTime(t) {
   if (!t) return '—';
   return new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-}
-
-// PCI-DSS: 卡密默认掩码，仅显示前4后4字符（长度>10时），短密钥全掩码
-function maskKey(key) {
-  if (!key || key.length <= 10) return '••••••••';
-  return key.slice(0, 4) + '••••' + key.slice(-4);
-}
-
-function toggleKeyReveal(el, cardId) {
-  const full = cardKeysCache[cardId];
-  if (!full) return;
-  if (el.textContent === full) {
-    el.textContent = maskKey(full);
-  } else {
-    el.textContent = full;
-  }
 }
 </script>
 </body>

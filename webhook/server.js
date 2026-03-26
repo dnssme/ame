@@ -1,8 +1,30 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.21
+ * Anima 灵枢 · Webhook 服务 v5.22
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.22 相对于 v5.21）：
+ *
+ *   #FIX-5.22-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - 前端 escAttr 新增 &、<、>、换行符转义，
+ *                  阻断 HTML-entity 属性注入 XSS（PCI-DSS 6.5.7）。
+ *                - SSRF 校验 host === '[::1]' 修正为 host === '::1'，
+ *                  URL 类剥离方括号导致原判断永不生效（PCI-DSS 1.3.x）。
+ *                - 新增 X-Request-ID 请求关联标识（crypto.randomUUID），
+ *                  响应头 + 审计日志均携带，完善追踪链（PCI-DSS 10.2）。
+ *                - JSON body 限制从 1 MB 收紧至 256 KB，
+ *                  计费 API 负载均 < 1 KB，防止大包体 DoS（CIS）。
+ *                - 前端清理已失效的 toggleKeyReveal/maskKey 客户端解密码，
+ *                  v5.21 服务端掩码后该路径为死代码（PCI-DSS 3.4 减面）。
+ *
+ *   #FIX-5.22-2  企业生产级速度优化
+ *                - /admin/dashboard 静态 HTML 新增 ETag（SHA-256 摘要），
+ *                  浏览器条件请求返回 304，减少重复传输。
+ *
+ *   #FIX-5.22-3  Dockerfile CIS 加固
+ *                - 新增 ENV HOST=0.0.0.0，确保容器内 HEALTHCHECK
+ *                  指向正确监听地址（CIS Docker 5.6 修正）。
+ *
  * 修复记录（v5.21 相对于 v5.20）：
  *
  *   #FIX-5.21-1  企业生产级安全加固（PCI-DSS / CIS 全面对齐）
@@ -511,10 +533,18 @@ app.use(helmet({
   },
 }));
 
-app.use(express.json({ limit: '1mb' }));
+// FIX-5.22-1: 计费 API 负载均 < 1 KB，收紧至 256 KB 防止大包体 DoS（CIS）
+app.use(express.json({ limit: '256kb' }));
 
 // FIX-5.21-2: gzip/br 压缩 JSON 响应，减少带宽占用 60-80%
 app.use(compression({ threshold: 512 }));
+
+// FIX-5.22-1: PCI-DSS 10.2——每请求唯一关联标识，串联审计日志与响应
+app.use((req, res, next) => {
+  req.id = crypto.randomUUID();
+  res.setHeader('X-Request-ID', req.id);
+  next();
+});
 
 // FIX-5.20-2: PCI-DSS & CIS 安全响应头
 app.use((_req, res, next) => {
@@ -630,10 +660,11 @@ function requireServiceToken(req, res, next) {
   next();
 }
 
-// FIX-5.21-1: PCI-DSS 10.2 审计追踪——结构化审计日志
+// FIX-5.21-1 + FIX-5.22-1: PCI-DSS 10.2 审计追踪——结构化审计日志 + 请求关联 ID
 function auditLog(action, details, req) {
   logger.info('AUDIT', {
     action,
+    request_id: req.id,
     actor_ip: req.ip,
     method:   req.method,
     path:     req.path,
@@ -669,7 +700,8 @@ function isValidBaseUrl(urlStr) {
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
   const host = parsed.hostname.toLowerCase();
   // 阻断 localhost / IPv4 内网保留 IP / IPv6 loopback 与私有地址
-  if (host === 'localhost' || host === '[::1]' || PRIVATE_IP_RE.test(host) || PRIVATE_IPV6_RE.test(host)) return false;
+  // FIX-5.22-1: URL 类将 [::1] 解析为 hostname='::1'（无方括号），修正判断条件
+  if (host === 'localhost' || host === '::1' || PRIVATE_IP_RE.test(host) || PRIVATE_IPV6_RE.test(host)) return false;
   return true;
 }
 
@@ -1551,15 +1583,22 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 const ADMIN_HTML_PATH = path.join(__dirname, 'public', 'admin.html');
 // 启动时缓存 admin.html，避免每次请求同步读取文件阻塞事件循环
 let adminHtmlCache = null;
+// FIX-5.22-2: 预计算 ETag，支持 304 条件请求减少传输
+let adminHtmlEtag = null;
 try {
   adminHtmlCache = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
+  adminHtmlEtag = '"' + crypto.createHash('sha256').update(adminHtmlCache).digest('hex') + '"';
 } catch {
   logger.warn('Admin dashboard HTML not found at startup', { path: ADMIN_HTML_PATH });
 }
 
-app.get('/admin/dashboard', (_req, res) => {
+app.get('/admin/dashboard', (req, res) => {
   if (!adminHtmlCache) {
     return res.status(500).json({ success: false, msg: '管理页面文件缺失' });
+  }
+  // FIX-5.22-2: ETag 条件请求——浏览器缓存命中时返回 304
+  if (adminHtmlEtag && req.headers['if-none-match'] === adminHtmlEtag) {
+    return res.status(304).end();
   }
   // FIX-5.20-2: 严格化 CSP (PCI-DSS & CIS)
   // 补齐 connect-src / form-action / base-uri / frame-ancestors
@@ -1568,6 +1607,7 @@ app.get('/admin/dashboard', (_req, res) => {
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
     "font-src 'self' data:; connect-src 'self'; " +
     "form-action 'self'; base-uri 'self'; frame-ancestors 'none';");
+  if (adminHtmlEtag) res.setHeader('ETag', adminHtmlEtag);
   res.type('html').send(adminHtmlCache);
 });
 
