@@ -17,6 +17,13 @@
  *                管理员无法通过 API 获取模块状态信息。
  *                修：新增端点读取 modules.yml 并以 JSON 格式返回模块信息，
  *                路径通过 MODULES_YML_PATH 环境变量配置，文件不存在时降级返回空列表。
+ *                安全校验：仅允许读取 .yml/.yaml 扩展名文件。
+ *
+ *   #FIX-5.19-3  /billing/record 402 响应 is_suspended 字段改为动态读取
+ *                原：安全上限和余额不足两个 402 响应硬编码 is_suspended:false，
+ *                虽然在当前代码流程中技术上正确（暂停检查在前），但不符合
+ *                防御性编程最佳实践，且与其他端点响应字段来源不一致。
+ *                修：改为 !!u.is_suspended，与其他计费响应对齐。
  *
  * 修复记录（v5.18 相对于 v5.17）：
  *
@@ -1306,7 +1313,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         charged_fen: chargedFen,
         limit_fen:   MAX_SINGLE_REQUEST_FEN,
         balance_fen: Number(u.balance_fen),
-        is_suspended: false,
+        is_suspended: !!u.is_suspended,
       });
     }
 
@@ -1317,7 +1324,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         msg:          '余额不足，请充值后继续使用',
         balance_fen:  Number(u.balance_fen),
         required_fen: chargedFen,
-        is_suspended: false,
+        is_suspended: !!u.is_suspended,
       });
     }
 
@@ -1442,7 +1449,13 @@ const MODULES_YML_PATH = process.env.MODULES_YML_PATH
 
 app.get('/admin/modules', adminLimiter, requireAdmin, (_req, res) => {
   try {
-    const content = fs.readFileSync(MODULES_YML_PATH, 'utf8');
+    // 安全校验：仅允许读取 .yml/.yaml 文件
+    const resolvedPath = path.resolve(MODULES_YML_PATH);
+    if (!/\.ya?ml$/i.test(resolvedPath)) {
+      logger.warn('MODULES_YML_PATH 扩展名不合法', { path: resolvedPath });
+      return res.json({ success: true, categories: {} });
+    }
+    const content = fs.readFileSync(resolvedPath, 'utf8');
     const parsed = yaml.load(content);
     res.json({ success: true, categories: parsed || {} });
   } catch (err) {
