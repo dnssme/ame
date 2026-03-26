@@ -711,8 +711,7 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
   if (
     (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') &&
-    req.headers['content-type'] &&
-    !req.headers['content-type'].startsWith('application/json')
+    !( req.headers['content-type'] && req.headers['content-type'].startsWith('application/json') )
   ) {
     return res.status(415).json({ success: false, msg: 'Content-Type 必须为 application/json' });
   }
@@ -2503,7 +2502,8 @@ const HOST = process.env.HOST || '172.16.1.6';
 const server = app.listen(PORT, HOST, () => {
   logger.info(`Webhook 服务已启动 http://${HOST}:${PORT}`);
   // FIX-5.26-2: DB 连接池预热——消除首次请求的冷启动延迟
-  db.connect().then((c) => { c.release(); logger.info('DB 连接池预热完成'); })
+  db.connect()
+    .then((client) => { client.release(); logger.info('DB 连接池预热完成'); })
     .catch((err) => logger.warn('DB 连接池预热失败（首次请求将自动重试）', { err: err.message }));
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
@@ -2557,6 +2557,8 @@ const shutdown = (signal) => {
   });
   setTimeout(() => {
     // FIX-5.26-1: CIS 进程管理——超时后强制终止所有残留连接，防止僵尸连接阻塞进程退出
+    // Node 18.2+ 提供 server.closeAllConnections()；package.json 已要求 >=20.0.0
+    // 保留 typeof 检查作为防御性兜底，确保旧运行时不会崩溃
     if (typeof server.closeAllConnections === 'function') {
       server.closeAllConnections();
     }
