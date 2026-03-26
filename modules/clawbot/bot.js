@@ -5,10 +5,21 @@
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
  *
+ * 接入方式（官方微信）：
+ *   - 微信公众号扫码关注接入（用户扫描二维码 → 关注 → 自动绑定）
+ *   - 微信 App 互通接入（通过 Open Platform 跨应用通信）
+ *   - 不使用企业微信作为主接入方式
+ *
+ * 企业微信（WeCom）接口：
+ *   - 已添加完整的企业微信 Webhook 接口
+ *   - 默认关闭（WECOM_ENABLED=false），如需使用请手动开启
+ *   - 与微信公众号通道隔离，独立 Redis 键空间
+ *
  * 功能：
  *   - 微信 ClawBot 插件签名验证（token + timestamp + nonce SHA1）
  *   - 强制登录认证（用户必须绑定邮箱后才可使用 AI 功能）
  *   - 用户强隔离（独立 Redis 键空间、独立会话、独立计费）
+ *   - 二维码接入（扫码关注/登录）
  *   - 文字消息 → AI 对话
  *   - 语音消息 → Whisper STT → AI → TTS → 语音回复
  *   - 图片消息 → AI 图片分析
@@ -75,6 +86,14 @@ const WHISPER_URL    = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transc
 const TTS_URL        = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 const PORT           = parseInt(process.env.PORT || '3004', 10);
 
+// ─── 企业微信（WeCom）配置（默认关闭，仅添加接口不使用）────────
+const WECOM_ENABLED   = process.env.WECOM_ENABLED === 'true';
+const WECOM_CORPID    = process.env.WECOM_CORPID || '';
+const WECOM_SECRET    = process.env.WECOM_SECRET || '';
+const WECOM_TOKEN     = process.env.WECOM_TOKEN || '';
+const WECOM_AES_KEY   = process.env.WECOM_ENCODING_AES_KEY || '';
+const WECOM_AGENT_ID  = process.env.WECOM_AGENT_ID || '';
+
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
   process.exit(1);
@@ -86,6 +105,17 @@ if (!CLAWBOT_APP_ID) {
 if (!CLAWBOT_APP_SECRET) {
   logger.error('CLAWBOT_APP_SECRET 未设置，无法启动');
   process.exit(1);
+}
+
+// 企业微信配置检查（仅在启用时检查）
+if (WECOM_ENABLED) {
+  if (!WECOM_CORPID || !WECOM_SECRET || !WECOM_TOKEN) {
+    logger.error('企业微信已启用但配置不完整（需要 WECOM_CORPID/WECOM_SECRET/WECOM_TOKEN）');
+    process.exit(1);
+  }
+  logger.info('企业微信（WeCom）接口已启用');
+} else {
+  logger.info('企业微信（WeCom）接口已添加但未启用（WECOM_ENABLED=false）');
 }
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
@@ -114,6 +144,11 @@ if (redis) {
 const REDIS_EMAIL_KEY  = 'anima:clawbot:emails';      // Hash: openid → email
 const REDIS_MODELS_KEY = 'anima:clawbot:user_models';  // Hash: openid → model
 const REDIS_AUTH_KEY   = 'anima:clawbot:authed';       // Set:  已认证用户 openid
+
+// 企业微信使用独立键空间，与公众号通道完全隔离
+const WECOM_EMAIL_KEY  = 'anima:wecom:emails';         // Hash: userid → email
+const WECOM_MODELS_KEY = 'anima:wecom:user_models';     // Hash: userid → model
+const WECOM_AUTH_KEY   = 'anima:wecom:authed';          // Set:  已认证 userid
 
 // ─── 用户认证/邮箱管理 ──────────────────────────────────────
 async function isUserAuthed(openId) {
@@ -393,6 +428,158 @@ async function sendAsyncReply(openId, text) {
     } catch (err) {
       clearTimeout(timeoutId);
       logger.error('客服消息发送异常', { err: err.message, openId });
+    }
+  }
+}
+
+// ─── 扫码接入：二维码生成 ──────────────────────────────────────
+
+/**
+ * 生成带参数的微信二维码 ticket。
+ * 用户扫码后关注公众号，触发 subscribe/SCAN 事件。
+ * @param {string} sceneStr - 场景值（标识二维码用途）
+ * @param {boolean} temporary - 是否临时二维码（默认永久）
+ * @returns {Promise<{ticket: string, url: string}|null>}
+ */
+async function createQrCode(sceneStr = 'subscribe', temporary = false) {
+  const token = await getAccessToken();
+  if (!token) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const payload = temporary
+      ? { expire_seconds: 2592000, action_name: 'QR_STR_SCENE', action_info: { scene: { scene_str: sceneStr } } }
+      : { action_name: 'QR_LIMIT_STR_SCENE', action_info: { scene: { scene_str: sceneStr } } };
+
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/qrcode/create?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.ticket) {
+      return {
+        ticket: data.ticket,
+        url: data.url || '',
+        qrcodeUrl: `https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=${encodeURIComponent(data.ticket)}`,
+      };
+    }
+    logger.error('生成二维码失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return null;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('生成二维码异常', { err: err.message });
+    return null;
+  }
+}
+
+// ─── 企业微信（WeCom）接口 ────────────────────────────────────
+
+/** 企业微信 Access Token 缓存 */
+let wecomTokenCache = { token: '', expiresAt: 0 };
+
+/**
+ * 获取企业微信 access_token。
+ * 仅在 WECOM_ENABLED=true 时可用。
+ */
+async function getWecomAccessToken() {
+  if (!WECOM_ENABLED) return '';
+  if (wecomTokenCache.token && Date.now() < wecomTokenCache.expiresAt) {
+    return wecomTokenCache.token;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(WECOM_CORPID)}&corpsecret=${encodeURIComponent(WECOM_SECRET)}`;
+    const { body } = await request(url, {
+      bodyTimeout: 10_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.access_token) {
+      wecomTokenCache = {
+        token: data.access_token,
+        expiresAt: Date.now() + ((data.expires_in || 7200) - 300) * 1000,
+      };
+      return data.access_token;
+    }
+    logger.error('获取企业微信 access_token 失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取企业微信 access_token 异常', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 企业微信签名验证。
+ * 与公众号签名验证算法相同：SHA1(sort([token, timestamp, nonce]))
+ */
+function verifyWecomSignature(signature, timestamp, nonce) {
+  if (!WECOM_TOKEN) return false;
+  const arr = [WECOM_TOKEN, timestamp, nonce].sort();
+  const hash = crypto.createHash('sha1').update(arr.join('')).digest('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(hash, 'utf8'),
+    Buffer.from(signature, 'utf8')
+  );
+}
+
+/**
+ * 通过企业微信应用消息接口发送消息。
+ */
+async function sendWecomReply(userId, text) {
+  if (!WECOM_ENABLED) return;
+  const token = await getWecomAccessToken();
+  if (!token) {
+    logger.error('无法发送企业微信消息：access_token 不可用', { userId });
+    return;
+  }
+
+  const parts = splitMessage(text);
+  for (const part of parts) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+    try {
+      const { body } = await request(
+        `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(token)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            touser: userId,
+            msgtype: 'text',
+            agentid: parseInt(WECOM_AGENT_ID, 10) || 0,
+            text: { content: part },
+          }),
+          bodyTimeout: 10_000,
+          headersTimeout: 10_000,
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timeoutId);
+      const result = await body.json();
+      if (result.errcode && result.errcode !== 0) {
+        logger.error('企业微信消息发送失败', { errcode: result.errcode, errmsg: result.errmsg, userId });
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      logger.error('企业微信消息发送异常', { err: err.message, userId });
     }
   }
 }
@@ -1226,13 +1413,34 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
       case 'event': {
         const eventType = getXmlValue(xmlBody, 'Event');
+        const eventKey  = getXmlValue(xmlBody, 'EventKey');
+
         if (eventType === 'subscribe') {
-          replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
-            '首次使用请先绑定邮箱完成认证：\n' +
-            '/bind 你的邮箱@example.com\n\n' +
-            '绑定后即可直接发送消息与 AI 对话。\n' +
-            '支持文字、语音、图片、文件、位置、链接等多种消息类型。\n\n' +
-            '发送 /help 查看所有可用命令。';
+          // 用户关注（可能通过扫码关注：eventKey 包含 qrscene_ 前缀）
+          if (eventKey && eventKey.startsWith('qrscene_')) {
+            const scene = eventKey.slice(8);
+            logger.info('用户通过扫码关注', { openId, scene });
+            replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
+              '你通过扫码关注，' +
+              '首次使用请绑定邮箱完成认证：\n' +
+              '/bind 你的邮箱@example.com\n\n' +
+              '绑定后即可直接发送消息与 AI 对话。\n\n' +
+              '发送 /help 查看所有可用命令。';
+          } else {
+            replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
+              '首次使用请先绑定邮箱完成认证：\n' +
+              '/bind 你的邮箱@example.com\n\n' +
+              '绑定后即可直接发送消息与 AI 对话。\n' +
+              '支持文字、语音、图片、文件、位置、链接等多种消息类型。\n\n' +
+              '发送 /help 查看所有可用命令。';
+          }
+        } else if (eventType === 'SCAN') {
+          // 已关注用户扫码（不触发 subscribe，触发 SCAN 事件）
+          const scene = eventKey || '';
+          logger.info('已关注用户扫码', { openId, scene });
+          replyText = '📱 扫码成功！你已关注 Anima 灵枢。\n\n' +
+            '直接发送消息即可与 AI 对话。\n' +
+            '发送 /help 查看可用命令。';
         } else if (eventType === 'unsubscribe') {
           logger.info('用户取消关注', { openId });
         }
@@ -1260,6 +1468,174 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   }
 });
 
+// ─── 扫码接入：二维码生成端点 ──────────────────────────────────
+// 管理员调用此接口生成二维码，用户扫码关注后自动接入
+app.get('/clawbot/qrcode', verifyLimiter, async (req, res) => {
+  const scene = typeof req.query.scene === 'string' ? req.query.scene.substring(0, 64) : 'subscribe';
+  const temporary = req.query.temporary === 'true';
+
+  const result = await createQrCode(scene, temporary);
+  if (!result) {
+    res.status(500).json({ success: false, msg: '二维码生成失败' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    ticket: result.ticket,
+    url: result.url,
+    qrcodeUrl: result.qrcodeUrl,
+    scene,
+  });
+});
+
+// ─── 企业微信（WeCom）Webhook 接口 ────────────────────────────
+// 以下接口已添加但默认不启用（WECOM_ENABLED=false）
+// 企业微信回调也需要 XML body
+app.use('/wecom/webhook', express.text({ type: ['text/xml', 'application/xml'], limit: '256kb' }));
+
+// 企业微信 URL 验证（GET）
+app.get('/wecom/webhook', verifyLimiter, (req, res) => {
+  if (!WECOM_ENABLED) {
+    res.status(404).json({ error: 'WeCom interface not enabled' });
+    return;
+  }
+
+  const { msg_signature, timestamp, nonce, echostr } = req.query;
+
+  if (!msg_signature || !timestamp || !nonce || !echostr) {
+    logger.warn('企业微信验证请求缺少参数');
+    res.status(400).send('Missing parameters');
+    return;
+  }
+
+  try {
+    if (verifyWecomSignature(String(msg_signature), String(timestamp), String(nonce))) {
+      logger.info('企业微信 URL 验证成功');
+      res.status(200).send(String(echostr));
+    } else {
+      logger.warn('企业微信签名验证失败');
+      res.status(403).send('Signature verification failed');
+    }
+  } catch (err) {
+    logger.error('企业微信签名验证异常', { err: err.message });
+    res.status(500).send('Internal error');
+  }
+});
+
+// 企业微信消息接收（POST）
+app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
+  if (!WECOM_ENABLED) {
+    res.status(404).json({ error: 'WeCom interface not enabled' });
+    return;
+  }
+
+  const { msg_signature, timestamp, nonce } = req.query;
+
+  if (!msg_signature || !timestamp || !nonce) {
+    res.status(400).send('Missing parameters');
+    return;
+  }
+
+  try {
+    if (!verifyWecomSignature(String(msg_signature), String(timestamp), String(nonce))) {
+      logger.warn('企业微信消息签名验证失败');
+      res.status(403).send('Signature verification failed');
+      return;
+    }
+  } catch (err) {
+    logger.error('企业微信签名验证异常', { err: err.message });
+    res.status(500).send('Internal error');
+    return;
+  }
+
+  // 解析 XML 消息体
+  const xmlBody = typeof req.body === 'string' ? req.body : '';
+  if (!xmlBody) {
+    res.status(400).send('Empty body');
+    return;
+  }
+
+  const xmlFieldCache = new Map();
+  const getXmlValue = (xml, tag) => {
+    let re = xmlFieldCache.get(tag);
+    if (!re) {
+      re = {
+        cdata: new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`),
+        plain: new RegExp(`<${tag}>([^<]*)</${tag}>`),
+      };
+      xmlFieldCache.set(tag, re);
+    }
+    const match = xml.match(re.cdata);
+    if (match) return match[1];
+    const match2 = xml.match(re.plain);
+    return match2 ? match2[1] : '';
+  };
+
+  const toUserName   = getXmlValue(xmlBody, 'ToUserName');
+  const fromUserName = getXmlValue(xmlBody, 'FromUserName');   // 企业微信 UserID
+  const msgType      = getXmlValue(xmlBody, 'MsgType');
+  const content      = getXmlValue(xmlBody, 'Content');
+
+  if (!fromUserName || !msgType) {
+    res.status(400).send('Invalid message');
+    return;
+  }
+
+  // 企业微信使用 UserID 而非 OpenID
+  const userId = fromUserName;
+
+  logger.info('收到企业微信消息', { userId, msgType });
+
+  try {
+    let replyText = '';
+
+    // 企业微信消息处理：复用核心处理逻辑
+    // 但使用 WeCom 独立的 Redis 键空间，通过 userId 前缀 'wecom:' 区分
+    const wecomOpenId = `wecom:${userId}`;
+
+    switch (msgType) {
+      case 'text':
+        replyText = await handleTextMessage(wecomOpenId, content);
+        break;
+      default:
+        replyText = '企业微信通道当前支持文字消息。如需更多功能，请通过微信公众号使用。';
+        break;
+    }
+
+    if (replyText) {
+      // 企业微信被动回复 XML 格式
+      const timestamp = Math.floor(Date.now() / 1000);
+      const firstPart = splitMessage(replyText)[0] || '';
+      const replyXml = `<xml>
+<ToUserName><![CDATA[${userId}]]></ToUserName>
+<FromUserName><![CDATA[${toUserName}]]></FromUserName>
+<CreateTime>${timestamp}</CreateTime>
+<MsgType><![CDATA[text]]></MsgType>
+<Content><![CDATA[${firstPart}]]></Content>
+</xml>`;
+
+      // 企业微信超长消息通过应用消息接口发送剩余部分
+      const parts = splitMessage(replyText);
+      if (parts.length > 1) {
+        setImmediate(async () => {
+          for (const part of parts.slice(1)) {
+            await sendWecomReply(userId, part);
+          }
+        });
+      }
+
+      res.set('Content-Type', 'text/xml');
+      res.status(200).send(replyXml);
+    } else {
+      res.status(200).send('');
+    }
+  } catch (err) {
+    logger.error('企业微信消息处理异常', { err: err.message, userId, msgType });
+    res.status(200).send('');
+  }
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -1274,7 +1650,10 @@ app.use((err, req, res, _next) => {
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`ClawBot 接入服务已启动 :${PORT}`);
-  logger.info('等待微信 ClawBot 插件回调...');
+  logger.info('官方微信接入（扫码/App互通）就绪，等待回调...');
+  if (WECOM_ENABLED) {
+    logger.info('企业微信（WeCom）接口已就绪 /wecom/webhook');
+  }
 });
 
 // 安全加固
