@@ -23,6 +23,7 @@
 const crypto     = require('crypto');
 const express    = require('express');
 const helmet     = require('helmet');
+const rateLimit  = require('express-rate-limit');
 const { request } = require('undici');
 const winston    = require('winston');
 const Redis      = require('ioredis');
@@ -30,6 +31,8 @@ const Redis      = require('ioredis');
 // ─── 超时配置常量 ─────────────────────────────────────────────
 const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '60000', 10);
 const BILLING_REQUEST_TIMEOUT_MS = parseInt(process.env.BILLING_REQUEST_TIMEOUT_MS || '10000', 10);
+// AbortController 兜底超时缓冲：在 undici 超时之上额外等待，确保请求被取消
+const ABORT_TIMEOUT_BUFFER_MS = 30_000;
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -53,7 +56,9 @@ const logger = winston.createLogger({
 const CLAWBOT_TOKEN           = process.env.CLAWBOT_TOKEN;
 const CLAWBOT_APP_ID          = process.env.CLAWBOT_APP_ID;
 const CLAWBOT_APP_SECRET      = process.env.CLAWBOT_APP_SECRET;
-const CLAWBOT_ENCODING_AES_KEY = process.env.CLAWBOT_ENCODING_AES_KEY;
+// EncodingAESKey 用于消息加密模式（当微信服务器配置为"安全模式"时使用）
+// 当前实现使用明文模式，后续启用加密模式时需要此密钥进行 AES 解密
+const CLAWBOT_ENCODING_AES_KEY = process.env.CLAWBOT_ENCODING_AES_KEY || '';
 const AGENT_API_URL  = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, '');
 const DEFAULT_MODEL  = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const BILLING_URL    = (process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.6:3002').replace(/\/$/, '');
@@ -242,7 +247,7 @@ async function callAgent(openId, message) {
   const model = (await getUserModel(openId)) || DEFAULT_MODEL;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + 30_000);
+  const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + ABORT_TIMEOUT_BUFFER_MS);
 
   try {
     const { body } = await request(`${AGENT_API_URL}/chat`, {
@@ -266,7 +271,7 @@ async function callAgent(openId, message) {
   } catch (err) {
     clearTimeout(timeoutId);
     if (err.name === 'AbortError') {
-      logger.error('Agent API 请求超时', { openId, timeoutMs: AGENT_REQUEST_TIMEOUT_MS + 30_000 });
+      logger.error('Agent API 请求超时', { openId, timeoutMs: AGENT_REQUEST_TIMEOUT_MS + ABORT_TIMEOUT_BUFFER_MS });
       return '抱歉，AI 响应超时，请稍后重试。';
     }
     logger.error('Agent API call failed', { err: err.message, openId });
@@ -545,13 +550,28 @@ function buildTextReply(toUser, fromUser, text) {
 const app = express();
 
 // 安全中间件
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false,
-}));
+app.use(helmet());
 
 app.disable('x-powered-by');
 app.disable('etag');
+
+// 速率限制：微信 ClawBot URL 验证（低频调用）
+const verifyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests',
+});
+
+// 速率限制：微信 ClawBot 消息回调（高频消息处理）
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests',
+});
 
 // 微信回调需要原始 XML body
 app.use('/clawbot/webhook', express.text({ type: ['text/xml', 'application/xml'], limit: '256kb' }));
@@ -566,7 +586,7 @@ app.get('/health', (req, res) => {
 
 // ─── 微信 ClawBot Webhook 验证（GET）────────────────────────
 // 微信服务器验证 URL 有效性时发送 GET 请求
-app.get('/clawbot/webhook', (req, res) => {
+app.get('/clawbot/webhook', verifyLimiter, (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query;
 
   if (!signature || !timestamp || !nonce || !echostr) {
@@ -590,7 +610,7 @@ app.get('/clawbot/webhook', (req, res) => {
 });
 
 // ─── 微信 ClawBot Webhook 消息接收（POST）──────────────────
-app.post('/clawbot/webhook', async (req, res) => {
+app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   const { signature, timestamp, nonce } = req.query;
 
   // 签名验证
@@ -618,10 +638,20 @@ app.post('/clawbot/webhook', async (req, res) => {
     return;
   }
 
+  // 预编译 XML 字段提取正则（避免每次调用重新编译）
+  const xmlFieldCache = new Map();
   const getXmlValue = (xml, tag) => {
-    const match = xml.match(new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`));
+    let re = xmlFieldCache.get(tag);
+    if (!re) {
+      re = {
+        cdata: new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`),
+        plain: new RegExp(`<${tag}>([^<]*)</${tag}>`),
+      };
+      xmlFieldCache.set(tag, re);
+    }
+    const match = xml.match(re.cdata);
     if (match) return match[1];
-    const match2 = xml.match(new RegExp(`<${tag}>([^<]*)</${tag}>`));
+    const match2 = xml.match(re.plain);
     return match2 ? match2[1] : '';
   };
 
