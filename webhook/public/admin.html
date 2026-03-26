@@ -258,7 +258,7 @@ tr:hover td{background:rgba(99,102,241,.06)}
     <h1>🔮 Anima 灵枢</h1>
     <p>综合管理控制台</p>
     <div class="login-error" id="loginError"></div>
-    <input type="password" id="tokenInput" placeholder="请输入管理员令牌 (ADMIN_TOKEN)" autocomplete="off" autofocus>
+    <input type="password" id="tokenInput" placeholder="请输入管理员令牌 (ADMIN_TOKEN)" autocomplete="one-time-code" autofocus>
     <button onclick="doLogin()">登 录</button>
   </div>
 </div>
@@ -461,6 +461,7 @@ tr:hover td{background:rgba(99,102,241,.06)}
 let TOKEN = '';
 let allModels = [];
 let allProviders = [];
+let cardKeysCache = {}; // PCI-DSS: store keys in JS memory, not DOM data attributes
 const BASE = location.origin;
 
 // ── PCI-DSS 8.1.8: 空闲超时 15 分钟自动登出 ──────────────
@@ -1084,9 +1085,11 @@ async function loadCards(page) {
     if (cards.length === 0) {
       tbody.innerHTML = '<tr><td colspan="8" class="no-data">暂无充值卡</td></tr>';
     } else {
+      // PCI-DSS: store keys in JS memory, not DOM attributes
+      cards.forEach(c => { cardKeysCache[c.id] = c.key; });
       tbody.innerHTML = cards.map(c => `<tr>
         <td>${c.id}</td>
-        <td><code class="key-masked" onclick="toggleKeyReveal(this)" data-key="${escAttr(c.key)}" title="点击显示/隐藏">${maskKey(c.key)}</code></td>
+        <td><code class="key-masked" onclick="toggleKeyReveal(this,${c.id})" title="点击显示/隐藏">${maskKey(c.key)}</code></td>
         <td>${Number(c.credit_fen).toLocaleString()}</td>
         <td>${esc(c.label || '—')}</td>
         <td>${c.used ? '<span class="badge badge-warn">已使用</span>' : '<span class="badge badge-success">未使用</span>'}</td>
@@ -1166,14 +1169,15 @@ function fmtTime(t) {
   return new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
 }
 
-// PCI-DSS: 卡密默认掩码，仅显示前4后4字符
+// PCI-DSS: 卡密默认掩码，仅显示前4后4字符（长度>10时），短密钥全掩码
 function maskKey(key) {
-  if (!key || key.length <= 8) return '••••••••';
+  if (!key || key.length <= 10) return '••••••••';
   return key.slice(0, 4) + '••••' + key.slice(-4);
 }
 
-function toggleKeyReveal(el) {
-  const full = el.getAttribute('data-key');
+function toggleKeyReveal(el, cardId) {
+  const full = cardKeysCache[cardId];
+  if (!full) return;
   if (el.textContent === full) {
     el.textContent = maskKey(full);
   } else {
