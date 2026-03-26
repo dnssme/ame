@@ -470,8 +470,13 @@ app.use(helmet({
   noSniff: true,
   // 隐藏 X-Powered-By (CIS)
   hidePoweredBy: true,
-  // CSP 由各路由单独设置，此处全局禁止
-  contentSecurityPolicy: false,
+  // 全局 CSP: API 端点仅返回 JSON，使用最严格策略
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+    },
+  },
 }));
 
 app.use(express.json({ limit: '1mb' }));
