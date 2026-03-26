@@ -478,6 +478,9 @@ const logger = winston.createLogger({
 const PG_POOL_MAX_RAW = parseInt(process.env.PG_POOL_MAX || '15', 10);
 const PG_POOL_MAX = (Number.isFinite(PG_POOL_MAX_RAW) && PG_POOL_MAX_RAW >= 1 && PG_POOL_MAX_RAW <= 100)
   ? PG_POOL_MAX_RAW : 15;
+if (process.env.PG_POOL_MAX && PG_POOL_MAX !== PG_POOL_MAX_RAW) {
+  logger.warn('PG_POOL_MAX 值超出有效范围（1-100），已回退至默认值 15', { raw: process.env.PG_POOL_MAX });
+}
 const db = new Pool({
   host:     process.env.PG_HOST     || 'anima-db.postgres.database.azure.com',
   port:     parseInt(process.env.PG_PORT || '5432', 10),
@@ -546,6 +549,8 @@ const INCR_EXPIRE_LUA =
 // FIX-5.10-3：新增最大条目限制，防止长期运行后无限增长
 const MODEL_CACHE_TTL_MS   = 60_000; // 60 秒
 const MAX_MODEL_CACHE_SIZE = 1000;   // 最多缓存 1000 个模型条目
+// FIX-5.27-1: CIS 日志完整性——致命退出前等待日志落盘的延迟
+const LOG_FLUSH_DELAY_MS   = 100;
 const modelCache = new Map();
 
 function modelCacheGet(modelName) {
@@ -1061,26 +1066,26 @@ async function safeRollback(client, context) {
 // FIX-5.25-1: CIS 2.3 信息最小化——不暴露 db/redis 内部组件状态
 // FIX-5.27-2: DB 与 Redis 并行检查，健康检查延迟从串行 2×RTT 降至 1×RTT
 app.get('/health', async (_req, res) => {
-  let httpStatus = 200;
-
-  const dbCheck = db.query('SELECT 1').catch((err) => {
-    logger.error('Health check DB error', { err: err.message });
-    httpStatus = 503;
-  });
-
-  const redisCheck = (async () => {
-    try {
-      if (redis.status === 'ready') {
-        await redis.ping();
-      } else {
-        logger.info('Health check: Redis disconnected (degraded mode)');
+  // 并行发起 DB 和 Redis 检查，各自返回是否成功
+  const [dbOk] = await Promise.all([
+    db.query('SELECT 1').then(() => true, (err) => {
+      logger.error('Health check DB error', { err: err.message });
+      return false;
+    }),
+    (async () => {
+      try {
+        if (redis.status === 'ready') {
+          await redis.ping();
+        } else {
+          logger.info('Health check: Redis disconnected (degraded mode)');
+        }
+      } catch (err) {
+        logger.warn('Health check Redis error', { err: err.message });
       }
-    } catch (err) {
-      logger.warn('Health check Redis error', { err: err.message });
-    }
-  })();
+    })(),
+  ]);
 
-  await Promise.all([dbCheck, redisCheck]);
+  const httpStatus = dbOk ? 200 : 503;
 
   // FIX-5.23-2: 健康检查禁止缓存——确保探针获取实时状态
   res.set('Cache-Control', 'no-store, max-age=0');
@@ -2633,15 +2638,15 @@ const shutdown = (signal) => {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 
-// FIX-5.27-1: CIS 日志完整性——致命错误处理器增加 100ms 延迟确保日志落盘
+// FIX-5.27-1: CIS 日志完整性——致命错误处理器增加延迟确保日志落盘
 // winston 异步写入日志文件，process.exit() 会截断尚未刷新的缓冲区
 process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled promise rejection, shutting down', { err: String(reason) });
-  setTimeout(() => process.exit(1), 100);
+  setTimeout(() => process.exit(1), LOG_FLUSH_DELAY_MS);
 });
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception, shutting down', { err: err.message, stack: err.stack });
-  setTimeout(() => process.exit(1), 100);
+  setTimeout(() => process.exit(1), LOG_FLUSH_DELAY_MS);
 });
 
 module.exports = app;
