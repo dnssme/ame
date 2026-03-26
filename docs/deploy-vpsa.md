@@ -811,7 +811,7 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}/")
 [ "${CODE}" = "200" ] && echo "✅ 通过" || echo "HTTP ${CODE}"
 
 # Webhook 激活接口
-echo -n "  /activate → Webhook (172.16.1.5:3002): "
+echo -n "  /activate → Webhook (172.16.1.6:3002): "
 CODE=$(curl -s -o /dev/null -w "%{http_code}" \
   -X POST "https://${DOMAIN}/activate" \
   -H "Content-Type: application/json" \
@@ -919,12 +919,12 @@ ls /etc/letsencrypt/live/
 # 检查内网连通性
 ping -c 2 172.16.1.3   # LibreChat
 ping -c 2 172.16.1.2   # OpenClaw
-ping -c 2 172.16.1.5   # Webhook
+ping -c 2 172.16.1.6   # Webhook
 
 # 检查对应服务状态
 curl -sf http://172.16.1.3:3080/health
 curl -sf http://172.16.1.2:3000/health
-curl -sf http://172.16.1.5:3002/health
+curl -sf http://172.16.1.6:3002/health
 
 # WireGuard 状态
 wg show wg0

@@ -31,7 +31,7 @@
 
 ## 部署节点
 
-VPS-B (172.16.1.2)（Nextcloud 已在 OpenClaw config.yml 中配置）
+VPS-D (172.16.1.4)（Nextcloud 部署在此节点，提供 CalDAV 日历后端）
 
 ## 快速部署
 
