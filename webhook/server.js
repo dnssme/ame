@@ -1,8 +1,32 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.11
+ * Anima 灵枢 · Webhook 服务 v5.12
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.12 相对于 v5.11）：
+ *
+ *   #FIX-5.12-1  免费模型路径新增用户暂停检查
+ *                原：/billing/record 免费模型路径不检查 is_suspended，
+ *                被暂停的用户仍可无限使用免费模型，绕过账户管控。
+ *                修：免费路径开始前查询 user_billing.is_suspended，
+ *                若已暂停则返回 HTTP 403 拒绝。
+ *
+ *   #FIX-5.12-2  /billing/check 免费模型路径新增暂停检查 + 返回真实余额
+ *                原：免费模型预检不检查暂停状态，且硬编码 balance_fen:0，
+ *                导致前端显示不准确（用户可能有余额但显示 0）。
+ *                修：查询真实余额与暂停状态，被暂停时返回 can_proceed:false。
+ *
+ *   #FIX-5.12-3  幂等键唯一索引改为 (idempotency_key, user_email) 复合索引
+ *                原：全局唯一索引理论上允许跨用户 key 碰撞（虽概率极低），
+ *                应用层 FIX-5.10-1 已按 user_email 过滤但 DB 约束未对齐。
+ *                修：ON CONFLICT 子句同步更新为 (idempotency_key, user_email)，
+ *                配合 Migration 006 在 DB 层面强制用户隔离。
+ *
+ *   #FIX-5.12-4  /admin/adjust 新增 type 与 amount_fen 方向校验
+ *                原：recharge/refund 类型允许负数金额，可产生语义矛盾的
+ *                审计流水（如 "充值 -500 分"），商用环境下导致对账混乱。
+ *                修：recharge/refund 强制 amount_fen > 0，admin_adjust 不限。
+ *
  * 修复记录（v5.11 相对于 v5.10）：
  *
  *   #FIX-5.11-1  INCR_EXPIRE_LUA 免费每日限额绕过修复
@@ -744,17 +768,43 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   }
 
   if (model.is_free) {
+    // FIX-5.12-2: 免费模型也需检查暂停状态，并返回真实余额
+    let freeBalance = 0;
+    let freeSuspended = false;
+    try {
+      const freeUserRes = await db.query(
+        'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+        [userEmail]
+      );
+      if (freeUserRes.rows.length > 0) {
+        freeBalance   = Number(freeUserRes.rows[0].balance_fen);
+        freeSuspended = freeUserRes.rows[0].is_suspended;
+      }
+    } catch (err) {
+      logger.error('Free model user lookup error in /billing/check', { err: err.message, userEmail });
+      return res.status(500).json({ success: false, msg: '服务器内部错误' });
+    }
+
+    if (freeSuspended) {
+      return res.status(403).json({
+        success: false, can_proceed: false, is_free: true,
+        msg: '账户已被暂停',
+        balance_fen: freeBalance, is_suspended: true,
+      });
+    }
+
     const dailyCheck = await peekFreeDailyUsage(userEmail);
     if (!dailyCheck.allowed) {
       return res.status(429).json({
         success: false, can_proceed: false, is_free: true,
         msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used} 次。充值后可无限使用。`,
         daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
+        balance_fen: freeBalance, is_suspended: false,
       });
     }
     return res.json({
       success: true, can_proceed: true, is_free: true, estimated_fen: 0,
-      balance_fen: 0, is_suspended: false,
+      balance_fen: freeBalance, is_suspended: false,
       daily_used: dailyCheck.used, daily_limit: dailyCheck.limit,
     });
   }
@@ -928,6 +978,16 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     // ── 免费模型路径 ──────────────────────────────────────
     if (isFree) {
+      // FIX-5.12-1: 免费模型也需检查用户暂停状态
+      const suspendCheck = await client.query(
+        'SELECT is_suspended FROM user_billing WHERE user_email=$1',
+        [userEmail]
+      );
+      if (suspendCheck.rows.length > 0 && suspendCheck.rows[0].is_suspended) {
+        await safeRollback(client, '/billing/record free model suspended');
+        return res.status(403).json({ success: false, msg: '账户已被暂停' });
+      }
+
       const dailyCheck = await incrFreeDailyUsage(userEmail);
       if (!dailyCheck.allowed) {
         await safeRollback(client, '/billing/record free daily limit');
@@ -944,7 +1004,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
                (user_email, api_model_id, api_provider, model_name,
                 is_free, input_tokens, output_tokens, charged_fen, status, idempotency_key)
              VALUES ($1,$2,$3,$4,true,$5,$6,0,'ok',$7)
-             ON CONFLICT (idempotency_key)
+             ON CONFLICT (idempotency_key, user_email)
                WHERE idempotency_key IS NOT NULL
                DO NOTHING
              RETURNING id`,
@@ -1042,7 +1102,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
            (user_email, api_model_id, api_provider, model_name,
             is_free, input_tokens, output_tokens, charged_fen, status, idempotency_key)
          VALUES ($1,$2,$3,$4,false,$5,$6,$7,'ok',$8)
-         ON CONFLICT (idempotency_key)
+         ON CONFLICT (idempotency_key, user_email)
            WHERE idempotency_key IS NOT NULL
            DO NOTHING
          RETURNING id`,
@@ -1470,6 +1530,13 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
     return res.status(400).json({ success: false, msg: `type 必须是 ${validTypes.join('/')} 之一` });
+  }
+  // FIX-5.12-4: recharge/refund 类型强制正数，避免产生语义矛盾的审计流水
+  if ((type === 'recharge' || type === 'refund') && amount_fen < 0) {
+    return res.status(400).json({
+      success: false,
+      msg: `${type} 类型的 amount_fen 必须为正数（如需扣减请使用 admin_adjust 类型）`,
+    });
   }
   if (description != null && (typeof description !== 'string' || description.length > 500)) {
     return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
