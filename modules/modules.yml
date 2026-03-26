@@ -54,6 +54,13 @@ channels:
     path: ./telegram/
     depends_on: [agent]
 
+  clawbot:
+    enabled: false
+    description: "微信 ClawBot 插件接入（官方 API，强制认证 + 用户隔离）"
+    node: VPS-B
+    path: ./clawbot/
+    depends_on: [agent]
+
   email:
     enabled: true
     description: "邮件处理（IMAP 收件 + SMTP 发件 + AI 分析）"
