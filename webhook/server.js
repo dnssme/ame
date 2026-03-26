@@ -1,8 +1,32 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.17
+ * Anima 灵枢 · Webhook 服务 v5.18
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.18 相对于 v5.17）：
+ *
+ *   #FIX-5.18-1  /activate 新增用户暂停检查
+ *                原：被暂停的用户仍可使用充值卡激活余额，绕过账户管控。
+ *                商用系统中暂停账户应完全禁止财务操作。
+ *                修：ensureUser 后查询 is_suspended，暂停用户返回 HTTP 403。
+ *                成功响应补齐 is_suspended 字段，与其他计费响应对齐。
+ *
+ *   #FIX-5.18-2  /admin/adjust 响应补齐 is_suspended 字段
+ *                原：响应仅含 balance_fen 和 actual_applied_fen，
+ *                与其他所有计费响应不一致，前端无法统一读取用户状态。
+ *                修：SELECT 补齐 is_suspended 列，响应补齐该字段。
+ *
+ *   #FIX-5.18-3  新增 DELETE /admin/providers/:id 端点（软禁用）
+ *                原：Provider 管理仅有 CRU，缺少 D 操作，
+ *                管理员无法通过 API 禁用 provider，需直接操作数据库。
+ *                修：新增 DELETE 端点，行为设 is_enabled=false，
+ *                与 DELETE /admin/models/:id（设 is_active=false）对齐。
+ *
+ *   #FIX-5.18-4  管理员限速器放宽至 60 次/15 分钟
+ *                原：10 次/15 分钟，管理员执行批量操作（如管理多个模型/
+ *                用户/卡密）时频繁触发限速，影响运维效率。
+ *                修：放宽至 60 次/15 分钟，兼顾安全与运维需求。
+ *
  * 修复记录（v5.17 相对于 v5.16）：
  *
  *   #FIX-5.17-1  新增 validateChargedFen 安全熔断
@@ -437,9 +461,10 @@ const billingRecordLimiter = rateLimit({
   message: { success: false, msg: '计费记录请求过于频繁' },
 });
 
+// FIX-5.18-4: 放宽至 60 次/15 分钟，原 10 次过于严格，影响批量运维操作
 const adminLimiter = rateLimit({
   windowMs: 15 * 60_000,
-  max:      10,
+  max:      60,
   standardHeaders: true,
   legacyHeaders:   false,
   message: { success: false, msg: '管理员接口请求过于频繁，请 15 分钟后再试' },
@@ -753,6 +778,16 @@ app.post('/activate', activateLimiter, async (req, res) => {
 
     await ensureUser(client, userEmail);
 
+    // FIX-5.18-1: 暂停用户不允许使用充值卡（商用系统暂停账户应完全禁止财务操作）
+    const suspendRes = await client.query(
+      'SELECT is_suspended FROM user_billing WHERE user_email=$1',
+      [userEmail]
+    );
+    if (suspendRes.rows.length > 0 && suspendRes.rows[0].is_suspended) {
+      await safeRollback(client, '/activate user suspended');
+      return res.status(403).json({ success: false, msg: '账户已被暂停，无法使用充值卡' });
+    }
+
     const rechargeRes = await client.query(
       `UPDATE user_billing
           SET balance_fen = balance_fen + $1
@@ -781,11 +816,12 @@ app.post('/activate', activateLimiter, async (req, res) => {
     logger.info('Card activated', { userEmail, cardKey, credit: card.credit_fen });
 
     res.json({
-      success:     true,
-      msg:         '充值成功',
-      credit_fen:  Number(card.credit_fen),
-      balance_fen: newBalance,
-      label:       card.label || null,
+      success:      true,
+      msg:          '充值成功',
+      credit_fen:   Number(card.credit_fen),
+      balance_fen:  newBalance,
+      label:        card.label || null,
+      is_suspended: false, // FIX-5.18-1: 补齐字段，与其他计费响应对齐
     });
   } catch (err) {
     await safeRollback(client, '/activate error');
@@ -1725,6 +1761,33 @@ app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => 
   }
 });
 
+// FIX-5.18-3: DELETE /admin/providers/:id 软禁用（设 is_enabled=false）
+// 与 DELETE /admin/models/:id 对齐，补齐 Provider CRUD 的 D 操作
+app.delete('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ success: false, msg: 'Provider ID 无效' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE api_providers SET is_enabled = false
+        WHERE id = $1
+        RETURNING id, provider_name, display_name, is_enabled`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, msg: 'Provider 不存在' });
+    }
+
+    logger.info('Provider deactivated', { id, providerName: result.rows[0].provider_name });
+    res.json({ success: true, provider: result.rows[0] });
+  } catch (err) {
+    logger.error('Provider deactivate error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
 // ── 余额调整 ──────────────────────────────────────────────────
 
 app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
@@ -1762,11 +1825,13 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
 
     await ensureUser(client, userEmail);
 
+    // FIX-5.18-2: 补齐 is_suspended 列，确保响应与其他计费端点一致
     const prevRes = await client.query(
-      'SELECT balance_fen FROM user_billing WHERE user_email=$1 FOR UPDATE',
+      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1 FOR UPDATE',
       [userEmail]
     );
-    const oldBalance = Number(prevRes.rows[0].balance_fen);
+    const oldBalance  = Number(prevRes.rows[0].balance_fen);
+    const isSuspended = !!prevRes.rows[0].is_suspended;
 
     const result = await client.query(
       `UPDATE user_billing
@@ -1797,6 +1862,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
       success:            true,
       balance_fen:        newBalance,
       actual_applied_fen: actualApplied,
+      is_suspended:       isSuspended, // FIX-5.18-2
     };
     // 扣减被截断到 0 时附带说明
     if (actualApplied === 0 && amount_fen < 0) {
