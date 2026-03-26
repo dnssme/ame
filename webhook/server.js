@@ -1,8 +1,33 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.19
+ * Anima 灵枢 · Webhook 服务 v5.20
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.20 相对于 v5.19）：
+ *
+ *   #FIX-5.20-1  管理界面 UI 美化
+ *                原：管理控制台界面功能完整但视觉表现力较弱，
+ *                缺少过渡动画、加载状态和精细化交互反馈。
+ *                修：重新设计 CSS 视觉风格（渐变强调、精致阴影、聚焦环、
+ *                动画过渡）；新增加载旋转指示器、搜索去抖、段落切换动画。
+ *
+ *   #FIX-5.20-2  PCI-DSS / CIS 安全加固
+ *                原：helmet 使用默认配置，CSP 仅对 /admin/dashboard 设置，
+ *                缺少 HSTS、Permissions-Policy、X-Permitted-Cross-Domain-Policies
+ *                等 PCI-DSS 与 CIS 要求的安全头；前端无会话空闲超时。
+ *                修：helmet 启用严格 HSTS（includeSubDomains、preload、1年）、
+ *                frameguard DENY、referrerPolicy no-referrer、
+ *                添加 Permissions-Policy 与 X-Permitted-Cross-Domain-Policies 头；
+ *                管理页面 CSP 补齐 connect-src / form-action / base-uri /
+ *                frame-ancestors；禁用 TRACE/TRACK HTTP 方法（CIS 要求）；
+ *                前端新增 15 分钟空闲自动登出（PCI-DSS 8.1.8）、
+ *                密码字段 autocomplete=off、卡密默认掩码显示。
+ *
+ *   #FIX-5.20-3  速度优化
+ *                原：搜索/筛选输入无去抖，每次按键均触发 API 请求；
+ *                CSS 缺少 contain 性能提示。
+ *                修：搜索输入增加 300ms 去抖；CSS 对主要容器添加 contain 属性。
+ *
  * 修复记录（v5.19 相对于 v5.18）：
  *
  *   #FIX-5.19-1  新增综合管理控制台（/admin/dashboard）
@@ -433,13 +458,43 @@ const app = express();
 
 app.set('trust proxy', process.env.TRUST_PROXY || '172.16.1.1');
 
-app.use(helmet());
+// FIX-5.20-2: 严格 helmet 配置，满足 PCI-DSS & CIS 安全基线
+app.use(helmet({
+  // HSTS: PCI-DSS 要求强制 HTTPS，预加载列表
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  // X-Frame-Options: DENY — CIS 要求，阻止点击劫持
+  frameguard: { action: 'deny' },
+  // Referrer-Policy: 不泄露管理界面 URL (PCI-DSS 数据最小化)
+  referrerPolicy: { policy: 'no-referrer' },
+  // 禁止 MIME 嗅探 (CIS)
+  noSniff: true,
+  // 隐藏 X-Powered-By (CIS)
+  hidePoweredBy: true,
+  // CSP 由各路由单独设置，此处全局禁止
+  contentSecurityPolicy: false,
+}));
+
 app.use(express.json({ limit: '1mb' }));
 
+// FIX-5.20-2: PCI-DSS & CIS 安全响应头
 app.use((_req, res, next) => {
+  // 缓存控制：PCI-DSS 要求敏感数据不得缓存
   res.set('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
+  // CIS: 阻止跨域策略文件
+  res.set('X-Permitted-Cross-Domain-Policies', 'none');
+  // CIS: 限制浏览器功能 (Permissions-Policy)
+  res.set('Permissions-Policy',
+    'camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()');
+  next();
+});
+
+// FIX-5.20-2: CIS 要求禁用 TRACE/TRACK 方法
+app.use((req, res, next) => {
+  if (req.method === 'TRACE' || req.method === 'TRACK') {
+    return res.status(405).json({ success: false, msg: 'Method Not Allowed' });
+  }
   next();
 });
 
@@ -1439,11 +1494,13 @@ app.get('/admin/dashboard', (_req, res) => {
   if (!adminHtmlCache) {
     return res.status(500).json({ success: false, msg: '管理页面文件缺失' });
   }
-  // 管理控制台为内部页面（nginx 已屏蔽 /admin 外部访问），
-  // 放宽 CSP 以允许内联脚本和样式
+  // FIX-5.20-2: 严格化 CSP (PCI-DSS & CIS)
+  // 补齐 connect-src / form-action / base-uri / frame-ancestors
   res.setHeader('Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
-    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;");
+    "default-src 'none'; script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+    "font-src 'self' data:; connect-src 'self'; " +
+    "form-action 'self'; base-uri 'self'; frame-ancestors 'none';");
   res.type('html').send(adminHtmlCache);
 });
 
