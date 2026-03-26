@@ -1,8 +1,21 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.10
+ * Anima 灵枢 · Webhook 服务 v5.11
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.11 相对于 v5.10）：
+ *
+ *   #FIX-5.11-1  INCR_EXPIRE_LUA 免费每日限额绕过修复
+ *                原：c >= limit 时返回 c（= limit），导致后续
+ *                count <= FREE_DAILY_LIMIT 恒为 true，免费限额形同虚设。
+ *                修：返回 limit + 1，使 count > limit 正确触发拒绝。
+ *
+ *   #FIX-5.11-2  付费模型 chargedFen=0 时跳过 billing_transactions INSERT
+ *                原：管理员将付费模型价格设为 0 但未标记 is_free 时，
+ *                chargedFen=0 的 INSERT 违反 CHECK (amount_fen != 0) 约束
+ *                导致整个计费事务回滚并返回 500 错误。
+ *                修：chargedFen > 0 时才写入流水，与 admin/adjust FIX-5.8-1 对齐。
+ *
  * 修复记录（v5.10 相对于 v5.9）：
  *
  *   #FIX-5.10-1  幂等键预检查询新增 AND au.user_email = $2 用户隔离
@@ -112,7 +125,8 @@ const INCR_EXPIRE_LUA =
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
   // FIX-5.10-2: >= limit（原为 > limit，在 c=limit 时会多做一次 INCR）
-  'if c >= limit then return c end\n' +
+  // FIX-5.11-1: 返回 limit+1（原返回 c=limit，导致 count<=limit 恒真，免费限额无效）
+  'if c >= limit then return limit + 1 end\n' +
   'local new_c = redis.call("INCR", key)\n' +
   // 首次写入：设置 24h TTL（北京时间日期前缀确保次日自然重置）
   'if new_c == 1 then redis.call("EXPIRE", key, 86400) end\n' +
@@ -1063,18 +1077,23 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       return res.status(500).json({ success: false, msg: '服务器内部错误' });
     }
 
-    await client.query(
-      `INSERT INTO billing_transactions
-           (user_email, type, amount_fen, balance_after_fen, description, ref_id)
-         VALUES ($1,'charge',$2,$3,$4,$5)`,
-      [
-        userEmail,
-        chargedFen,
-        newBalance,
-        `${modelName}（输入 ${inputTokens} Token / 输出 ${outputTokens} Token）`,
-        String(usageId),
-      ]
-    );
+    // FIX-5.11-2: chargedFen=0 时跳过流水 INSERT（避免违反 CHECK amount_fen != 0）
+    // 场景：管理员将付费模型的输入/输出价格均设为 0 但未标记 is_free
+    // 此时 chargedFen=0，INSERT 会违反 billing_transactions 的 CHECK 约束
+    if (chargedFen > 0) {
+      await client.query(
+        `INSERT INTO billing_transactions
+             (user_email, type, amount_fen, balance_after_fen, description, ref_id)
+           VALUES ($1,'charge',$2,$3,$4,$5)`,
+        [
+          userEmail,
+          chargedFen,
+          newBalance,
+          `${modelName}（输入 ${inputTokens} Token / 输出 ${outputTokens} Token）`,
+          String(usageId),
+        ]
+      );
+    }
 
     await client.query('COMMIT');
 
