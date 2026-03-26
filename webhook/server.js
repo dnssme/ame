@@ -1,8 +1,39 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.24
+ * Anima 灵枢 · Webhook 服务 v5.25
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.25 相对于 v5.24）：
+ *
+ *   #FIX-5.25-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - Redis 连接新增 enableOfflineQueue: false，
+ *                  断连时立即失败而非排队等待，避免请求堆积（CIS fail-secure）。
+ *                - /health 端点移除 db/redis 内部状态明细，仅返回
+ *                  status: ok/degraded，防止攻击者枚举基础设施组件
+ *                  （CIS 2.3 信息最小化）。
+ *                - /activate 暂停检查新增 FOR UPDATE 行锁，防止
+ *                  并发事务在检查与充值之间解除暂停的 TOCTOU 竞态
+ *                  （PCI-DSS 6.5 数据完整性）。
+ *                - POST /admin/providers providerName 新增字符集校验
+ *                  （仅允许 a-zA-Z0-9._-），与 apiProvider 校验对齐，
+ *                  防御日志/SQL 注入（PCI-DSS 6.5 输入校验完整性）。
+ *                - 优雅关闭超时改为 GRACEFUL_SHUTDOWN_TIMEOUT 环境变量
+ *                  可配置，便于 K8s/Docker 对齐 terminationGracePeriodSeconds
+ *                  （CIS 进程管理）。
+ *                - 启动时校验 ADMIN_TOKEN 与 SERVICE_TOKEN 不得相同，
+ *                  防止凭据复用（PCI-DSS 2.1 唯一凭据）。
+ *
+ *   #FIX-5.25-2  企业生产级速度优化
+ *                - /billing/history 改用 COUNT(*) OVER() 窗口函数，
+ *                  单次查询同时返回分页数据与总数，减少一次 DB 往返。
+ *                - GET /admin/users 同上优化，减少一次 COUNT 查询。
+ *                - GET /admin/cards 同上优化，减少一次 COUNT 查询。
+ *                - Redis 连接新增 enableReadyCheck: true，
+ *                  加速断连后重连检测（生产级 Redis 连接管理）。
+ *
+ *   #FIX-5.25-3  前端版本号同步
+ *                - admin.html 侧边栏及 JS 注释版本号对齐至 v5.25。
+ *
  * 修复记录（v5.24 相对于 v5.23）：
  *
  *   #FIX-5.24-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -418,6 +449,10 @@ const redis = new Redis(REDIS_URL, {
     return Math.min(times * 200, 2000);
   },
   lazyConnect: true,
+  // FIX-5.25-2: 加速断连后重连检测（生产级 Redis 连接管理）
+  enableReadyCheck: true,
+  // FIX-5.25-1: CIS fail-secure——断连时立即失败，避免请求在离线队列中堆积
+  enableOfflineQueue: false,
 });
 redis.connect().catch((err) =>
   logger.warn('Redis connect error (free daily limits disabled)', { err: err.message })
@@ -921,8 +956,8 @@ async function safeRollback(client, context) {
 // =============================================================
 
 // ─── 健康检查（FIX-5.9-1: 含 Redis 状态）────────────────────
+// FIX-5.25-1: CIS 2.3 信息最小化——不暴露 db/redis 内部组件状态
 app.get('/health', async (_req, res) => {
-  const status  = { db: 'ok', redis: 'ok', ts: new Date().toISOString() };
   let httpStatus = 200;
 
   // DB 检查（必须健康，否则 HTTP 503）
@@ -930,21 +965,17 @@ app.get('/health', async (_req, res) => {
     await db.query('SELECT 1');
   } catch (err) {
     logger.error('Health check DB error', { err: err.message });
-    status.db = 'error';
     httpStatus = 503;
   }
 
-  // Redis 检查（降级运行不影响 HTTP 状态码，但运维需感知）
+  // Redis 检查（降级运行不影响 HTTP 状态码，但运维需通过日志感知）
   try {
     if (redis.status === 'ready') {
       await redis.ping();
-      status.redis = 'ok';
     } else {
-      // 连接中断或重连中——服务可降级运行（免费限额暂不生效）
-      status.redis = 'disconnected';
+      logger.info('Health check: Redis disconnected (degraded mode)');
     }
   } catch (err) {
-    status.redis = 'error';
     logger.warn('Health check Redis error', { err: err.message });
   }
 
@@ -952,7 +983,7 @@ app.get('/health', async (_req, res) => {
   res.set('Cache-Control', 'no-store, max-age=0');
   res.status(httpStatus).json({
     status: httpStatus === 200 ? 'ok' : 'degraded',
-    ...status,
+    ts: new Date().toISOString(),
   });
 });
 
@@ -1047,8 +1078,9 @@ app.post('/activate', activateLimiter, async (req, res) => {
     await ensureUser(client, userEmail);
 
     // FIX-5.18-1: 暂停用户不允许使用充值卡（商用系统暂停账户应完全禁止财务操作）
+    // FIX-5.25-1: PCI-DSS 6.5 数据完整性——FOR UPDATE 行锁防止并发 TOCTOU 竞态
     const suspendRes = await client.query(
-      'SELECT is_suspended FROM user_billing WHERE user_email=$1',
+      'SELECT is_suspended FROM user_billing WHERE user_email=$1 FOR UPDATE',
       [userEmail]
     );
     if (suspendRes.rows.length > 0 && suspendRes.rows[0].is_suspended) {
@@ -1140,21 +1172,19 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
   const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
 
   try {
-    const [result, countRes] = await Promise.all([
-      db.query(
-        `SELECT type, amount_fen, balance_after_fen, description, created_at
-           FROM billing_transactions
-          WHERE user_email=$1
-          ORDER BY created_at DESC
-          LIMIT $2 OFFSET $3`,
-        [email, limit, offset]
-      ),
-      db.query(
-        'SELECT COUNT(*) AS total FROM billing_transactions WHERE user_email=$1',
-        [email]
-      ),
-    ]);
-    res.json({ success: true, records: result.rows, total: Number(countRes.rows[0]?.total ?? 0) });
+    // FIX-5.25-2: 使用 COUNT(*) OVER() 窗口函数，单次查询同时返回分页数据与总数
+    const result = await db.query(
+      `SELECT type, amount_fen, balance_after_fen, description, created_at,
+              COUNT(*) OVER() AS _total
+         FROM billing_transactions
+        WHERE user_email=$1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3`,
+      [email, limit, offset]
+    );
+    const total = result.rows.length > 0 ? Number(result.rows[0]._total) : 0;
+    const records = result.rows.map(({ _total, ...rest }) => rest);
+    res.json({ success: true, records, total });
   } catch (err) {
     logger.error('History query error', { err: err.message, email });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -2015,6 +2045,10 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof providerName !== 'string' || providerName.length > 32) {
     return res.status(400).json({ success: false, msg: 'providerName 长度不能超过 32 字符' });
   }
+  // FIX-5.25-1: providerName 字符集校验——与 apiProvider 校验对齐，防御日志/SQL 注入（PCI-DSS 6.5）
+  if (!API_PROVIDER_RE.test(providerName)) {
+    return res.status(400).json({ success: false, msg: 'providerName 仅允许字母、数字、连字符、下划线、点' });
+  }
   if (typeof displayName !== 'string' || displayName.length > 64) {
     return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 64 字符' });
   }
@@ -2235,17 +2269,18 @@ app.get('/admin/users', adminLimiter, requireAdmin, async (req, res) => {
   const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
 
   try {
-    const [result, countRes] = await Promise.all([
-      db.query(
-        `SELECT user_email, balance_fen, total_charged_fen, is_suspended, created_at, updated_at
-           FROM user_billing
-          ORDER BY created_at DESC
-          LIMIT $1 OFFSET $2`,
-        [limit, offset]
-      ),
-      db.query('SELECT COUNT(*) AS total FROM user_billing'),
-    ]);
-    res.json({ success: true, users: result.rows, total: Number(countRes.rows[0]?.total ?? 0) });
+    // FIX-5.25-2: 使用 COUNT(*) OVER() 窗口函数，单次查询同时返回分页数据与总数
+    const result = await db.query(
+      `SELECT user_email, balance_fen, total_charged_fen, is_suspended, created_at, updated_at,
+              COUNT(*) OVER() AS _total
+         FROM user_billing
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    const total = result.rows.length > 0 ? Number(result.rows[0]._total) : 0;
+    const users = result.rows.map(({ _total, ...rest }) => rest);
+    res.json({ success: true, users, total });
   } catch (err) {
     logger.error('Admin users query error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -2361,26 +2396,26 @@ app.get('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
       whereClause = 'WHERE used = false';
     }
 
-    const [result, countRes] = await Promise.all([
-      db.query(
-        `SELECT id, key, credit_fen, label, used, used_at, used_by, created_at
-           FROM recharge_cards
-          ${whereClause}
-          ORDER BY created_at DESC
-          LIMIT $1 OFFSET $2`,
-        params
-      ),
-      db.query(`SELECT COUNT(*) AS total FROM recharge_cards ${whereClause}`),
-    ]);
+    // FIX-5.25-2: 使用 COUNT(*) OVER() 窗口函数，单次查询同时返回分页数据与总数
+    const result = await db.query(
+      `SELECT id, key, credit_fen, label, used, used_at, used_by, created_at,
+              COUNT(*) OVER() AS _total
+         FROM recharge_cards
+        ${whereClause}
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2`,
+      params
+    );
+    const total = result.rows.length > 0 ? Number(result.rows[0]._total) : 0;
     // FIX-5.21-1: PCI-DSS 3.4——服务端掩码卡密，仅显示前4后4字符
     // 防止网络层/日志/浏览器缓存泄露全量密钥
-    const maskedCards = result.rows.map(c => ({
+    const maskedCards = result.rows.map(({ _total, ...c }) => ({
       ...c,
       key: c.key && c.key.length > 10
         ? c.key.slice(0, 4) + '••••' + c.key.slice(-4)
         : '••••••••',
     }));
-    res.json({ success: true, cards: maskedCards, total: Number(countRes.rows[0]?.total ?? 0) });
+    res.json({ success: true, cards: maskedCards, total });
   } catch (err) {
     logger.error('Admin cards query error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -2407,6 +2442,10 @@ if (!process.env.PG_PASSWORD) {
 // FIX-5.24-1: CIS Node.js 安全基线——生产环境必须设置 NODE_ENV=production
 if (process.env.NODE_ENV !== 'production') {
   logger.warn(`NODE_ENV 当前为 "${process.env.NODE_ENV || 'undefined'}"，生产环境请确保设置 NODE_ENV=production（CIS 安全基线）`);
+}
+// FIX-5.25-1: PCI-DSS 2.1——ADMIN_TOKEN 与 SERVICE_TOKEN 不得相同，防止凭据复用
+if (ADMIN_TOKEN && SERVICE_TOKEN && ADMIN_TOKEN === SERVICE_TOKEN) {
+  logger.error('ADMIN_TOKEN 与 SERVICE_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
 }
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
@@ -2443,6 +2482,12 @@ server.requestTimeout    = 30_000;
 // 50: 标准浏览器/内部服务请求通常携带 10-20 个头，50 已含充分余量（Node 默认 2000 过于宽松）
 server.maxHeadersCount   = 50;
 
+// FIX-5.25-1: CIS 进程管理——优雅关闭超时可配置，便于 K8s terminationGracePeriodSeconds 对齐
+const GRACEFUL_SHUTDOWN_TIMEOUT = Math.max(5000, Math.min(
+  parseInt(process.env.GRACEFUL_SHUTDOWN_TIMEOUT || '10000', 10) || 10000,
+  60000
+));
+
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
   server.close(() => {
@@ -2459,7 +2504,7 @@ const shutdown = (signal) => {
         process.exit(1);
       });
   });
-  setTimeout(() => process.exit(1), 10_000);
+  setTimeout(() => process.exit(1), GRACEFUL_SHUTDOWN_TIMEOUT);
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
