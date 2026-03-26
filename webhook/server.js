@@ -1091,9 +1091,10 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
         [userEmail]
       );
-      const freeBalance = suspendCheck.rows.length > 0 ? Number(suspendCheck.rows[0].balance_fen) : 0;
+      const freeBalance   = suspendCheck.rows.length > 0 ? Number(suspendCheck.rows[0].balance_fen) : 0;
+      const freeSuspended = suspendCheck.rows.length > 0 && !!suspendCheck.rows[0].is_suspended;
 
-      if (suspendCheck.rows.length > 0 && suspendCheck.rows[0].is_suspended) {
+      if (freeSuspended) {
         await safeRollback(client, '/billing/record free model suspended');
         return res.status(403).json({
           success: false, msg: '账户已被暂停',
@@ -1134,7 +1135,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
             is_free:      true,
             charged_fen:  0,
             balance_fen:  freeBalance,
-            is_suspended: false,
+            is_suspended: freeSuspended,
             idempotent:   true,
             daily_used:   Math.max(0, dailyCheck.used - 1),
             daily_limit:  dailyCheck.limit,
@@ -1154,7 +1155,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         is_free:      true,
         charged_fen:  0,
         balance_fen:  freeBalance,
-        is_suspended: false,
+        is_suspended: freeSuspended,
         daily_used:   dailyCheck.used,
         daily_limit:  dailyCheck.limit,
       });
@@ -1289,7 +1290,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     logger.info('Billing recorded', { userEmail, modelName, chargedFen, newBalance, idempotencyKey: normalizedIdempKey });
 
-    res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance, is_suspended: false });
+    res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance, is_suspended: !!u.is_suspended });
   } catch (err) {
     await safeRollback(client, '/billing/record unhandled error');
     logger.error('Billing record error', { err: err.message, userEmail });
