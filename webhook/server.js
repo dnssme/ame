@@ -1,8 +1,31 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.15
+ * Anima 灵枢 · Webhook 服务 v5.16
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.16 相对于 v5.15）：
+ *
+ *   #FIX-5.16-1  /billing/check 付费模型用户暂停时返回 HTTP 403
+ *                原：付费模型路径仅在 200 响应中设置 can_proceed:false +
+ *                is_suspended:true，但免费模型路径直接返回 403。
+ *                前端无法通过 HTTP 状态码统一处理"用户暂停"场景。
+ *                修：付费模型路径在安全上限检查之前新增显式 403 分支，
+ *                与免费模型路径保持一致。
+ *
+ *   #FIX-5.16-2  /billing/record 免费模型路径新增 ensureUser 调用
+ *                原：仅付费模型路径调用 ensureUser，纯免费用户永远不会在
+ *                user_billing 中创建记录，导致管理员无法通过 GET /admin/users
+ *                看到这些用户，也无法对其执行 suspend/unsuspend 操作。
+ *                修：免费模型路径在暂停检查前先调用 ensureUser，确保所有
+ *                活跃用户均可被管理员管理。
+ *
+ *   #FIX-5.16-3  /billing/record 所有成功/幂等响应补齐 is_suspended 字段
+ *                原：所有拒绝响应（403/402/429）均包含 is_suspended，但
+ *                成功/幂等响应缺失该字段，前端无法在所有场景下一致读取
+ *                用户暂停状态。
+ *                修：五个成功/幂等响应路径均补齐 is_suspended 字段；
+ *                幂等预检/冲突解决查询 SELECT 新增 ub.is_suspended 列。
+ *
  * 修复记录（v5.15 相对于 v5.14）：
  *
  *   #FIX-5.15-1  /activate 卡密无效/已使用时返回 HTTP 403 而非 200
@@ -904,6 +927,18 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 
+  // FIX-5.16-1: 付费模型用户暂停时返回 403（与免费模型路径对齐）
+  if (isSuspended) {
+    return res.status(403).json({
+      success:      false,
+      can_proceed:  false,
+      is_free:      false,
+      msg:          '账户已被暂停',
+      balance_fen:  balance,
+      is_suspended: true,
+    });
+  }
+
   const MAX_SINGLE_REQUEST_FEN = getMaxSingleRequestFen();
   if (estimatedFen > MAX_SINGLE_REQUEST_FEN) {
     return res.status(402).json({
@@ -998,7 +1033,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   if (normalizedIdempKey) {
     try {
       const idempRes = await db.query(
-        `SELECT au.charged_fen, au.is_free, ub.balance_fen
+        `SELECT au.charged_fen, au.is_free, ub.balance_fen, ub.is_suspended
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
           WHERE au.idempotency_key = $1
@@ -1009,11 +1044,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         logger.info('Idempotent billing record (pre-check hit)', { idempotencyKey: normalizedIdempKey, userEmail });
         const existRec = idempRes.rows[0];
         return res.json({
-          success:     true,
-          is_free:     existRec.is_free,
-          charged_fen: existRec.is_free ? 0 : Number(existRec.charged_fen),
-          balance_fen: existRec.balance_fen !== null ? Number(existRec.balance_fen) : 0,
-          idempotent:  true,
+          success:      true,
+          is_free:      existRec.is_free,
+          charged_fen:  existRec.is_free ? 0 : Number(existRec.charged_fen),
+          balance_fen:  existRec.balance_fen !== null ? Number(existRec.balance_fen) : 0,
+          is_suspended: !!existRec.is_suspended,
+          idempotent:   true,
         });
       }
     } catch (err) {
@@ -1045,15 +1081,20 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     // ── 免费模型路径 ──────────────────────────────────────
     if (isFree) {
+      // FIX-5.16-2: 免费模型路径也需调用 ensureUser，确保纯免费用户
+      //   在 user_billing 中有记录，管理员可通过 GET /admin/users 查看并管理
+      await ensureUser(client, userEmail);
+
       // FIX-5.12-1: 免费模型也需检查用户暂停状态
       // FIX-5.13-1: 同时获取 balance_fen，确保所有响应返回真实余额
       const suspendCheck = await client.query(
         'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
         [userEmail]
       );
-      const freeBalance = suspendCheck.rows.length > 0 ? Number(suspendCheck.rows[0].balance_fen) : 0;
+      const freeBalance   = suspendCheck.rows.length > 0 ? Number(suspendCheck.rows[0].balance_fen) : 0;
+      const freeSuspended = suspendCheck.rows.length > 0 && !!suspendCheck.rows[0].is_suspended;
 
-      if (suspendCheck.rows.length > 0 && suspendCheck.rows[0].is_suspended) {
+      if (freeSuspended) {
         await safeRollback(client, '/billing/record free model suspended');
         return res.status(403).json({
           success: false, msg: '账户已被暂停',
@@ -1090,13 +1131,14 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
           await safeRollback(client, '/billing/record free concurrent idempotent');
           await tryDecrFreeDailyUsage(dailyCheck.key);
           return res.json({
-            success:     true,
-            is_free:     true,
-            charged_fen: 0,
-            balance_fen: freeBalance,
-            idempotent:  true,
-            daily_used:  Math.max(0, dailyCheck.used - 1),
-            daily_limit: dailyCheck.limit,
+            success:      true,
+            is_free:      true,
+            charged_fen:  0,
+            balance_fen:  freeBalance,
+            is_suspended: freeSuspended,
+            idempotent:   true,
+            daily_used:   Math.max(0, dailyCheck.used - 1),
+            daily_limit:  dailyCheck.limit,
           });
         }
 
@@ -1109,12 +1151,13 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       }
 
       return res.json({
-        success:     true,
-        is_free:     true,
-        charged_fen: 0,
-        balance_fen: freeBalance,
-        daily_used:  dailyCheck.used,
-        daily_limit: dailyCheck.limit,
+        success:      true,
+        is_free:      true,
+        charged_fen:  0,
+        balance_fen:  freeBalance,
+        is_suspended: freeSuspended,
+        daily_used:   dailyCheck.used,
+        daily_limit:  dailyCheck.limit,
       });
     }
 
@@ -1196,7 +1239,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       await safeRollback(client, '/billing/record idempotency conflict');
       logger.info('Idempotent billing record (conflict resolution)', { idempotencyKey: normalizedIdempKey, userEmail });
       const existingRes = await db.query(
-        `SELECT au.charged_fen, au.is_free, ub.balance_fen
+        `SELECT au.charged_fen, au.is_free, ub.balance_fen, ub.is_suspended
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
           WHERE au.idempotency_key = $1
@@ -1204,12 +1247,13 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         [normalizedIdempKey, userEmail]
       );
       return res.json({
-        success:     true,
-        is_free:     existingRes.rows.length > 0 ? existingRes.rows[0].is_free : false,
-        charged_fen: existingRes.rows.length > 0 ? Number(existingRes.rows[0].charged_fen) : chargedFen,
-        balance_fen: existingRes.rows.length > 0 && existingRes.rows[0].balance_fen !== null
+        success:      true,
+        is_free:      existingRes.rows.length > 0 ? existingRes.rows[0].is_free : false,
+        charged_fen:  existingRes.rows.length > 0 ? Number(existingRes.rows[0].charged_fen) : chargedFen,
+        balance_fen:  existingRes.rows.length > 0 && existingRes.rows[0].balance_fen !== null
           ? Number(existingRes.rows[0].balance_fen) : 0,
-        idempotent:  true,
+        is_suspended: existingRes.rows.length > 0 ? !!existingRes.rows[0].is_suspended : false,
+        idempotent:   true,
       });
     }
 
@@ -1246,7 +1290,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     logger.info('Billing recorded', { userEmail, modelName, chargedFen, newBalance, idempotencyKey: normalizedIdempKey });
 
-    res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance });
+    res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance, is_suspended: !!u.is_suspended });
   } catch (err) {
     await safeRollback(client, '/billing/record unhandled error');
     logger.error('Billing record error', { err: err.message, userEmail });
