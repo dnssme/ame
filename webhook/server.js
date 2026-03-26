@@ -1427,27 +1427,31 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
 // ── 综合管理控制台（FIX-5.19-1）──────────────────────────────
 const ADMIN_HTML_PATH = path.join(__dirname, 'public', 'admin.html');
+// 启动时缓存 admin.html，避免每次请求同步读取文件阻塞事件循环
+let adminHtmlCache = null;
+try {
+  adminHtmlCache = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
+} catch {
+  logger.warn('Admin dashboard HTML not found at startup', { path: ADMIN_HTML_PATH });
+}
 
 app.get('/admin/dashboard', (_req, res) => {
-  try {
-    const html = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
-    // 管理控制台为内部页面（nginx 已屏蔽 /admin 外部访问），
-    // 放宽 CSP 以允许内联脚本和样式
-    res.setHeader('Content-Security-Policy',
-      "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
-      "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;");
-    res.type('html').send(html);
-  } catch (err) {
-    logger.error('Admin dashboard read error', { err: err.message });
-    res.status(500).json({ success: false, msg: '管理页面文件缺失' });
+  if (!adminHtmlCache) {
+    return res.status(500).json({ success: false, msg: '管理页面文件缺失' });
   }
+  // 管理控制台为内部页面（nginx 已屏蔽 /admin 外部访问），
+  // 放宽 CSP 以允许内联脚本和样式
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;");
+  res.type('html').send(adminHtmlCache);
 });
 
 // ── 模块状态（FIX-5.19-2）────────────────────────────────────
 const MODULES_YML_PATH = process.env.MODULES_YML_PATH
   || path.join(__dirname, '..', 'modules', 'modules.yml');
 
-app.get('/admin/modules', adminLimiter, requireAdmin, (_req, res) => {
+app.get('/admin/modules', adminLimiter, requireAdmin, async (_req, res) => {
   try {
     // 安全校验：仅允许读取 .yml/.yaml 文件
     const resolvedPath = path.resolve(MODULES_YML_PATH);
@@ -1455,7 +1459,7 @@ app.get('/admin/modules', adminLimiter, requireAdmin, (_req, res) => {
       logger.warn('MODULES_YML_PATH 扩展名不合法', { path: resolvedPath });
       return res.json({ success: true, categories: {} });
     }
-    const content = fs.readFileSync(resolvedPath, 'utf8');
+    const content = await fs.promises.readFile(resolvedPath, 'utf8');
     const parsed = yaml.load(content);
     res.json({ success: true, categories: parsed || {} });
   } catch (err) {
