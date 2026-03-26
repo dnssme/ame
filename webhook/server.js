@@ -1,8 +1,36 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.23
+ * Anima 灵枢 · Webhook 服务 v5.24
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.24 相对于 v5.23）：
+ *
+ *   #FIX-5.24-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - Helmet 新增 crossOriginResourcePolicy('same-origin')、
+ *                  crossOriginOpenerPolicy('same-origin')、
+ *                  crossOriginEmbedderPolicy(true)，完善 CIS 跨源隔离策略。
+ *                - /billing/record modelName 新增字符集校验
+ *                  （仅允许 a-zA-Z0-9._:/-），与 apiProvider 校验对齐，
+ *                  防御日志注入（PCI-DSS 6.5 输入校验完整性）。
+ *                - 管理员模型端点 provider 字段新增字符集校验
+ *                  （仅允许 a-zA-Z0-9._-），防御日志/SQL 注入。
+ *                - /admin/dashboard 响应追加 X-Robots-Tag: noindex，
+ *                  防止搜索引擎收录管理页面（PCI-DSS 数据最小化）。
+ *                - 启动时检测 NODE_ENV !== 'production' 并输出警告
+ *                  （CIS Node.js 安全基线——生产环境必须设置）。
+ *
+ *   #FIX-5.24-2  企业生产级速度优化
+ *                - /admin/dashboard 静态 HTML 预转换为 Buffer，
+ *                  避免每次请求 string→Buffer 转换开销。
+ *                - 访问日志改用 process.hrtime.bigint() 计时，
+ *                  提供亚毫秒精度，替代 Date.now() 毫秒级精度。
+ *                - 公开只读端点（/models、/providers）追加
+ *                  Vary: Accept-Encoding，确保 CDN/代理正确缓存
+ *                  不同编码的响应变体。
+ *
+ *   #FIX-5.24-3  前端版本号同步
+ *                - admin.html 侧边栏及 JS 注释版本号对齐至 v5.24。
+ *
  * 修复记录（v5.23 相对于 v5.22）：
  *
  *   #FIX-5.23-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -535,7 +563,7 @@ const app = express();
 
 app.set('trust proxy', process.env.TRUST_PROXY || '172.16.1.1');
 
-// FIX-5.20-2: 严格 helmet 配置，满足 PCI-DSS & CIS 安全基线
+// FIX-5.20-2 + FIX-5.24-1: 严格 helmet 配置，满足 PCI-DSS & CIS 安全基线
 app.use(helmet({
   // HSTS: PCI-DSS 要求强制 HTTPS，预加载列表
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
@@ -547,6 +575,10 @@ app.use(helmet({
   noSniff: true,
   // 隐藏 X-Powered-By (CIS)
   hidePoweredBy: true,
+  // FIX-5.24-1: CIS 跨源隔离策略——防止跨源信息泄露
+  crossOriginResourcePolicy: { policy: 'same-origin' },
+  crossOriginOpenerPolicy: { policy: 'same-origin' },
+  crossOriginEmbedderPolicy: true,
   // 全局 CSP: API 端点仅返回 JSON，使用最严格策略
   contentSecurityPolicy: {
     directives: {
@@ -569,17 +601,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// FIX-5.23-1: PCI-DSS 10.2——全链路访问日志（method/path/status/duration/ip/request_id）
+// FIX-5.23-1 + FIX-5.24-2: PCI-DSS 10.2——全链路访问日志
+// FIX-5.24-2: 改用 process.hrtime.bigint() 提供亚毫秒精度计时
 app.use((req, res, next) => {
-  const start = Date.now();
+  const start = process.hrtime.bigint();
   res.on('finish', () => {
-    const durationMs = Date.now() - start;
+    const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
     logger.info('ACCESS', {
       request_id: req.id,
       method:     req.method,
       path:       req.path,
       status:     res.statusCode,
-      duration_ms: durationMs,
+      duration_ms: Math.round(durationMs * 100) / 100,
       ip:         req.ip,
     });
   });
@@ -720,6 +753,9 @@ const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
 // FIX-5.23-1: apiProvider 字符集校验——仅允许字母、数字、连字符、下划线、点
 // 安全审查：apiProvider 仅用于 SQL 参数化查询和日志输出，不作为文件路径或 URL 拼接
 const API_PROVIDER_RE = /^[a-zA-Z0-9._-]+$/;
+// FIX-5.24-1: modelName 字符集校验——仅允许字母、数字、连字符、下划线、点、冒号、斜杠
+// 模型名称含 provider:model 或 org/model 命名惯例（如 openai/gpt-4、claude-3:opus）
+const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/\-]+$/;
 
 function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
@@ -932,7 +968,9 @@ app.get('/models', readLimiter, async (_req, res) => {
         ORDER BY provider, model_name`
     );
     // FIX-5.23-2: 公开只读端点允许短暂缓存，减少 DB 查询压力
+    // FIX-5.24-2: Vary: Accept-Encoding 确保 CDN/代理按编码正确缓存
     res.set('Cache-Control', 'public, max-age=30');
+    res.set('Vary', 'Accept-Encoding');
     res.json({ success: true, models: result.rows });
   } catch (err) {
     logger.error('Models query error', { err: err.message });
@@ -959,7 +997,9 @@ app.get('/providers', readLimiter, async (_req, res) => {
       throw err;
     });
     // FIX-5.23-2: 公开只读端点允许短暂缓存，减少 DB 查询压力
+    // FIX-5.24-2: Vary: Accept-Encoding 确保 CDN/代理按编码正确缓存
     res.set('Cache-Control', 'public, max-age=30');
+    res.set('Vary', 'Accept-Encoding');
     res.json({ success: true, providers: result.rows });
   } catch (err) {
     logger.error('Providers query error', { err: err.message });
@@ -1316,6 +1356,10 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   if (typeof modelName !== 'string' || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
+  // FIX-5.24-1: modelName 字符集校验——防御日志注入（PCI-DSS 6.5 输入校验完整性）
+  if (!MODEL_NAME_RE.test(modelName)) {
+    return res.status(400).json({ success: false, msg: 'modelName 仅允许字母、数字、连字符、下划线、点、冒号、斜杠' });
+  }
   if (
     typeof inputTokens !== 'number' || typeof outputTokens !== 'number' ||
     !Number.isFinite(inputTokens)   || !Number.isFinite(outputTokens) ||
@@ -1636,23 +1680,28 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 const ADMIN_HTML_PATH = path.join(__dirname, 'public', 'admin.html');
 // 启动时缓存 admin.html，避免每次请求同步读取文件阻塞事件循环
 let adminHtmlCache = null;
+// FIX-5.24-2: 预转换为 Buffer，避免每次 res.send() 进行 string→Buffer 转换
+let adminHtmlBuffer = null;
 // FIX-5.22-2: 预计算 ETag，支持 304 条件请求减少传输
 let adminHtmlEtag = null;
 try {
   adminHtmlCache = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
+  adminHtmlBuffer = Buffer.from(adminHtmlCache, 'utf8');
   adminHtmlEtag = '"' + crypto.createHash('sha256').update(adminHtmlCache).digest('hex') + '"';
 } catch {
   logger.warn('Admin dashboard HTML not found at startup', { path: ADMIN_HTML_PATH });
 }
 
 app.get('/admin/dashboard', (req, res) => {
-  if (!adminHtmlCache) {
+  if (!adminHtmlBuffer) {
     return res.status(500).json({ success: false, msg: '管理页面文件缺失' });
   }
   // FIX-5.22-2: ETag 条件请求——浏览器缓存命中时返回 304
   if (adminHtmlEtag && req.headers['if-none-match'] === adminHtmlEtag) {
     return res.status(304).end();
   }
+  // FIX-5.24-1: PCI-DSS 数据最小化——阻止搜索引擎收录管理页面
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
   // FIX-5.20-2: 严格化 CSP (PCI-DSS & CIS)
   // 补齐 connect-src / form-action / base-uri / frame-ancestors
   res.setHeader('Content-Security-Policy',
@@ -1661,7 +1710,10 @@ app.get('/admin/dashboard', (req, res) => {
     "font-src 'self' data:; connect-src 'self'; " +
     "form-action 'self'; base-uri 'self'; frame-ancestors 'none';");
   if (adminHtmlEtag) res.setHeader('ETag', adminHtmlEtag);
-  res.type('html').send(adminHtmlCache);
+  // FIX-5.24-2: 发送预转换的 Buffer，避免 string→Buffer 运行时开销
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Length', adminHtmlBuffer.length);
+  res.end(adminHtmlBuffer);
 });
 
 // ── 模块状态（FIX-5.19-2）────────────────────────────────────
@@ -1718,6 +1770,10 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   }
   if (typeof provider !== 'string' || provider.length > 32) {
     return res.status(400).json({ success: false, msg: 'provider 长度不能超过 32 字符' });
+  }
+  // FIX-5.24-1: provider 字符集校验——防御日志/SQL 注入（PCI-DSS 6.5）
+  if (!API_PROVIDER_RE.test(provider)) {
+    return res.status(400).json({ success: false, msg: 'provider 仅允许字母、数字、连字符、下划线、点' });
   }
   if (typeof modelName !== 'string' || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
@@ -2347,6 +2403,10 @@ app.use((err, req, res, _next) => {
 // FIX-5.21-1: 启动时校验关键环境变量（PCI-DSS 配置管理）
 if (!process.env.PG_PASSWORD) {
   logger.warn('PG_PASSWORD 未设置，数据库连接可能失败');
+}
+// FIX-5.24-1: CIS Node.js 安全基线——生产环境必须设置 NODE_ENV=production
+if (process.env.NODE_ENV !== 'production') {
+  logger.warn('NODE_ENV 未设置为 production，生产环境请确保设置 NODE_ENV=production（CIS 安全基线）');
 }
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
