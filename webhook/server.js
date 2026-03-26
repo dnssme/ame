@@ -1,8 +1,40 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.27
+ * Anima 灵枢 · Webhook 服务 v5.28
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.28 相对于 v5.27）：
+ *
+ *   #FIX-5.28-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - 新增 server.maxRequestsPerSocket（默认 256），限制
+ *                  单个 TCP 连接上的 HTTP 请求数，防止持久连接上的
+ *                  请求洪水攻击（CIS DoS 缓解 / HTTP 管道限流）。
+ *                - DB 连接池新增 idle_in_transaction_session_timeout
+ *                  （30s），自动终止空闲事务中的连接，防止行锁泄漏
+ *                  导致数据库资源耗尽（CIS 资源保护）。
+ *                - /activate 成功日志中的卡密 cardKey 改为掩码输出
+ *                  （前4后4），防止日志泄露完整密钥（PCI-DSS 3.4
+ *                  敏感认证数据掩码）。
+ *                - 安全响应头新增 X-Download-Options: noopen，防止
+ *                  IE 浏览器在站点上下文中执行下载文件（CIS 浏览器
+ *                  安全加固）。
+ *                - 启动时强制校验 ADMIN_TOKEN / SERVICE_TOKEN 最短
+ *                  32 字符，不满足则拒绝启动（PCI-DSS 8.2.3 最低
+ *                  密码/密钥复杂度要求；原仅 warn < 64 字符）。
+ *                - 启动时检测 NODE_TLS_REJECT_UNAUTHORIZED=0，
+ *                  生产环境下拒绝启动（PCI-DSS 4.1 传输加密——
+ *                  禁止全局禁用 TLS 证书校验）。
+ *
+ *   #FIX-5.28-2  企业生产级速度优化
+ *                - 高频用户查询改用命名预备语句（user_bal_status /
+ *                  user_bal_full / user_bal_for_update），覆盖
+ *                  /billing/balance、/billing/check、/billing/record
+ *                  中的用户余额/暂停状态查询，连接复用时跳过 SQL
+ *                  解析阶段，减少 DB CPU 开销。
+ *
+ *   #FIX-5.28-3  前端版本号同步
+ *                - admin.html 侧边栏及 JS 注释版本号对齐至 v5.28。
+ *
  * 修复记录（v5.27 相对于 v5.26）：
  *
  *   #FIX-5.27-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -501,6 +533,14 @@ const db = new Pool({
 
 db.on('error', (err) => logger.error('DB pool error', { err: err.message }));
 
+// FIX-5.28-1: CIS 资源保护——新连接设置 idle_in_transaction_session_timeout（30s）
+// 防止事务内空闲连接长期持有行锁导致数据库资源耗尽
+db.on('connect', (client) => {
+  client.query('SET idle_in_transaction_session_timeout = 30000').catch((err) => {
+    logger.warn('Failed to set idle_in_transaction_session_timeout', { err: err.message });
+  });
+});
+
 // ─── Redis 连接 ───────────────────────────────────────────────
 const REDIS_URL = process.env.REDIS_URL || 'redis://172.16.1.6:6379';
 // FIX-5.27-1: PCI-DSS 4.1——检测 Redis 传输层是否加密
@@ -739,6 +779,8 @@ app.use((_req, res, next) => {
   res.set('Expires', '0');
   // CIS: 阻止跨域策略文件
   res.set('X-Permitted-Cross-Domain-Policies', 'none');
+  // FIX-5.28-1: CIS 浏览器安全加固——阻止 IE 在站点上下文中执行下载文件
+  res.set('X-Download-Options', 'noopen');
   // CIS: 限制浏览器功能 (Permissions-Policy)
   res.set('Permissions-Policy',
     'camera=(), microphone=(), geolocation=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()');
@@ -1221,7 +1263,11 @@ app.post('/activate', activateLimiter, async (req, res) => {
 
     await client.query('COMMIT');
 
-    logger.info('Card activated', { userEmail, cardKey, credit: card.credit_fen });
+    // FIX-5.28-1: PCI-DSS 3.4——日志中掩码卡密，仅显示前4后4字符，防止日志泄露完整密钥
+    const maskedKey = cardKey.length > 10
+      ? cardKey.slice(0, 4) + '••••' + cardKey.slice(-4)
+      : '••••••••';
+    logger.info('Card activated', { userEmail, cardKey: maskedKey, credit: card.credit_fen });
 
     res.json({
       success:      true,
@@ -1248,11 +1294,13 @@ app.get('/billing/balance/:email', readLimiter, async (req, res) => {
   }
 
   try {
-    const result = await db.query(
-      `SELECT balance_fen, total_charged_fen, is_suspended
+    // FIX-5.28-2: 命名预备语句加速重复查询
+    const result = await db.query({
+      name: 'user_bal_full',
+      text: `SELECT balance_fen, total_charged_fen, is_suspended
          FROM user_billing WHERE user_email=$1`,
-      [email]
-    );
+      values: [email],
+    });
     if (result.rows.length === 0) {
       return res.json({ success: true, balance_fen: 0, total_charged_fen: 0, is_suspended: false });
     }
@@ -1341,10 +1389,12 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     let freeBalance = 0;
     let freeSuspended = false;
     try {
-      const freeUserRes = await db.query(
-        'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
-        [userEmail]
-      );
+      // FIX-5.28-2: 命名预备语句加速重复查询
+      const freeUserRes = await db.query({
+        name: 'user_bal_status',
+        text: 'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+        values: [userEmail],
+      });
       if (freeUserRes.rows.length > 0) {
         freeBalance   = Number(freeUserRes.rows[0].balance_fen);
         freeSuspended = freeUserRes.rows[0].is_suspended;
@@ -1407,10 +1457,12 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   let balance     = 0;
   let isSuspended = false;
   try {
-    const balRes = await db.query(
-      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
-      [userEmail]
-    );
+    // FIX-5.28-2: 命名预备语句加速重复查询
+    const balRes = await db.query({
+      name: 'user_bal_status',
+      text: 'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+      values: [userEmail],
+    });
     if (balRes.rows.length > 0) {
       balance     = Number(balRes.rows[0].balance_fen);
       isSuspended = balRes.rows[0].is_suspended;
@@ -1588,10 +1640,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
       // FIX-5.12-1: 免费模型也需检查用户暂停状态
       // FIX-5.13-1: 同时获取 balance_fen，确保所有响应返回真实余额
-      const suspendCheck = await client.query(
-        'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
-        [userEmail]
-      );
+      // FIX-5.28-2: 命名预备语句加速重复查询
+      const suspendCheck = await client.query({
+        name: 'user_bal_status',
+        text: 'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+        values: [userEmail],
+      });
       const freeBalance   = suspendCheck.rows.length > 0 ? Number(suspendCheck.rows[0].balance_fen) : 0;
       const freeSuspended = suspendCheck.rows.length > 0 && !!suspendCheck.rows[0].is_suspended;
 
@@ -1665,10 +1719,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     // ── 付费模型路径 ──────────────────────────────────────
     await ensureUser(client, userEmail);
 
-    const userRes = await client.query(
-      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1 FOR UPDATE',
-      [userEmail]
-    );
+    // FIX-5.28-2: 命名预备语句加速重复查询
+    const userRes = await client.query({
+      name: 'user_bal_for_update',
+      text: 'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1 FOR UPDATE',
+      values: [userEmail],
+    });
     const u = userRes.rows[0];
 
     // FIX-5.14-1: 付费模型 403 暂停响应补齐 balance_fen 和 is_suspended
@@ -2561,6 +2617,27 @@ if (ADMIN_TOKEN && SERVICE_TOKEN && ADMIN_TOKEN === SERVICE_TOKEN) {
   logger.error('ADMIN_TOKEN 与 SERVICE_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
   process.exit(1);
 }
+// FIX-5.28-1: PCI-DSS 8.2.3——ADMIN_TOKEN / SERVICE_TOKEN 最短 32 字符强制校验
+// 32 字符 = 128 位熵（hex 编码 16 字节），满足 PCI-DSS 最低密钥长度要求
+// 原 < 64 字符仅 warn，现 < 32 字符直接拒绝启动
+if (ADMIN_TOKEN && ADMIN_TOKEN.length < 32) {
+  logger.error('ADMIN_TOKEN 过短（< 32 字符），不满足 PCI-DSS 8.2.3 最低密钥长度要求，拒绝启动');
+  process.exit(1);
+}
+if (SERVICE_TOKEN && SERVICE_TOKEN.length < 32) {
+  logger.error('SERVICE_TOKEN 过短（< 32 字符），不满足 PCI-DSS 8.2.3 最低密钥长度要求，拒绝启动');
+  process.exit(1);
+}
+// FIX-5.28-1: PCI-DSS 4.1——检测 NODE_TLS_REJECT_UNAUTHORIZED=0（全局禁用 TLS 证书校验）
+// 此设置会使所有 HTTPS 连接（包括 DB SSL）跳过证书验证，生产环境严禁使用
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+  if (process.env.NODE_ENV === 'production') {
+    logger.error('NODE_TLS_REJECT_UNAUTHORIZED=0 在生产环境中被设置，TLS 证书校验已全局禁用（PCI-DSS 4.1 违规），拒绝启动');
+    process.exit(1);
+  } else {
+    logger.warn('NODE_TLS_REJECT_UNAUTHORIZED=0 已设置，TLS 证书校验全局禁用，生产环境严禁此配置（PCI-DSS 4.1）');
+  }
+}
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
 const HOST = process.env.HOST || '172.16.1.6';
@@ -2602,6 +2679,9 @@ server.requestTimeout    = 30_000;
 server.maxHeadersCount   = 50;
 // FIX-5.27-1: CIS 资源保护——限制并发 TCP 连接数，防止连接洪水耗尽文件描述符
 server.maxConnections    = 1024;
+// FIX-5.28-1: CIS DoS 缓解——限制单个持久连接上的 HTTP 请求数，防止管道请求洪水
+// 256: 正常浏览器/内部服务单连接请求数远低于此值，超限后强制断开重连
+server.maxRequestsPerSocket = 256;
 
 // FIX-5.25-1: CIS 进程管理——优雅关闭超时可配置，便于 K8s terminationGracePeriodSeconds 对齐
 // 有效范围 5-60 秒，默认 10 秒
