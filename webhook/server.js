@@ -1,8 +1,28 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.13
+ * Anima 灵枢 · Webhook 服务 v5.14
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.14 相对于 v5.13）：
+ *
+ *   #FIX-5.14-1  /billing/record 付费模型路径所有拒绝响应补齐字段
+ *                原：付费模型 403（暂停）缺少 balance_fen/is_suspended；
+ *                402（安全上限）缺少 balance_fen；402（余额不足）缺少
+ *                is_suspended。前端无法在拒绝场景下一致展示用户状态。
+ *                修：三个拒绝响应均补齐 balance_fen + is_suspended 字段，
+ *                与免费模型路径响应格式对齐。
+ *
+ *   #FIX-5.14-2  /billing/check 付费模型 402（安全上限）补齐字段
+ *                原：仅返回 estimated_fen 和 limit_fen，缺少
+ *                can_proceed/is_free 字段，前端无法统一处理 check 响应。
+ *                修：补齐 can_proceed: false 和 is_free: false。
+ *
+ *   #FIX-5.14-3  新增 DELETE /admin/models/:id 端点（软删除）
+ *                架构文档中提及但未实现的 RESTful 模型停用接口。
+ *                行为：将 is_active 设为 false 并清除模型缓存。
+ *                等价于 PUT /admin/models/:id { isActive: false }，
+ *                但语义更清晰，符合 REST 惯例。
+ *
  * 修复记录（v5.13 相对于 v5.12）：
  *
  *   #FIX-5.13-1  /billing/record 免费模型路径返回真实余额
@@ -840,8 +860,10 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   const MAX_SINGLE_REQUEST_FEN = getMaxSingleRequestFen();
   if (estimatedFen > MAX_SINGLE_REQUEST_FEN) {
     return res.status(402).json({
-      success:  false,
-      msg:      '预估费用超过单次安全上限，请新建对话或减少上下文。',
+      success:       false,
+      can_proceed:   false,
+      is_free:       false,
+      msg:           '预估费用超过单次安全上限，请新建对话或减少上下文。',
       estimated_fen: estimatedFen,
       limit_fen:     MAX_SINGLE_REQUEST_FEN,
     });
@@ -1069,9 +1091,13 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     );
     const u = userRes.rows[0];
 
+    // FIX-5.14-1: 付费模型 403 暂停响应补齐 balance_fen 和 is_suspended
     if (u.is_suspended) {
       await safeRollback(client, '/billing/record suspended');
-      return res.status(403).json({ success: false, msg: '账户已被暂停' });
+      return res.status(403).json({
+        success: false, msg: '账户已被暂停',
+        balance_fen: Number(u.balance_fen), is_suspended: true,
+      });
     }
 
     const MAX_SINGLE_REQUEST_FEN = getMaxSingleRequestFen();
@@ -1090,6 +1116,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         msg:         '单次请求费用超过安全上限，请新建对话或减少上下文。',
         charged_fen: chargedFen,
         limit_fen:   MAX_SINGLE_REQUEST_FEN,
+        balance_fen: Number(u.balance_fen),
       });
     }
 
@@ -1100,6 +1127,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         msg:          '余额不足，请充值后继续使用',
         balance_fen:  Number(u.balance_fen),
         required_fen: chargedFen,
+        is_suspended: false,
       });
     }
 
@@ -1403,6 +1431,34 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     res.json({ success: true, model: result.rows[0] });
   } catch (err) {
     logger.error('Model update error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+// FIX-5.14-3: DELETE /admin/models/:id 软删除（设 is_active=false）
+app.delete('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ success: false, msg: '模型 ID 无效' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE api_models SET is_active = false
+        WHERE id = $1
+        RETURNING id, model_name, display_name, is_active`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, msg: '模型不存在' });
+    }
+
+    modelCacheDelete(result.rows[0].model_name);
+
+    logger.info('Model deactivated', { id, modelName: result.rows[0].model_name });
+    res.json({ success: true, model: result.rows[0] });
+  } catch (err) {
+    logger.error('Model deactivate error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
