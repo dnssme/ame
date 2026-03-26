@@ -1,8 +1,31 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.22
+ * Anima 灵枢 · Webhook 服务 v5.23
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.23 相对于 v5.22）：
+ *
+ *   #FIX-5.23-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - 新增 server.requestTimeout（30 s）和
+ *                  server.maxHeadersCount（50），防止 Slowloris 及
+ *                  头部洪水 DoS 攻击（CIS Node.js 安全基线）。
+ *                - 新增请求级访问日志中间件（method/path/status/duration/
+ *                  request_id/ip），满足 PCI-DSS 10.2 全链路审计追踪。
+ *                - /billing/record apiProvider 新增字符集校验
+ *                  （仅允许 a-zA-Z0-9._-），防御 SQL/日志注入（PCI-DSS 6.5）。
+ *                - 关键 catch 块补齐 request_id 字段，确保故障日志
+ *                  可与请求关联（PCI-DSS 10.3 日志完整性）。
+ *
+ *   #FIX-5.23-2  企业生产级速度优化
+ *                - 公开只读端点（/models、/providers）响应追加
+ *                  Cache-Control: public, max-age=30，允许浏览器及
+ *                  CDN 短暂缓存，减少对 DB 的重复查询。
+ *                - /health 端点响应追加 Cache-Control: no-cache,
+ *                  max-age=0，防止误缓存健康检查结果。
+ *
+ *   #FIX-5.23-3  前端版本号同步
+ *                - admin.html 侧边栏及 JS 注释版本号对齐至 v5.23。
+ *
  * 修复记录（v5.22 相对于 v5.21）：
  *
  *   #FIX-5.22-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -546,6 +569,23 @@ app.use((req, res, next) => {
   next();
 });
 
+// FIX-5.23-1: PCI-DSS 10.2——全链路访问日志（method/path/status/duration/ip/request_id）
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+    logger.info('ACCESS', {
+      request_id: req.id,
+      method:     req.method,
+      path:       req.path,
+      status:     res.statusCode,
+      duration_ms: Math.round(durationMs * 100) / 100,
+      ip:         req.ip,
+    });
+  });
+  next();
+});
+
 // FIX-5.20-2: PCI-DSS & CIS 安全响应头
 app.use((_req, res, next) => {
   // 缓存控制：PCI-DSS 要求敏感数据不得缓存
@@ -677,6 +717,8 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL_LEN = 254;
 // 连字符置末尾，语义清晰，避免与字符范围操作符混淆
 const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
+// FIX-5.23-1: apiProvider 字符集校验——仅允许字母、数字、连字符、下划线、点
+const API_PROVIDER_RE = /^[a-zA-Z0-9._-]+$/;
 
 function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
@@ -869,6 +911,8 @@ app.get('/health', async (_req, res) => {
     logger.warn('Health check Redis error', { err: err.message });
   }
 
+  // FIX-5.23-2: 健康检查禁止缓存——确保探针获取实时状态
+  res.set('Cache-Control', 'no-cache, no-store, max-age=0');
   res.status(httpStatus).json({
     status: httpStatus === 200 ? 'ok' : 'degraded',
     ...status,
@@ -886,6 +930,8 @@ app.get('/models', readLimiter, async (_req, res) => {
         WHERE is_active = true
         ORDER BY provider, model_name`
     );
+    // FIX-5.23-2: 公开只读端点允许短暂缓存，减少 DB 查询压力
+    res.set('Cache-Control', 'public, max-age=30');
     res.json({ success: true, models: result.rows });
   } catch (err) {
     logger.error('Models query error', { err: err.message });
@@ -911,6 +957,8 @@ app.get('/providers', readLimiter, async (_req, res) => {
       }
       throw err;
     });
+    // FIX-5.23-2: 公开只读端点允许短暂缓存，减少 DB 查询压力
+    res.set('Cache-Control', 'public, max-age=30');
     res.json({ success: true, providers: result.rows });
   } catch (err) {
     logger.error('Providers query error', { err: err.message });
@@ -1004,7 +1052,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
     });
   } catch (err) {
     await safeRollback(client, '/activate error');
-    logger.error('Activation error', { err: err.message, userEmail });
+    logger.error('Activation error', { err: err.message, userEmail, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误，请稍后重试' });
   } finally {
     client.release();
@@ -1259,6 +1307,10 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   }
   if (typeof apiProvider !== 'string' || apiProvider.length > 32) {
     return res.status(400).json({ success: false, msg: 'apiProvider 长度不能超过 32 字符' });
+  }
+  // FIX-5.23-1: apiProvider 字符集校验——防御日志/SQL 注入（PCI-DSS 6.5）
+  if (!API_PROVIDER_RE.test(apiProvider)) {
+    return res.status(400).json({ success: false, msg: 'apiProvider 仅允许字母、数字、连字符、下划线、点' });
   }
   if (typeof modelName !== 'string' || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
@@ -1568,7 +1620,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance, is_suspended: !!u.is_suspended });
   } catch (err) {
     await safeRollback(client, '/billing/record unhandled error');
-    logger.error('Billing record error', { err: err.message, userEmail });
+    logger.error('Billing record error', { err: err.message, userEmail, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
     client.release();
@@ -2284,8 +2336,8 @@ app.use((_req, res) => {
 });
 
 // eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
-  logger.error('Unhandled error', { err: err.message, stack: err.stack });
+app.use((err, req, res, _next) => {
+  logger.error('Unhandled error', { err: err.message, stack: err.stack, request_id: req.id });
   if (res.headersSent) return;
   res.status(500).json({ success: false, msg: '服务器内部错误' });
 });
@@ -2324,6 +2376,9 @@ const server = app.listen(PORT, HOST, () => {
 // 防止长连接阻塞容器优雅重启（K8s/Docker 滚动更新场景）
 server.keepAliveTimeout  = 65_000; // 略高于常见 LB/Nginx 60s
 server.headersTimeout    = 66_000; // 必须 > keepAliveTimeout
+// FIX-5.23-1: CIS Node.js 安全基线——请求超时 & 头部数量限制，防止 Slowloris / Header Flood
+server.requestTimeout    = 30_000; // 单请求最长 30 秒
+server.maxHeadersCount   = 50;     // 限制 HTTP 头数量，默认 2000 过于宽松
 
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
