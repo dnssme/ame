@@ -1268,6 +1268,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     }
 
     // FIX-5.17-3: chargedFen=0 时跳过余额扣减，避免无效 UPDATE 占用行锁
+    // u 来自上方 FOR UPDATE 查询（userRes.rows[0]）
     let newBalance = Number(u.balance_fen);
     if (chargedFen > 0) {
       const deductRes = await client.query(
