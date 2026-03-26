@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Anima 灵枢 · 综合管理</title>
+<style>
+/* ── Reset & Base ──────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f172a;--surface:#1e293b;--surface2:#334155;--border:#475569;
+  --text:#e2e8f0;--text2:#94a3b8;--text3:#64748b;
+  --primary:#6366f1;--primary-hover:#818cf8;
+  --success:#22c55e;--success-bg:rgba(34,197,94,.12);
+  --warn:#f59e0b;--warn-bg:rgba(245,158,11,.12);
+  --danger:#ef4444;--danger-bg:rgba(239,68,68,.12);
+  --info:#3b82f6;--info-bg:rgba(59,130,246,.12);
+  --radius:8px;--shadow:0 4px 24px rgba(0,0,0,.25);
+}
+html{font-size:14px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;
+  background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh}
+a{color:var(--primary);text-decoration:none}
+button{cursor:pointer;font-family:inherit}
+input,select,textarea{font-family:inherit;font-size:.9rem}
+
+/* ── Login ─────────────────────────────────────────────── */
+#loginOverlay{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;
+  justify-content:center;background:var(--bg)}
+#loginOverlay.hidden{display:none}
+.login-box{background:var(--surface);border-radius:12px;padding:2.5rem;width:380px;
+  max-width:92vw;box-shadow:var(--shadow);text-align:center}
+.login-box h1{font-size:1.5rem;margin-bottom:.3rem}
+.login-box p{color:var(--text2);margin-bottom:1.5rem;font-size:.85rem}
+.login-box input{width:100%;padding:.65rem .85rem;border-radius:var(--radius);
+  border:1px solid var(--border);background:var(--bg);color:var(--text);margin-bottom:1rem}
+.login-box input:focus{outline:none;border-color:var(--primary)}
+.login-box button{width:100%;padding:.7rem;border:none;border-radius:var(--radius);
+  background:var(--primary);color:#fff;font-weight:600;font-size:.95rem}
+.login-box button:hover{background:var(--primary-hover)}
+.login-error{color:var(--danger);font-size:.82rem;min-height:1.2rem;margin-bottom:.5rem}
+
+/* ── Layout ────────────────────────────────────────────── */
+#app{display:none;height:100vh}
+#app.active{display:flex}
+.sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.sidebar-brand{padding:1.2rem 1rem;border-bottom:1px solid var(--border);text-align:center}
+.sidebar-brand h2{font-size:1.1rem;font-weight:700}
+.sidebar-brand small{color:var(--text3);font-size:.72rem}
+.sidebar-nav{flex:1;padding:.5rem 0}
+.nav-item{display:flex;align-items:center;gap:.6rem;padding:.7rem 1.2rem;
+  color:var(--text2);font-size:.88rem;border-left:3px solid transparent;
+  transition:all .15s}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{color:var(--primary);border-left-color:var(--primary);
+  background:rgba(99,102,241,.08)}
+.nav-item .icon{font-size:1.1rem;width:1.4rem;text-align:center}
+.sidebar-footer{padding:.8rem 1rem;border-top:1px solid var(--border);font-size:.75rem;
+  color:var(--text3);text-align:center}
+.sidebar-footer button{background:none;border:none;color:var(--danger);font-size:.8rem;
+  margin-top:.3rem}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{padding:.8rem 1.5rem;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;background:var(--surface)}
+.topbar h3{font-size:1.05rem;font-weight:600}
+.topbar-actions{display:flex;gap:.5rem}
+.content{flex:1;overflow-y:auto;padding:1.5rem}
+.section{display:none}
+.section.active{display:block}
+
+/* ── Cards / Stats ─────────────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
+.stat-card{background:var(--surface);border-radius:var(--radius);padding:1.2rem;
+  border:1px solid var(--border)}
+.stat-card .label{font-size:.78rem;color:var(--text2);margin-bottom:.3rem}
+.stat-card .value{font-size:1.6rem;font-weight:700}
+.stat-card .sub{font-size:.75rem;color:var(--text3);margin-top:.2rem}
+.stat-card.ok .value{color:var(--success)}
+.stat-card.warn .value{color:var(--warn)}
+.stat-card.error .value{color:var(--danger)}
+
+/* ── Health ─────────────────────────────────────────────── */
+.health-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem}
+.health-item{background:var(--surface);border-radius:var(--radius);padding:1rem;
+  border:1px solid var(--border);text-align:center}
+.health-item .dot{width:12px;height:12px;border-radius:50%;display:inline-block;margin-right:.4rem}
+.health-item .dot.ok{background:var(--success)}
+.health-item .dot.err{background:var(--danger)}
+.health-item .dot.warn{background:var(--warn)}
+
+/* ── Tables ────────────────────────────────────────────── */
+.table-wrap{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);
+  overflow-x:auto;margin-bottom:1rem}
+table{width:100%;border-collapse:collapse;min-width:600px}
+th,td{padding:.6rem .8rem;text-align:left;border-bottom:1px solid var(--border);font-size:.85rem}
+th{background:var(--surface2);color:var(--text2);font-weight:600;
+  position:sticky;top:0;z-index:1;white-space:nowrap}
+tr:hover td{background:rgba(99,102,241,.04)}
+.no-data{text-align:center;color:var(--text3);padding:2rem}
+
+/* ── Badges ────────────────────────────────────────────── */
+.badge{display:inline-block;padding:.15rem .55rem;border-radius:99px;font-size:.75rem;font-weight:600}
+.badge-success{background:var(--success-bg);color:var(--success)}
+.badge-danger{background:var(--danger-bg);color:var(--danger)}
+.badge-warn{background:var(--warn-bg);color:var(--warn)}
+.badge-info{background:var(--info-bg);color:var(--info)}
+
+/* ── Buttons ───────────────────────────────────────────── */
+.btn{padding:.45rem .9rem;border-radius:var(--radius);border:1px solid transparent;
+  font-size:.82rem;font-weight:500;display:inline-flex;align-items:center;gap:.35rem;
+  transition:all .15s}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary-hover)}
+.btn-success{background:var(--success);color:#fff}
+.btn-success:hover{opacity:.85}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-danger:hover{opacity:.85}
+.btn-outline{background:transparent;border-color:var(--border);color:var(--text2)}
+.btn-outline:hover{border-color:var(--text2);color:var(--text)}
+.btn-sm{padding:.3rem .6rem;font-size:.78rem}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* ── Toolbar ───────────────────────────────────────────── */
+.toolbar{display:flex;align-items:center;gap:.6rem;margin-bottom:1rem;flex-wrap:wrap}
+.toolbar select,.toolbar input{padding:.45rem .7rem;border-radius:var(--radius);
+  border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:.82rem}
+.toolbar select:focus,.toolbar input:focus{outline:none;border-color:var(--primary)}
+.spacer{flex:1}
+
+/* ── Pagination ────────────────────────────────────────── */
+.pagination{display:flex;align-items:center;gap:.5rem;justify-content:flex-end;
+  padding:.6rem 0;font-size:.82rem;color:var(--text2)}
+.pagination button{padding:.3rem .7rem}
+
+/* ── Modal ─────────────────────────────────────────────── */
+.modal-overlay{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.6);
+  display:flex;align-items:center;justify-content:center}
+.modal-overlay.hidden{display:none}
+.modal{background:var(--surface);border-radius:12px;width:520px;max-width:92vw;
+  max-height:85vh;display:flex;flex-direction:column;box-shadow:var(--shadow)}
+.modal-header{padding:1rem 1.2rem;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between}
+.modal-header h4{font-size:1rem}
+.modal-close{background:none;border:none;color:var(--text3);font-size:1.3rem;
+  padding:.2rem .4rem;line-height:1}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:1.2rem;overflow-y:auto;flex:1}
+.modal-footer{padding:.8rem 1.2rem;border-top:1px solid var(--border);
+  display:flex;justify-content:flex-end;gap:.5rem}
+.form-group{margin-bottom:1rem}
+.form-group label{display:block;font-size:.82rem;color:var(--text2);margin-bottom:.3rem;font-weight:500}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:.5rem .7rem;
+  border-radius:var(--radius);border:1px solid var(--border);background:var(--bg);color:var(--text)}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{
+  outline:none;border-color:var(--primary)}
+.form-group textarea{min-height:60px;resize:vertical}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
+.form-check{display:flex;align-items:center;gap:.5rem;margin-bottom:.8rem}
+.form-check input[type=checkbox]{width:auto;accent-color:var(--primary)}
+.form-check label{margin-bottom:0;font-size:.85rem;color:var(--text)}
+
+/* ── Toast ─────────────────────────────────────────────── */
+#toastContainer{position:fixed;top:1rem;right:1rem;z-index:2000;display:flex;
+  flex-direction:column;gap:.5rem}
+.toast{padding:.7rem 1rem;border-radius:var(--radius);font-size:.85rem;
+  box-shadow:var(--shadow);animation:toastIn .25s ease;min-width:250px;max-width:400px}
+.toast-success{background:#065f46;color:#a7f3d0;border:1px solid #059669}
+.toast-error{background:#7f1d1d;color:#fecaca;border:1px solid #dc2626}
+.toast-info{background:#1e3a5f;color:#bfdbfe;border:1px solid #2563eb}
+@keyframes toastIn{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
+
+/* ── Modules Grid ──────────────────────────────────────── */
+.modules-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1rem}
+.module-card{background:var(--surface);border-radius:var(--radius);padding:1rem;
+  border:1px solid var(--border)}
+.module-card .module-header{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:.5rem}
+.module-card .module-name{font-weight:600;font-size:.95rem}
+.module-card .module-desc{color:var(--text2);font-size:.82rem;margin-bottom:.5rem}
+.module-card .module-meta{display:flex;gap:.8rem;font-size:.75rem;color:var(--text3)}
+.module-card .module-deps{font-size:.75rem;color:var(--text3);margin-top:.4rem}
+.module-category{margin-bottom:1.5rem}
+.module-category h4{font-size:.9rem;color:var(--text2);margin-bottom:.8rem;
+  padding-bottom:.4rem;border-bottom:1px solid var(--border)}
+
+/* ── Responsive ────────────────────────────────────────── */
+@media(max-width:768px){
+  .sidebar{width:60px;overflow:hidden}
+  .sidebar-brand h2,.sidebar-brand small,.nav-item span,.sidebar-footer span{display:none}
+  .nav-item{justify-content:center;padding:.7rem}
+  .stats-grid{grid-template-columns:1fr 1fr}
+  .form-row{grid-template-columns:1fr}
+  .content{padding:1rem}
+}
+</style>
+</head>
+<body>
+
+<!-- ── Login ───────────────────────────────────────────── -->
+<div id="loginOverlay">
+  <div class="login-box">
+    <h1>🔮 Anima 灵枢</h1>
+    <p>综合管理控制台</p>
+    <div class="login-error" id="loginError"></div>
+    <input type="password" id="tokenInput" placeholder="请输入管理员令牌 (ADMIN_TOKEN)" autofocus>
+    <button onclick="doLogin()">登 录</button>
+  </div>
+</div>
+
+<!-- ── App ─────────────────────────────────────────────── -->
+<div id="app">
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <div class="sidebar-brand">
+      <h2>🔮 Anima 灵枢</h2>
+      <small>综合管理 v5.19</small>
+    </div>
+    <div class="sidebar-nav">
+      <a class="nav-item active" data-tab="dashboard" href="#">
+        <span class="icon">📊</span><span>系统概览</span>
+      </a>
+      <a class="nav-item" data-tab="models" href="#">
+        <span class="icon">🤖</span><span>模型管理</span>
+      </a>
+      <a class="nav-item" data-tab="providers" href="#">
+        <span class="icon">🔌</span><span>服务商管理</span>
+      </a>
+      <a class="nav-item" data-tab="users" href="#">
+        <span class="icon">👥</span><span>用户管理</span>
+      </a>
+      <a class="nav-item" data-tab="cards" href="#">
+        <span class="icon">🎫</span><span>充值卡管理</span>
+      </a>
+      <a class="nav-item" data-tab="modules" href="#">
+        <span class="icon">📦</span><span>模块状态</span>
+      </a>
+    </div>
+    <div class="sidebar-footer">
+      <span>已登录</span><br>
+      <button onclick="doLogout()">退出登录</button>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="topbar">
+      <h3 id="pageTitle">系统概览</h3>
+      <div class="topbar-actions" id="pageActions"></div>
+    </div>
+
+    <div class="content">
+
+      <!-- ── Dashboard ────────────────────────────────── -->
+      <div class="section active" id="sec-dashboard">
+        <div class="health-grid" id="healthGrid"></div>
+        <div class="stats-grid" id="statsGrid"></div>
+      </div>
+
+      <!-- ── Models ───────────────────────────────────── -->
+      <div class="section" id="sec-models">
+        <div class="toolbar">
+          <select id="modelFilter" onchange="loadModels()">
+            <option value="all">全部模型</option>
+            <option value="active">启用中</option>
+            <option value="inactive">已停用</option>
+          </select>
+          <select id="modelFreeFilter" onchange="loadModels()">
+            <option value="all">免费+付费</option>
+            <option value="free">仅免费</option>
+            <option value="paid">仅付费</option>
+          </select>
+          <input id="modelSearch" type="text" placeholder="搜索模型名称..." oninput="loadModels()">
+          <span class="spacer"></span>
+          <button class="btn btn-primary" onclick="showModelModal()">+ 新增模型</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>服务商</th><th>模型名称</th><th>显示名称</th>
+                <th>类型</th><th>输入价格</th><th>输出价格</th><th>货币</th>
+                <th>缓存</th><th>状态</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="modelsBody"></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="modelsPagination"></div>
+      </div>
+
+      <!-- ── Providers ────────────────────────────────── -->
+      <div class="section" id="sec-providers">
+        <div class="toolbar">
+          <input id="providerSearch" type="text" placeholder="搜索服务商..." oninput="loadProviders()">
+          <span class="spacer"></span>
+          <button class="btn btn-primary" onclick="showProviderModal()">+ 新增服务商</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>服务商标识</th><th>显示名称</th><th>Base URL</th>
+                <th>状态</th><th>描述</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="providersBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── Users ────────────────────────────────────── -->
+      <div class="section" id="sec-users">
+        <div class="toolbar">
+          <span style="color:var(--text2);font-size:.85rem" id="usersTotal"></span>
+          <span class="spacer"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>邮箱</th><th>余额 (分)</th><th>累计消费 (分)</th>
+                <th>状态</th><th>注册时间</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="usersBody"></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="usersPagination"></div>
+      </div>
+
+      <!-- ── Cards ────────────────────────────────────── -->
+      <div class="section" id="sec-cards">
+        <div style="background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);padding:1rem;margin-bottom:1rem">
+          <h4 style="font-size:.9rem;margin-bottom:.8rem">批量创建充值卡</h4>
+          <div style="display:flex;gap:.8rem;flex-wrap:wrap;align-items:flex-end">
+            <div class="form-group" style="margin-bottom:0;min-width:140px">
+              <label>面额 (元)</label>
+              <input type="number" id="cardAmountYuan" min="0.01" step="0.01" value="10" style="width:100%">
+            </div>
+            <div class="form-group" style="margin-bottom:0;min-width:100px">
+              <label>数量</label>
+              <input type="number" id="cardCount" min="1" max="100" value="1" style="width:100%">
+            </div>
+            <div class="form-group" style="margin-bottom:0;min-width:160px">
+              <label>标签 (可选)</label>
+              <input type="text" id="cardLabel" placeholder="例：促销活动" style="width:100%">
+            </div>
+            <button class="btn btn-primary" onclick="createCards()" style="height:36px">生成卡密</button>
+          </div>
+        </div>
+        <div class="toolbar">
+          <select id="cardFilter" onchange="loadCards()">
+            <option value="">全部卡密</option>
+            <option value="false">未使用</option>
+            <option value="true">已使用</option>
+          </select>
+          <span style="color:var(--text2);font-size:.85rem" id="cardsTotal"></span>
+          <span class="spacer"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th><th>卡密</th><th>面额 (分)</th><th>标签</th>
+                <th>状态</th><th>使用者</th><th>使用时间</th><th>创建时间</th>
+              </tr>
+            </thead>
+            <tbody id="cardsBody"></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="cardsPagination"></div>
+      </div>
+
+      <!-- ── Modules ──────────────────────────────────── -->
+      <div class="section" id="sec-modules">
+        <div id="modulesContent"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ── Modal ───────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="modalOverlay" onclick="event.target===this&&closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h4 id="modalTitle">标题</h4>
+      <button class="modal-close" onclick="closeModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-footer" id="modalFooter"></div>
+  </div>
+</div>
+
+<!-- ── Toast ───────────────────────────────────────────── -->
+<div id="toastContainer"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   Anima 灵枢 · Admin Dashboard JS
+   ═══════════════════════════════════════════════════════════ */
+
+// ── State ─────────────────────────────────────────────────
+let TOKEN = '';
+let allModels = [];
+let allProviders = [];
+const BASE = location.origin;
+
+// ── Auth ──────────────────────────────────────────────────
+function doLogin() {
+  const t = document.getElementById('tokenInput').value.trim();
+  if (!t) { document.getElementById('loginError').textContent = '请输入管理员令牌'; return; }
+  TOKEN = t;
+  sessionStorage.setItem('anima_admin_token', t);
+  testAuth();
+}
+
+function doLogout() {
+  TOKEN = '';
+  sessionStorage.removeItem('anima_admin_token');
+  document.getElementById('app').classList.remove('active');
+  document.getElementById('loginOverlay').classList.remove('hidden');
+  document.getElementById('tokenInput').value = '';
+  document.getElementById('loginError').textContent = '';
+}
+
+async function testAuth() {
+  try {
+    const res = await api('/admin/models');
+    if (!res.ok) throw new Error('认证失败');
+    document.getElementById('loginOverlay').classList.add('hidden');
+    document.getElementById('app').classList.add('active');
+    document.getElementById('loginError').textContent = '';
+    initDashboard();
+  } catch {
+    document.getElementById('loginError').textContent = '令牌无效或服务不可用';
+    TOKEN = '';
+    sessionStorage.removeItem('anima_admin_token');
+  }
+}
+
+// auto login from session
+(function() {
+  const saved = sessionStorage.getItem('anima_admin_token');
+  if (saved) { TOKEN = saved; testAuth(); }
+})();
+
+document.getElementById('tokenInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doLogin();
+});
+
+// ── API Helper ────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const url = BASE + path;
+  const headers = { 'Authorization': 'Bearer ' + TOKEN, ...opts.headers };
+  if (opts.body && typeof opts.body === 'object') {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(opts.body);
+  }
+  const res = await fetch(url, { ...opts, headers });
+  if (res.status === 401) { doLogout(); throw new Error('未授权'); }
+  return res;
+}
+
+async function apiJSON(path, opts = {}) {
+  const res = await api(path, opts);
+  const data = await res.json();
+  if (!res.ok || !data.success) throw new Error(data.msg || '请求失败');
+  return data;
+}
+
+// ── Toast ─────────────────────────────────────────────────
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = msg;
+  document.getElementById('toastContainer').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// ── Tab Navigation ────────────────────────────────────────
+const TITLES = {
+  dashboard: '系统概览', models: '模型管理', providers: '服务商管理',
+  users: '用户管理', cards: '充值卡管理', modules: '模块状态'
+};
+
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', (e) => {
+    e.preventDefault();
+    const tab = item.dataset.tab;
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    item.classList.add('active');
+    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+    document.getElementById('sec-' + tab).classList.add('active');
+    document.getElementById('pageTitle').textContent = TITLES[tab] || tab;
+    if (tab === 'dashboard') loadDashboard();
+    if (tab === 'models') loadModels();
+    if (tab === 'providers') loadProviders();
+    if (tab === 'users') loadUsers();
+    if (tab === 'cards') loadCards();
+    if (tab === 'modules') loadModules();
+  });
+});
+
+// ── Modal ─────────────────────────────────────────────────
+function openModal(title, bodyHTML, footerHTML) {
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalBody').innerHTML = bodyHTML;
+  document.getElementById('modalFooter').innerHTML = footerHTML;
+  document.getElementById('modalOverlay').classList.remove('hidden');
+}
+function closeModal() {
+  document.getElementById('modalOverlay').classList.add('hidden');
+}
+
+// ── Init ──────────────────────────────────────────────────
+function initDashboard() {
+  loadDashboard();
+}
+
+// ═══════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════
+async function loadDashboard() {
+  // Health
+  const hGrid = document.getElementById('healthGrid');
+  try {
+    const res = await fetch(BASE + '/health');
+    const h = await res.json();
+    hGrid.innerHTML = `
+      <div class="health-item">
+        <span class="dot ${h.status === 'ok' ? 'ok' : 'err'}"></span>
+        <strong>系统状态</strong><br><small>${h.status}</small>
+      </div>
+      <div class="health-item">
+        <span class="dot ${h.db === 'ok' ? 'ok' : 'err'}"></span>
+        <strong>数据库</strong><br><small>${h.db}</small>
+      </div>
+      <div class="health-item">
+        <span class="dot ${h.redis === 'ok' ? 'ok' : (h.redis === 'disconnected' ? 'warn' : 'err')}"></span>
+        <strong>Redis</strong><br><small>${h.redis}</small>
+      </div>
+      <div class="health-item">
+        <span class="dot ok"></span>
+        <strong>服务时间</strong><br><small>${new Date(h.ts).toLocaleString('zh-CN')}</small>
+      </div>`;
+  } catch {
+    hGrid.innerHTML = '<div class="health-item"><span class="dot err"></span><strong>健康检查失败</strong></div>';
+  }
+
+  // Stats
+  const sGrid = document.getElementById('statsGrid');
+  sGrid.innerHTML = '';
+  try {
+    const [modelsData, providersData, usersData, cardsUsed, cardsUnused] = await Promise.all([
+      apiJSON('/admin/models'),
+      apiJSON('/admin/providers'),
+      apiJSON('/admin/users?limit=1&offset=0'),
+      apiJSON('/admin/cards?limit=1&offset=0&used=true'),
+      apiJSON('/admin/cards?limit=1&offset=0&used=false'),
+    ]);
+    const models = modelsData.models || [];
+    const providers = providersData.providers || [];
+    const activeModels = models.filter(m => m.is_active).length;
+    const freeModels = models.filter(m => m.is_free).length;
+    const enabledProviders = providers.filter(p => p.is_enabled).length;
+    const totalUsers = usersData.total || 0;
+    const suspendedUsers = (usersData.users || []).filter(u => u.is_suspended).length;
+    const totalCardsUsed = cardsUsed.total || 0;
+    const totalCardsUnused = cardsUnused.total || 0;
+
+    sGrid.innerHTML = `
+      <div class="stat-card ok"><div class="label">模型总数</div><div class="value">${models.length}</div>
+        <div class="sub">启用 ${activeModels} · 免费 ${freeModels} · 付费 ${models.length - freeModels}</div></div>
+      <div class="stat-card ok"><div class="label">服务商总数</div><div class="value">${providers.length}</div>
+        <div class="sub">启用 ${enabledProviders} · 停用 ${providers.length - enabledProviders}</div></div>
+      <div class="stat-card"><div class="label">注册用户</div><div class="value">${totalUsers}</div>
+        <div class="sub">暂停 ${suspendedUsers} 人</div></div>
+      <div class="stat-card"><div class="label">充值卡</div><div class="value">${totalCardsUsed + totalCardsUnused}</div>
+        <div class="sub">已使用 ${totalCardsUsed} · 未使用 ${totalCardsUnused}</div></div>`;
+  } catch (e) {
+    sGrid.innerHTML = `<div class="stat-card error"><div class="label">加载失败</div><div class="value">—</div>
+      <div class="sub">${e.message}</div></div>`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODELS
+// ═══════════════════════════════════════════════════════════
+async function loadModels() {
+  const tbody = document.getElementById('modelsBody');
+  try {
+    const data = await apiJSON('/admin/models');
+    allModels = data.models || [];
+    let filtered = allModels;
+
+    const statusF = document.getElementById('modelFilter').value;
+    if (statusF === 'active') filtered = filtered.filter(m => m.is_active);
+    if (statusF === 'inactive') filtered = filtered.filter(m => !m.is_active);
+
+    const freeF = document.getElementById('modelFreeFilter').value;
+    if (freeF === 'free') filtered = filtered.filter(m => m.is_free);
+    if (freeF === 'paid') filtered = filtered.filter(m => !m.is_free);
+
+    const search = (document.getElementById('modelSearch').value || '').toLowerCase();
+    if (search) filtered = filtered.filter(m =>
+      m.model_name.toLowerCase().includes(search) ||
+      m.display_name.toLowerCase().includes(search) ||
+      m.provider.toLowerCase().includes(search));
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="11" class="no-data">无匹配模型</td></tr>';
+      return;
+    }
+    tbody.innerHTML = filtered.map(m => `<tr>
+      <td>${m.id}</td>
+      <td>${esc(m.provider)}</td>
+      <td><code style="font-size:.8rem">${esc(m.model_name)}</code></td>
+      <td>${esc(m.display_name)}</td>
+      <td>${m.is_free ? '<span class="badge badge-success">免费</span>' : '<span class="badge badge-info">付费</span>'}</td>
+      <td>${m.is_free ? '—' : num(m.price_input_per_1k_tokens)}</td>
+      <td>${m.is_free ? '—' : num(m.price_output_per_1k_tokens)}</td>
+      <td>${m.currency || 'CNY'}</td>
+      <td>${m.supports_cache ? '✅' : '—'}</td>
+      <td>${m.is_active ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">停用</span>'}</td>
+      <td>
+        <button class="btn btn-outline btn-sm" onclick="showModelModal(${m.id})">编辑</button>
+        ${m.is_active
+          ? `<button class="btn btn-danger btn-sm" onclick="toggleModel(${m.id},false)">停用</button>`
+          : `<button class="btn btn-success btn-sm" onclick="toggleModel(${m.id},true)">启用</button>`}
+      </td>
+    </tr>`).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="11" class="no-data">加载失败: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+function showModelModal(editId) {
+  const m = editId ? allModels.find(x => x.id === editId) : null;
+  const title = m ? '编辑模型' : '新增模型';
+  const body = `
+    <div class="form-row">
+      <div class="form-group"><label>服务商标识 *</label>
+        <input id="mf_provider" value="${m ? esc(m.provider) : ''}" ${m ? 'readonly style="opacity:.6"' : ''} placeholder="例：openai"></div>
+      <div class="form-group"><label>模型名称 *</label>
+        <input id="mf_modelName" value="${m ? esc(m.model_name) : ''}" ${m ? 'readonly style="opacity:.6"' : ''} placeholder="例：gpt-4o"></div>
+    </div>
+    <div class="form-group"><label>显示名称 *</label>
+      <input id="mf_displayName" value="${m ? esc(m.display_name) : ''}" placeholder="例：GPT-4o"></div>
+    <div class="form-check">
+      <input type="checkbox" id="mf_isFree" ${m && m.is_free ? 'checked' : ''} onchange="togglePriceFields()">
+      <label for="mf_isFree">免费模型</label>
+    </div>
+    <div class="form-row" id="priceFields" style="${m && m.is_free ? 'display:none' : ''}">
+      <div class="form-group"><label>输入价格 (元/千Token)</label>
+        <input type="number" id="mf_priceInput" step="0.0001" min="0" value="${m && !m.is_free ? m.price_input_per_1k_tokens : '0'}"></div>
+      <div class="form-group"><label>输出价格 (元/千Token)</label>
+        <input type="number" id="mf_priceOutput" step="0.0001" min="0" value="${m && !m.is_free ? m.price_output_per_1k_tokens : '0'}"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>货币</label>
+        <select id="mf_currency"><option value="CNY" ${!m || m.currency === 'CNY' ? 'selected' : ''}>CNY</option>
+          <option value="USD" ${m && m.currency === 'USD' ? 'selected' : ''}>USD</option></select></div>
+      <div class="form-group" style="display:flex;align-items:center;padding-top:1.3rem">
+        <div class="form-check" style="margin-bottom:0">
+          <input type="checkbox" id="mf_cache" ${m && m.supports_cache ? 'checked' : ''}>
+          <label for="mf_cache">支持缓存计费</label>
+        </div>
+      </div>
+    </div>
+    <div class="form-group"><label>描述</label>
+      <textarea id="mf_desc" rows="2">${m && m.description ? esc(m.description) : ''}</textarea></div>`;
+  const footer = `<button class="btn btn-outline" onclick="closeModal()">取消</button>
+    <button class="btn btn-primary" onclick="saveModel(${editId || 'null'})">${m ? '保存修改' : '创建模型'}</button>`;
+  openModal(title, body, footer);
+}
+
+function togglePriceFields() {
+  const isFree = document.getElementById('mf_isFree').checked;
+  document.getElementById('priceFields').style.display = isFree ? 'none' : '';
+}
+
+async function saveModel(editId) {
+  const isFree = document.getElementById('mf_isFree').checked;
+  const payload = {
+    displayName: document.getElementById('mf_displayName').value.trim(),
+    isFree,
+    priceInput: isFree ? 0 : parseFloat(document.getElementById('mf_priceInput').value),
+    priceOutput: isFree ? 0 : parseFloat(document.getElementById('mf_priceOutput').value),
+    currency: document.getElementById('mf_currency').value,
+    supportsCache: document.getElementById('mf_cache').checked,
+    description: document.getElementById('mf_desc').value.trim() || null,
+  };
+  try {
+    if (editId) {
+      await apiJSON(`/admin/models/${editId}`, { method: 'PUT', body: payload });
+      toast('模型已更新', 'success');
+    } else {
+      payload.provider = document.getElementById('mf_provider').value.trim();
+      payload.modelName = document.getElementById('mf_modelName').value.trim();
+      await apiJSON('/admin/models', { method: 'POST', body: payload });
+      toast('模型已创建', 'success');
+    }
+    closeModal();
+    loadModels();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function toggleModel(id, active) {
+  if (!confirm(active ? '确定启用该模型？' : '确定停用该模型？')) return;
+  try {
+    if (active) {
+      await apiJSON(`/admin/models/${id}`, { method: 'PUT', body: { isActive: true } });
+    } else {
+      await apiJSON(`/admin/models/${id}`, { method: 'DELETE' });
+    }
+    toast(active ? '模型已启用' : '模型已停用', 'success');
+    loadModels();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PROVIDERS
+// ═══════════════════════════════════════════════════════════
+async function loadProviders() {
+  const tbody = document.getElementById('providersBody');
+  try {
+    const data = await apiJSON('/admin/providers');
+    allProviders = data.providers || [];
+    let filtered = allProviders;
+    const search = (document.getElementById('providerSearch').value || '').toLowerCase();
+    if (search) filtered = filtered.filter(p =>
+      p.provider_name.toLowerCase().includes(search) ||
+      p.display_name.toLowerCase().includes(search));
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="no-data">无匹配服务商</td></tr>';
+      return;
+    }
+    tbody.innerHTML = filtered.map(p => `<tr>
+      <td>${p.id}</td>
+      <td><code style="font-size:.8rem">${esc(p.provider_name)}</code></td>
+      <td>${esc(p.display_name)}</td>
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.base_url)}">${esc(p.base_url)}</td>
+      <td>${p.is_enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">停用</span>'}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.description || '—')}</td>
+      <td>
+        <button class="btn btn-outline btn-sm" onclick="showProviderModal(${p.id})">编辑</button>
+        ${p.is_enabled
+          ? `<button class="btn btn-danger btn-sm" onclick="toggleProvider(${p.id},false)">停用</button>`
+          : `<button class="btn btn-success btn-sm" onclick="toggleProvider(${p.id},true)">启用</button>`}
+      </td>
+    </tr>`).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="no-data">加载失败: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+function showProviderModal(editId) {
+  const p = editId ? allProviders.find(x => x.id === editId) : null;
+  const title = p ? '编辑服务商' : '新增服务商';
+  const body = `
+    <div class="form-group"><label>服务商标识 * (唯一)</label>
+      <input id="pf_name" value="${p ? esc(p.provider_name) : ''}" ${p ? 'readonly style="opacity:.6"' : ''} placeholder="例：openai"></div>
+    <div class="form-group"><label>显示名称 *</label>
+      <input id="pf_display" value="${p ? esc(p.display_name) : ''}" placeholder="例：OpenAI"></div>
+    <div class="form-group"><label>Base URL *</label>
+      <input id="pf_url" value="${p ? esc(p.base_url) : ''}" placeholder="https://api.openai.com/v1"></div>
+    <div class="form-check">
+      <input type="checkbox" id="pf_enabled" ${!p || p.is_enabled ? 'checked' : ''}>
+      <label for="pf_enabled">启用</label>
+    </div>
+    <div class="form-group"><label>描述</label>
+      <textarea id="pf_desc" rows="2">${p && p.description ? esc(p.description) : ''}</textarea></div>`;
+  const footer = `<button class="btn btn-outline" onclick="closeModal()">取消</button>
+    <button class="btn btn-primary" onclick="saveProvider(${editId || 'null'})">${p ? '保存修改' : '创建服务商'}</button>`;
+  openModal(title, body, footer);
+}
+
+async function saveProvider(editId) {
+  const payload = {
+    displayName: document.getElementById('pf_display').value.trim(),
+    baseUrl: document.getElementById('pf_url').value.trim(),
+    isEnabled: document.getElementById('pf_enabled').checked,
+    description: document.getElementById('pf_desc').value.trim() || null,
+  };
+  try {
+    if (editId) {
+      await apiJSON(`/admin/providers/${editId}`, { method: 'PUT', body: payload });
+      toast('服务商已更新', 'success');
+    } else {
+      payload.providerName = document.getElementById('pf_name').value.trim();
+      await apiJSON('/admin/providers', { method: 'POST', body: payload });
+      toast('服务商已创建', 'success');
+    }
+    closeModal();
+    loadProviders();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function toggleProvider(id, enable) {
+  if (!confirm(enable ? '确定启用该服务商？' : '确定停用该服务商？')) return;
+  try {
+    if (enable) {
+      await apiJSON(`/admin/providers/${id}`, { method: 'PUT', body: { isEnabled: true } });
+    } else {
+      await apiJSON(`/admin/providers/${id}`, { method: 'DELETE' });
+    }
+    toast(enable ? '服务商已启用' : '服务商已停用', 'success');
+    loadProviders();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════════════
+// USERS
+// ═══════════════════════════════════════════════════════════
+let usersPage = 0;
+const USERS_LIMIT = 20;
+
+async function loadUsers(page) {
+  if (typeof page === 'number') usersPage = page;
+  const offset = usersPage * USERS_LIMIT;
+  const tbody = document.getElementById('usersBody');
+  try {
+    const data = await apiJSON(`/admin/users?limit=${USERS_LIMIT}&offset=${offset}`);
+    const users = data.users || [];
+    const total = data.total || 0;
+    document.getElementById('usersTotal').textContent = `共 ${total} 位用户`;
+
+    if (users.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="no-data">暂无用户</td></tr>';
+    } else {
+      tbody.innerHTML = users.map(u => `<tr>
+        <td>${esc(u.user_email)}</td>
+        <td>${Number(u.balance_fen).toLocaleString()}</td>
+        <td>${Number(u.total_charged_fen).toLocaleString()}</td>
+        <td>${u.is_suspended ? '<span class="badge badge-danger">已暂停</span>' : '<span class="badge badge-success">正常</span>'}</td>
+        <td>${fmtTime(u.created_at)}</td>
+        <td>
+          ${u.is_suspended
+            ? `<button class="btn btn-success btn-sm" onclick="unsuspendUser('${escAttr(u.user_email)}')">恢复</button>`
+            : `<button class="btn btn-danger btn-sm" onclick="suspendUser('${escAttr(u.user_email)}')">暂停</button>`}
+          <button class="btn btn-outline btn-sm" onclick="showAdjustModal('${escAttr(u.user_email)}')">调额</button>
+        </td>
+      </tr>`).join('');
+    }
+
+    // Pagination
+    const totalPages = Math.ceil(total / USERS_LIMIT);
+    const pg = document.getElementById('usersPagination');
+    pg.innerHTML = `
+      <button class="btn btn-outline btn-sm" ${usersPage <= 0 ? 'disabled' : ''} onclick="loadUsers(${usersPage - 1})">上一页</button>
+      <span>第 ${usersPage + 1} / ${totalPages || 1} 页</span>
+      <button class="btn btn-outline btn-sm" ${usersPage >= totalPages - 1 ? 'disabled' : ''} onclick="loadUsers(${usersPage + 1})">下一页</button>`;
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="no-data">加载失败: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function suspendUser(email) {
+  if (!confirm(`确定暂停用户 ${email}？`)) return;
+  try {
+    await apiJSON(`/admin/users/${encodeURIComponent(email)}/suspend`, { method: 'PUT' });
+    toast('用户已暂停', 'success');
+    loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function unsuspendUser(email) {
+  if (!confirm(`确定恢复用户 ${email}？`)) return;
+  try {
+    await apiJSON(`/admin/users/${encodeURIComponent(email)}/unsuspend`, { method: 'PUT' });
+    toast('用户已恢复', 'success');
+    loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function showAdjustModal(email) {
+  const body = `
+    <div class="form-group"><label>用户邮箱</label>
+      <input id="adj_email" value="${esc(email)}" readonly style="opacity:.6"></div>
+    <div class="form-group"><label>调整类型</label>
+      <select id="adj_type">
+        <option value="recharge">充值 (recharge)</option>
+        <option value="refund">退款 (refund)</option>
+        <option value="admin_adjust">管理调整 (admin_adjust)</option>
+      </select></div>
+    <div class="form-group"><label>金额 (元)</label>
+      <input type="number" id="adj_amount" step="0.01" min="0.01" value="10" placeholder="正数">
+      <small style="color:var(--text3)">recharge/refund 类型仅支持正数；admin_adjust 负数为扣减</small></div>
+    <div class="form-group"><label>备注 (可选)</label>
+      <input id="adj_desc" placeholder="调整原因"></div>`;
+  const footer = `<button class="btn btn-outline" onclick="closeModal()">取消</button>
+    <button class="btn btn-primary" onclick="doAdjust()">确认调整</button>`;
+  openModal('余额调整', body, footer);
+}
+
+async function doAdjust() {
+  const email = document.getElementById('adj_email').value;
+  const type = document.getElementById('adj_type').value;
+  const amountYuan = parseFloat(document.getElementById('adj_amount').value);
+  const desc = document.getElementById('adj_desc').value.trim();
+  if (!amountYuan || !isFinite(amountYuan)) { toast('请输入有效金额', 'error'); return; }
+  const amount_fen = Math.round(amountYuan * 100);
+  try {
+    const data = await apiJSON('/admin/adjust', {
+      method: 'POST',
+      body: { userEmail: email, amount_fen, type, description: desc || undefined },
+    });
+    toast(`调整成功，当前余额: ¥${(data.balance_fen / 100).toFixed(2)}`, 'success');
+    closeModal();
+    loadUsers();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CARDS
+// ═══════════════════════════════════════════════════════════
+let cardsPage = 0;
+const CARDS_LIMIT = 20;
+
+async function createCards() {
+  const amountYuan = parseFloat(document.getElementById('cardAmountYuan').value);
+  const count = parseInt(document.getElementById('cardCount').value) || 1;
+  const label = document.getElementById('cardLabel').value.trim();
+  if (!amountYuan || amountYuan <= 0) { toast('请输入有效面额', 'error'); return; }
+  const creditFen = Math.round(amountYuan * 100);
+  try {
+    const data = await apiJSON('/admin/cards', {
+      method: 'POST',
+      body: { creditFen, count, label: label || undefined },
+    });
+    const cards = data.cards || [];
+    toast(`成功创建 ${cards.length} 张充值卡`, 'success');
+    // Show keys in modal
+    if (cards.length > 0) {
+      const keyList = cards.map(c => c.key).join('\n');
+      openModal('卡密生成成功', `
+        <p style="margin-bottom:.8rem;color:var(--text2)">请妥善保存以下卡密（面额: ¥${amountYuan.toFixed(2)}）：</p>
+        <textarea readonly rows="${Math.min(cards.length, 10)}" style="width:100%;font-family:monospace;font-size:.85rem;
+          background:var(--bg);color:var(--success);border:1px solid var(--border);border-radius:var(--radius);padding:.5rem">${keyList}</textarea>
+        <p style="margin-top:.5rem;font-size:.78rem;color:var(--text3)">共 ${cards.length} 张，点击复制按钮即可复制全部卡密</p>`,
+        `<button class="btn btn-outline" onclick="copyText(\`${keyList.replace(/`/g, '\\`')}\`)">复制全部</button>
+         <button class="btn btn-primary" onclick="closeModal()">关闭</button>`);
+    }
+    loadCards();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => toast('已复制到剪贴板', 'success'))
+    .catch(() => toast('复制失败', 'error'));
+}
+
+async function loadCards(page) {
+  if (typeof page === 'number') cardsPage = page;
+  const offset = cardsPage * CARDS_LIMIT;
+  const used = document.getElementById('cardFilter').value;
+  const usedParam = used ? `&used=${used}` : '';
+  const tbody = document.getElementById('cardsBody');
+  try {
+    const data = await apiJSON(`/admin/cards?limit=${CARDS_LIMIT}&offset=${offset}${usedParam}`);
+    const cards = data.cards || [];
+    const total = data.total || 0;
+    document.getElementById('cardsTotal').textContent = `共 ${total} 张`;
+
+    if (cards.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="no-data">暂无充值卡</td></tr>';
+    } else {
+      tbody.innerHTML = cards.map(c => `<tr>
+        <td>${c.id}</td>
+        <td><code style="font-size:.78rem;user-select:all">${esc(c.key)}</code></td>
+        <td>${Number(c.credit_fen).toLocaleString()}</td>
+        <td>${esc(c.label || '—')}</td>
+        <td>${c.used ? '<span class="badge badge-warn">已使用</span>' : '<span class="badge badge-success">未使用</span>'}</td>
+        <td>${c.used_by ? esc(c.used_by) : '—'}</td>
+        <td>${c.used_at ? fmtTime(c.used_at) : '—'}</td>
+        <td>${fmtTime(c.created_at)}</td>
+      </tr>`).join('');
+    }
+
+    const totalPages = Math.ceil(total / CARDS_LIMIT);
+    const pg = document.getElementById('cardsPagination');
+    pg.innerHTML = `
+      <button class="btn btn-outline btn-sm" ${cardsPage <= 0 ? 'disabled' : ''} onclick="loadCards(${cardsPage - 1})">上一页</button>
+      <span>第 ${cardsPage + 1} / ${totalPages || 1} 页</span>
+      <button class="btn btn-outline btn-sm" ${cardsPage >= totalPages - 1 ? 'disabled' : ''} onclick="loadCards(${cardsPage + 1})">下一页</button>`;
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="8" class="no-data">加载失败: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODULES
+// ═══════════════════════════════════════════════════════════
+async function loadModules() {
+  const container = document.getElementById('modulesContent');
+  try {
+    const data = await apiJSON('/admin/modules');
+    const categories = data.categories || {};
+    const CATEGORY_NAMES = {
+      infrastructure: '🏗️ 基础设施模块',
+      core: '⚙️ 核心模块',
+      channels: '📡 通讯渠道模块',
+      tools: '🛠️ 工具模块',
+      clients: '📱 客户端模块',
+    };
+    let html = '';
+    for (const [cat, modules] of Object.entries(categories)) {
+      html += `<div class="module-category"><h4>${CATEGORY_NAMES[cat] || cat}</h4><div class="modules-grid">`;
+      for (const [name, mod] of Object.entries(modules)) {
+        const enabled = mod.enabled;
+        const required = mod.required;
+        html += `<div class="module-card">
+          <div class="module-header">
+            <span class="module-name">${esc(name)}</span>
+            ${required ? '<span class="badge badge-info">必选</span>' :
+              (enabled ? '<span class="badge badge-success">已启用</span>' : '<span class="badge badge-danger">未启用</span>')}
+          </div>
+          <div class="module-desc">${esc(mod.description || '')}</div>
+          <div class="module-meta">
+            ${mod.node ? `<span>📍 ${esc(mod.node)}</span>` : ''}
+            ${mod.path ? `<span>📁 ${esc(mod.path)}</span>` : ''}
+          </div>
+          ${mod.depends_on && mod.depends_on.length ? `<div class="module-deps">依赖: ${mod.depends_on.map(d => `<span class="badge badge-info" style="margin-right:.2rem">${esc(d)}</span>`).join('')}</div>` : ''}
+        </div>`;
+      }
+      html += '</div></div>';
+    }
+    container.innerHTML = html || '<p class="no-data">无模块信息</p>';
+  } catch (e) {
+    container.innerHTML = `<p class="no-data">加载模块信息失败: ${esc(e.message)}</p>`;
+  }
+}
+
+// ── Utilities ─────────────────────────────────────────────
+function esc(s) {
+  if (s == null) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+function escAttr(s) {
+  return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+function num(n) { return n != null ? Number(n).toFixed(4) : '—'; }
+function fmtTime(t) {
+  if (!t) return '—';
+  return new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+}
+</script>
+</body>
+</html>

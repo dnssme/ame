@@ -1,8 +1,23 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.18
+ * Anima 灵枢 · Webhook 服务 v5.19
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.19 相对于 v5.18）：
+ *
+ *   #FIX-5.19-1  新增综合管理控制台（/admin/dashboard）
+ *                原：管理员只能通过命令行 cURL 调用 REST API 进行管理，
+ *                缺少直观的可视化管理界面，运维效率低。
+ *                修：新增 GET /admin/dashboard 端点，提供完整的 Web 管理界面，
+ *                覆盖模型管理、服务商管理、用户管理、充值卡管理、模块状态
+ *                等所有管理功能。页面为单文件 SPA，通过 ADMIN_TOKEN 鉴权。
+ *
+ *   #FIX-5.19-2  新增 GET /admin/modules 端点
+ *                原：模块注册表（modules.yml）只能通过文件系统查看，
+ *                管理员无法通过 API 获取模块状态信息。
+ *                修：新增端点读取 modules.yml 并以 JSON 格式返回模块信息，
+ *                路径通过 MODULES_YML_PATH 环境变量配置，文件不存在时降级返回空列表。
+ *
  * 修复记录（v5.18 相对于 v5.17）：
  *
  *   #FIX-5.18-1  /activate 新增用户暂停检查
@@ -212,12 +227,15 @@
  */
 
 const crypto    = require('crypto');
+const fs        = require('fs');
+const path      = require('path');
 const express   = require('express');
 const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Pool }  = require('pg');
 const winston   = require('winston');
 const Redis     = require('ioredis');
+const yaml      = require('js-yaml');
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -1399,6 +1417,44 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 // =============================================================
 // ─── 管理员接口 ───────────────────────────────────────────────
 // =============================================================
+
+// ── 综合管理控制台（FIX-5.19-1）──────────────────────────────
+const ADMIN_HTML_PATH = path.join(__dirname, 'public', 'admin.html');
+
+app.get('/admin/dashboard', (_req, res) => {
+  try {
+    const html = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
+    // 管理控制台为内部页面（nginx 已屏蔽 /admin 外部访问），
+    // 放宽 CSP 以允许内联脚本和样式
+    res.setHeader('Content-Security-Policy',
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+      "style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;");
+    res.type('html').send(html);
+  } catch (err) {
+    logger.error('Admin dashboard read error', { err: err.message });
+    res.status(500).json({ success: false, msg: '管理页面文件缺失' });
+  }
+});
+
+// ── 模块状态（FIX-5.19-2）────────────────────────────────────
+const MODULES_YML_PATH = process.env.MODULES_YML_PATH
+  || path.join(__dirname, '..', 'modules', 'modules.yml');
+
+app.get('/admin/modules', adminLimiter, requireAdmin, (_req, res) => {
+  try {
+    const content = fs.readFileSync(MODULES_YML_PATH, 'utf8');
+    const parsed = yaml.load(content);
+    res.json({ success: true, categories: parsed || {} });
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      // 文件不存在——降级返回空列表（Docker 环境可能未挂载该文件）
+      logger.info('modules.yml not found, returning empty list', { path: MODULES_YML_PATH });
+      return res.json({ success: true, categories: {} });
+    }
+    logger.error('Modules YAML read error', { err: err.message });
+    res.status(500).json({ success: false, msg: '模块配置读取失败' });
+  }
+});
 
 // ── 模型管理 ─────────────────────────────────────────────────
 
