@@ -1,8 +1,32 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.25
+ * Anima 灵枢 · Webhook 服务 v5.26
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.26 相对于 v5.25）：
+ *
+ *   #FIX-5.26-1  企业生产级安全加固（PCI-DSS / CIS 增量）
+ *                - POST/PUT/PATCH 请求新增 Content-Type 校验中间件，
+ *                  非 application/json 请求直接返回 415（PCI-DSS 6.5
+ *                  输入校验，CIS 防御纵深）。
+ *                - 优雅关闭超时后调用 server.closeAllConnections()
+ *                  强制终止残留连接，防止僵尸连接阻塞进程退出
+ *                  （CIS 进程管理，Node 18.2+ API）。
+ *                - 分页端点新增 offset 上限（100,000），防止深分页
+ *                  触发昂贵 OFFSET 扫描导致 DB 资源耗尽（CIS 资源保护）。
+ *                - 禁用 Express 默认 ETag 自动生成，管理面板已使用
+ *                  自定义 SHA-256 ETag；自动 ETag 泄露响应体指纹
+ *                  （CIS 2.3 信息最小化）。
+ *
+ *   #FIX-5.26-2  企业生产级速度优化
+ *                - 启动时预热 DB 连接池（SELECT 1），消除首次请求
+ *                  的冷启动延迟（生产级连接池管理）。
+ *                - 禁用 Express 默认 ETag 后，每个 JSON 响应节省
+ *                  一次 SHA 哈希计算（速度 + 安全双收益）。
+ *
+ *   #FIX-5.26-3  前端版本号同步
+ *                - admin.html 侧边栏及 JS 注释版本号对齐至 v5.26。
+ *
  * 修复记录（v5.25 相对于 v5.24）：
  *
  *   #FIX-5.25-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -598,6 +622,12 @@ const app = express();
 
 app.set('trust proxy', process.env.TRUST_PROXY || '172.16.1.1');
 
+// FIX-5.26-1 + FIX-5.26-2: 禁用 Express 默认 ETag 自动生成
+// 安全：自动 ETag 泄露响应体指纹（CIS 2.3 信息最小化）
+// 速度：每个 JSON 响应节省一次 SHA 哈希计算
+// 注：管理面板 /admin/dashboard 使用自定义 SHA-256 ETag，不受影响
+app.disable('etag');
+
 // FIX-5.20-2 + FIX-5.24-1: 严格 helmet 配置，满足 PCI-DSS & CIS 安全基线
 app.use(helmet({
   // HSTS: PCI-DSS 要求强制 HTTPS，预加载列表
@@ -672,6 +702,19 @@ app.use((_req, res, next) => {
 app.use((req, res, next) => {
   if (req.method === 'TRACE' || req.method === 'TRACK') {
     return res.status(405).json({ success: false, msg: 'Method Not Allowed' });
+  }
+  next();
+});
+
+// FIX-5.26-1: PCI-DSS 6.5 输入校验——POST/PUT/PATCH 请求必须携带 JSON Content-Type
+// 防止非 JSON 负载绕过 express.json() 解析器导致 req.body 为 undefined
+app.use((req, res, next) => {
+  if (
+    (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') &&
+    req.headers['content-type'] &&
+    !req.headers['content-type'].startsWith('application/json')
+  ) {
+    return res.status(415).json({ success: false, msg: 'Content-Type 必须为 application/json' });
   }
   next();
 });
@@ -801,6 +844,8 @@ function normalizeEmail(email) {
 }
 
 const MAX_TOKEN_VALUE = 10_000_000;
+// FIX-5.26-1: CIS 资源保护——分页 offset 上限，防止深分页 DoS（OFFSET 越大，DB 扫描行数越多）
+const MAX_PAGINATION_OFFSET = 100_000;
 
 // FIX-5.21-1: SSRF 防护——校验 URL 禁止内网/保留地址
 // PCI-DSS 1.3.x 网络安全要求：不允许从 DMZ 访问内网资源
@@ -1169,7 +1214,8 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
   }
 
   const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20, 1), 100);
-  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+  // FIX-5.26-1: CIS 资源保护——cap offset 防止深分页 DoS
+  const offset = Math.min(Math.max(parseInt(req.query.offset || '0', 10) || 0, 0), MAX_PAGINATION_OFFSET);
 
   try {
     // FIX-5.25-2: 使用 COUNT(*) OVER() 窗口函数，单次查询同时返回分页数据与总数
@@ -2266,7 +2312,8 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
 
 app.get('/admin/users', adminLimiter, requireAdmin, async (req, res) => {
   const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20, 1), 100);
-  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+  // FIX-5.26-1: CIS 资源保护——cap offset 防止深分页 DoS
+  const offset = Math.min(Math.max(parseInt(req.query.offset || '0', 10) || 0, 0), MAX_PAGINATION_OFFSET);
 
   try {
     // FIX-5.25-2: 使用 COUNT(*) OVER() 窗口函数，单次查询同时返回分页数据与总数
@@ -2384,7 +2431,8 @@ app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
 
 app.get('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
   const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20, 1), 100);
-  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+  // FIX-5.26-1: CIS 资源保护——cap offset 防止深分页 DoS
+  const offset = Math.min(Math.max(parseInt(req.query.offset || '0', 10) || 0, 0), MAX_PAGINATION_OFFSET);
   const usedFilter = req.query.used;  // 'true', 'false', or undefined (all)
 
   try {
@@ -2454,6 +2502,9 @@ const HOST = process.env.HOST || '172.16.1.6';
 
 const server = app.listen(PORT, HOST, () => {
   logger.info(`Webhook 服务已启动 http://${HOST}:${PORT}`);
+  // FIX-5.26-2: DB 连接池预热——消除首次请求的冷启动延迟
+  db.connect().then((c) => { c.release(); logger.info('DB 连接池预热完成'); })
+    .catch((err) => logger.warn('DB 连接池预热失败（首次请求将自动重试）', { err: err.message }));
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
   } else if (ADMIN_TOKEN.length < 64) {
@@ -2504,7 +2555,13 @@ const shutdown = (signal) => {
         process.exit(1);
       });
   });
-  setTimeout(() => process.exit(1), GRACEFUL_SHUTDOWN_TIMEOUT);
+  setTimeout(() => {
+    // FIX-5.26-1: CIS 进程管理——超时后强制终止所有残留连接，防止僵尸连接阻塞进程退出
+    if (typeof server.closeAllConnections === 'function') {
+      server.closeAllConnections();
+    }
+    process.exit(1);
+  }, GRACEFUL_SHUTDOWN_TIMEOUT);
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
