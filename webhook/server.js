@@ -1117,6 +1117,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         charged_fen: chargedFen,
         limit_fen:   MAX_SINGLE_REQUEST_FEN,
         balance_fen: Number(u.balance_fen),
+        is_suspended: false,
       });
     }
 
