@@ -571,15 +571,15 @@ app.use((req, res, next) => {
 
 // FIX-5.23-1: PCI-DSS 10.2——全链路访问日志（method/path/status/duration/ip/request_id）
 app.use((req, res, next) => {
-  const start = process.hrtime.bigint();
+  const start = Date.now();
   res.on('finish', () => {
-    const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+    const durationMs = Date.now() - start;
     logger.info('ACCESS', {
       request_id: req.id,
       method:     req.method,
       path:       req.path,
       status:     res.statusCode,
-      duration_ms: Math.round(durationMs * 100) / 100,
+      duration_ms: durationMs,
       ip:         req.ip,
     });
   });
@@ -718,6 +718,7 @@ const MAX_EMAIL_LEN = 254;
 // 连字符置末尾，语义清晰，避免与字符范围操作符混淆
 const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
 // FIX-5.23-1: apiProvider 字符集校验——仅允许字母、数字、连字符、下划线、点
+// 安全审查：apiProvider 仅用于 SQL 参数化查询和日志输出，不作为文件路径或 URL 拼接
 const API_PROVIDER_RE = /^[a-zA-Z0-9._-]+$/;
 
 function isValidEmail(email) {
@@ -912,7 +913,7 @@ app.get('/health', async (_req, res) => {
   }
 
   // FIX-5.23-2: 健康检查禁止缓存——确保探针获取实时状态
-  res.set('Cache-Control', 'no-cache, no-store, max-age=0');
+  res.set('Cache-Control', 'no-store, max-age=0');
   res.status(httpStatus).json({
     status: httpStatus === 200 ? 'ok' : 'degraded',
     ...status,
@@ -2377,8 +2378,10 @@ const server = app.listen(PORT, HOST, () => {
 server.keepAliveTimeout  = 65_000; // 略高于常见 LB/Nginx 60s
 server.headersTimeout    = 66_000; // 必须 > keepAliveTimeout
 // FIX-5.23-1: CIS Node.js 安全基线——请求超时 & 头部数量限制，防止 Slowloris / Header Flood
-server.requestTimeout    = 30_000; // 单请求最长 30 秒
-server.maxHeadersCount   = 50;     // 限制 HTTP 头数量，默认 2000 过于宽松
+// 30s: 计费 API 典型响应 < 1s，30s 为最大数据库事务超时的 3 倍（statement_timeout=10s），足够宽裕
+server.requestTimeout    = 30_000;
+// 50: 标准浏览器/内部服务请求通常携带 10-20 个头，50 已含充分余量（Node 默认 2000 过于宽松）
+server.maxHeadersCount   = 50;
 
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
