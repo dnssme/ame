@@ -475,9 +475,11 @@ CREATE INDEX IF NOT EXISTS idx_api_usage_user_date
 CREATE INDEX IF NOT EXISTS idx_api_usage_model
     ON api_usage(api_model_id, created_at DESC);
 
--- 部分唯一索引：仅对非 NULL 的 idempotency_key 强制唯一
+-- 部分唯一索引：仅对非 NULL 的 idempotency_key 强制唯一（按用户隔离）
+-- FIX-5.12-3：改为 (idempotency_key, user_email) 复合索引，
+--   防止不同用户使用相同 key 时发生跨用户碰撞
 CREATE UNIQUE INDEX IF NOT EXISTS idx_api_usage_idempotency
-    ON api_usage(idempotency_key)
+    ON api_usage(idempotency_key, user_email)
     WHERE idempotency_key IS NOT NULL;
 
 COMMENT ON COLUMN api_usage.idempotency_key IS

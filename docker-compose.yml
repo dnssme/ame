@@ -121,7 +121,7 @@ services:
   # ─── LibreChat 轻量版（lightweight profile）─────────────────
   librechat-light:
     image: ghcr.io/danny-avila/librechat:latest
-    container_name: librechat
+    container_name: librechat-light
     restart: unless-stopped
     profiles: ["lightweight"]
 
@@ -171,7 +171,7 @@ services:
   # ─── OpenClaw Agent 轻量版 ─────────────────────────────────
   openclaw-light:
     build: ./openclaw
-    container_name: openclaw
+    container_name: openclaw-light
     restart: unless-stopped
     profiles: ["lightweight"]
 
@@ -274,7 +274,7 @@ services:
   # ─── Webhook 计费服务 轻量版 ─────────────────────────────────
   webhook-light:
     build: ./webhook
-    container_name: anima-webhook
+    container_name: anima-webhook-light
     restart: unless-stopped
     profiles: ["lightweight"]
 
