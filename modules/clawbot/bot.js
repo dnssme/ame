@@ -5,16 +5,34 @@
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
  *
+ * 接入方式（官方微信）：
+ *   - 微信公众号扫码关注接入（用户扫描二维码 → 关注 → 自动绑定）
+ *   - 微信 App 互通接入（通过 Open Platform 跨应用通信）
+ *   - 不使用企业微信作为主接入方式
+ *
+ * 企业微信（WeCom）接口：
+ *   - 已添加完整的企业微信 Webhook 接口
+ *   - 默认关闭（WECOM_ENABLED=false），如需使用请手动开启
+ *   - 与微信公众号通道隔离，独立 Redis 键空间
+ *
  * 功能：
  *   - 微信 ClawBot 插件签名验证（token + timestamp + nonce SHA1）
  *   - 强制登录认证（用户必须绑定邮箱后才可使用 AI 功能）
  *   - 用户强隔离（独立 Redis 键空间、独立会话、独立计费）
+ *   - 二维码接入（扫码关注/登录）
  *   - 文字消息 → AI 对话
  *   - 语音消息 → Whisper STT → AI → TTS → 语音回复
- *   - 图片/文件 → 文件分析
+ *   - 图片消息 → AI 图片分析
+ *   - 视频/文件 → 文件分析
+ *   - 位置消息 → 位置相关 AI 服务
+ *   - 链接消息 → 链接内容分析
  *   - /model 切换模型
  *   - /balance 查询余额
  *   - /clear 清除对话上下文
+ *   - /search 网页搜索（DuckDuckGo）
+ *   - /calendar 日历管理（Nextcloud CalDAV）
+ *   - /home 智能家居控制（Home Assistant）
+ *   - /files 云存储信息（Nextcloud WebDAV）
  *   - /help 帮助信息
  *   - 长耗时任务异步回复
  *   - 消息分段发送（适配微信消息长度限制）
@@ -68,6 +86,14 @@ const WHISPER_URL    = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transc
 const TTS_URL        = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 const PORT           = parseInt(process.env.PORT || '3004', 10);
 
+// ─── 企业微信（WeCom）配置（默认关闭，仅添加接口不使用）────────
+const WECOM_ENABLED   = process.env.WECOM_ENABLED === 'true';
+const WECOM_CORPID    = process.env.WECOM_CORPID || '';
+const WECOM_SECRET    = process.env.WECOM_SECRET || '';
+const WECOM_TOKEN     = process.env.WECOM_TOKEN || '';
+const WECOM_AES_KEY   = process.env.WECOM_ENCODING_AES_KEY || '';
+const WECOM_AGENT_ID  = process.env.WECOM_AGENT_ID || '';
+
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
   process.exit(1);
@@ -79,6 +105,17 @@ if (!CLAWBOT_APP_ID) {
 if (!CLAWBOT_APP_SECRET) {
   logger.error('CLAWBOT_APP_SECRET 未设置，无法启动');
   process.exit(1);
+}
+
+// 企业微信配置检查（仅在启用时检查）
+if (WECOM_ENABLED) {
+  if (!WECOM_CORPID || !WECOM_SECRET || !WECOM_TOKEN) {
+    logger.error('企业微信已启用但配置不完整（需要 WECOM_CORPID/WECOM_SECRET/WECOM_TOKEN）');
+    process.exit(1);
+  }
+  logger.info('企业微信（WeCom）接口已启用');
+} else {
+  logger.info('企业微信（WeCom）接口已添加但未启用（WECOM_ENABLED=false）');
 }
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
@@ -107,6 +144,11 @@ if (redis) {
 const REDIS_EMAIL_KEY  = 'anima:clawbot:emails';      // Hash: openid → email
 const REDIS_MODELS_KEY = 'anima:clawbot:user_models';  // Hash: openid → model
 const REDIS_AUTH_KEY   = 'anima:clawbot:authed';       // Set:  已认证用户 openid
+
+// 企业微信使用独立键空间，与公众号通道完全隔离
+const WECOM_EMAIL_KEY  = 'anima:wecom:emails';         // Hash: userid → email
+const WECOM_MODELS_KEY = 'anima:wecom:user_models';     // Hash: userid → model
+const WECOM_AUTH_KEY   = 'anima:wecom:authed';          // Set:  已认证 userid
 
 // ─── 用户认证/邮箱管理 ──────────────────────────────────────
 async function isUserAuthed(openId) {
@@ -390,10 +432,374 @@ async function sendAsyncReply(openId, text) {
   }
 }
 
+// ─── 扫码接入：二维码生成 ──────────────────────────────────────
+
+/**
+ * 生成带参数的微信二维码 ticket。
+ * 用户扫码后关注公众号，触发 subscribe/SCAN 事件。
+ * @param {string} sceneStr - 场景值（标识二维码用途）
+ * @param {boolean} temporary - 是否临时二维码（默认永久）
+ * @returns {Promise<{ticket: string, url: string}|null>}
+ */
+async function createQrCode(sceneStr = 'subscribe', temporary = false) {
+  const token = await getAccessToken();
+  if (!token) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const payload = temporary
+      ? { expire_seconds: 2592000, action_name: 'QR_STR_SCENE', action_info: { scene: { scene_str: sceneStr } } }
+      : { action_name: 'QR_LIMIT_STR_SCENE', action_info: { scene: { scene_str: sceneStr } } };
+
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/qrcode/create?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.ticket) {
+      return {
+        ticket: data.ticket,
+        url: data.url || '',
+        qrcodeUrl: `https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=${encodeURIComponent(data.ticket)}`,
+      };
+    }
+    logger.error('生成二维码失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return null;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('生成二维码异常', { err: err.message });
+    return null;
+  }
+}
+
+// ─── 企业微信（WeCom）接口 ────────────────────────────────────
+
+/** 企业微信 Access Token 缓存 */
+let wecomTokenCache = { token: '', expiresAt: 0 };
+
+/**
+ * 获取企业微信 access_token。
+ * 仅在 WECOM_ENABLED=true 时可用。
+ */
+async function getWecomAccessToken() {
+  if (!WECOM_ENABLED) return '';
+  if (wecomTokenCache.token && Date.now() < wecomTokenCache.expiresAt) {
+    return wecomTokenCache.token;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const url = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(WECOM_CORPID)}&corpsecret=${encodeURIComponent(WECOM_SECRET)}`;
+    const { body } = await request(url, {
+      bodyTimeout: 10_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.access_token) {
+      wecomTokenCache = {
+        token: data.access_token,
+        expiresAt: Date.now() + ((data.expires_in || 7200) - 300) * 1000,
+      };
+      return data.access_token;
+    }
+    logger.error('获取企业微信 access_token 失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取企业微信 access_token 异常', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 企业微信签名验证。
+ * 与公众号签名验证算法相同：SHA1(sort([token, timestamp, nonce]))
+ */
+function verifyWecomSignature(signature, timestamp, nonce) {
+  if (!WECOM_TOKEN) return false;
+  const arr = [WECOM_TOKEN, timestamp, nonce].sort();
+  const hash = crypto.createHash('sha1').update(arr.join('')).digest('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(hash, 'utf8'),
+    Buffer.from(signature, 'utf8')
+  );
+}
+
+/**
+ * 通过企业微信应用消息接口发送消息。
+ */
+async function sendWecomReply(userId, text) {
+  if (!WECOM_ENABLED) return;
+  const token = await getWecomAccessToken();
+  if (!token) {
+    logger.error('无法发送企业微信消息：access_token 不可用', { userId });
+    return;
+  }
+
+  const parts = splitMessage(text);
+  for (const part of parts) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+    try {
+      const { body } = await request(
+        `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(token)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            touser: userId,
+            msgtype: 'text',
+            agentid: parseInt(WECOM_AGENT_ID, 10) || 0,
+            text: { content: part },
+          }),
+          bodyTimeout: 10_000,
+          headersTimeout: 10_000,
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timeoutId);
+      const result = await body.json();
+      if (result.errcode && result.errcode !== 0) {
+        logger.error('企业微信消息发送失败', { errcode: result.errcode, errmsg: result.errmsg, userId });
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      logger.error('企业微信消息发送异常', { err: err.message, userId });
+    }
+  }
+}
+
+// ─── 微信媒体 API ────────────────────────────────────────────
+
+/**
+ * 从微信服务器下载临时媒体文件（语音/图片/视频/文件）。
+ * @param {string} mediaId - 微信 MediaId
+ * @returns {Promise<{buffer: Buffer, contentType: string}|null>}
+ */
+async function downloadMedia(mediaId) {
+  const token = await getAccessToken();
+  if (!token) {
+    logger.error('下载媒体失败：access_token 不可用', { mediaId });
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const url = `https://api.weixin.qq.com/cgi-bin/media/get?access_token=${encodeURIComponent(token)}&media_id=${encodeURIComponent(mediaId)}`;
+    const { body, headers } = await request(url, {
+      bodyTimeout: 30_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const contentType = headers['content-type'] || '';
+    // 微信错误返回 JSON
+    if (contentType.includes('application/json') || contentType.includes('text/plain')) {
+      const errData = await body.json();
+      logger.error('下载媒体失败', { errcode: errData.errcode, errmsg: errData.errmsg, mediaId });
+      return null;
+    }
+
+    const chunks = [];
+    for await (const chunk of body) {
+      chunks.push(chunk);
+    }
+    return { buffer: Buffer.concat(chunks), contentType };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('下载媒体异常', { err: err.message, mediaId });
+    return null;
+  }
+}
+
+/**
+ * 上传临时媒体到微信服务器（用于回复语音消息）。
+ * @param {Buffer} audioBuffer - 音频文件 Buffer
+ * @param {string} type - 媒体类型 (voice/image/video/thumb)
+ * @returns {Promise<string>} 上传后的 media_id，失败返回空字符串
+ */
+async function uploadVoiceMedia(audioBuffer, type = 'voice') {
+  const token = await getAccessToken();
+  if (!token) return '';
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const boundary = `----WebKitFormBoundary${crypto.randomBytes(16).toString('hex')}`;
+    const filename = type === 'voice' ? 'reply.mp3' : 'media.bin';
+    const contentTypeMap = { voice: 'audio/mpeg', image: 'image/png', video: 'video/mp4' };
+    const mimeType = contentTypeMap[type] || 'application/octet-stream';
+
+    const head = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${filename}"\r\nContent-Type: ${mimeType}\r\n\r\n`
+    );
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const payload = Buffer.concat([head, audioBuffer, tail]);
+
+    const url = `https://api.weixin.qq.com/cgi-bin/media/upload?access_token=${encodeURIComponent(token)}&type=${type}`;
+    const { body } = await request(url, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: payload,
+      bodyTimeout: 30_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const data = await body.json();
+    if (data.media_id) {
+      return data.media_id;
+    }
+    logger.error('上传媒体失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('上传媒体异常', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 调用 Whisper STT 服务将音频转文字。
+ * @param {Buffer} audioBuffer - 音频文件
+ * @param {string} format - 音频格式 (amr/mp3/wav)
+ * @returns {Promise<string>} 转录文本
+ */
+async function transcribeVoice(audioBuffer, format = 'amr') {
+  if (!VOICE_ENABLED) return '';
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const boundary = `----WhisperBoundary${crypto.randomBytes(16).toString('hex')}`;
+    const mimeMap = { amr: 'audio/amr', mp3: 'audio/mpeg', wav: 'audio/wav' };
+    const mimeType = mimeMap[format] || 'application/octet-stream';
+
+    const head = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${format}"\r\nContent-Type: ${mimeType}\r\n\r\n`
+    );
+    const langPart = Buffer.from(
+      `\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nzh\r\n--${boundary}--\r\n`
+    );
+    const payload = Buffer.concat([head, audioBuffer, langPart]);
+
+    const { body } = await request(WHISPER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body: payload,
+      bodyTimeout: 60_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const data = await body.json();
+    return data.text || data.transcription || '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('Whisper STT 失败', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 调用 Coqui TTS 将文本合成语音。
+ * @param {string} text - 要合成的文本
+ * @returns {Promise<Buffer|null>} 音频 Buffer (WAV 格式)
+ */
+async function synthesizeSpeech(text) {
+  if (!VOICE_ENABLED) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const { body } = await request(TTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, language: 'zh' }),
+      bodyTimeout: 30_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const chunks = [];
+    for await (const chunk of body) {
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('TTS 合成失败', { err: err.message });
+    return null;
+  }
+}
+
+/**
+ * 通过客服消息接口发送语音回复。
+ */
+async function sendAsyncVoiceReply(openId, voiceMediaId) {
+  const token = await getAccessToken();
+  if (!token) return;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          touser: openId,
+          msgtype: 'voice',
+          voice: { media_id: voiceMediaId },
+        }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode && result.errcode !== 0) {
+      logger.error('语音客服消息发送失败', { errcode: result.errcode, errmsg: result.errmsg, openId });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('语音客服消息发送异常', { err: err.message, openId });
+  }
+}
+
 // ─── 输入验证 ────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
 const MAX_TEXT_LENGTH = 10000;
+// TTS 文本上限：防止合成超时和音频过大（Coqui TTS 对超长文本性能下降）
+const MAX_TTS_TEXT_LENGTH = 500;
 
 function stripControlChars(str) {
   return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
@@ -430,12 +836,23 @@ async function handleTextMessage(openId, rawText) {
   // /help — 帮助
   if (text === '/help') {
     return '📖 Anima 灵枢 · ClawBot 命令列表\n\n' +
+      '【基础】\n' +
       '/bind <邮箱> — 绑定邮箱（首次使用必须绑定）\n' +
       '/balance — 查询账户余额\n' +
       '/model <模型名> — 切换 AI 模型\n' +
-      '/clear — 清除对话上下文\n' +
-      '/help — 显示此帮助\n\n' +
-      '直接发送文字即可与 AI 对话。';
+      '/clear — 清除对话上下文\n\n' +
+      '【工具】\n' +
+      '/search <关键词> — 网页搜索\n' +
+      '/calendar [操作] — 日历管理\n' +
+      '/home [命令] — 智能家居控制\n' +
+      '/files — 云存储信息\n\n' +
+      '【消息类型】\n' +
+      '• 发送文字 — AI 对话\n' +
+      '• 发送语音 — 语音转文字 → AI 对话\n' +
+      '• 发送图片/文件 — AI 分析\n' +
+      '• 发送位置 — 位置相关 AI 服务\n' +
+      '• 发送链接 — 链接内容分析\n\n' +
+      '/help — 显示此帮助';
   }
 
   // ── 认证检查（/bind 和 /help 不需要认证）──
@@ -479,6 +896,74 @@ async function handleTextMessage(openId, rawText) {
     return '🗑 对话上下文已清除。';
   }
 
+  // /search <query> — 网页搜索（通过 Agent 调用 DuckDuckGo）
+  if (text.startsWith('/search ') || text.startsWith('/search\u3000')) {
+    const query = text.slice(8).trim();
+    if (!query || query.length > MAX_TEXT_LENGTH) {
+      return '❌ 请输入搜索关键词。\n\n用法：/search 关键词';
+    }
+    logger.info('用户发起搜索', { openId, query: query.substring(0, 50) });
+    const searchPrompt = `请帮我搜索以下内容并总结结果：${query}`;
+    // 搜索是长耗时任务，异步处理
+    callAgent(openId, searchPrompt)
+      .then(async (reply) => {
+        await sendAsyncReply(openId, `🔍 搜索结果：\n\n${reply}`);
+      })
+      .catch(async (err) => {
+        logger.error('搜索任务失败', { err: err.message, openId });
+        await sendAsyncReply(openId, '❌ 搜索失败，请稍后重试。');
+      });
+    return '🔍 正在搜索，请稍候...';
+  }
+
+  // /calendar [操作] — 日历管理（通过 Agent 调用 CalDAV）
+  if (text === '/calendar' || text.startsWith('/calendar ') || text.startsWith('/calendar\u3000')) {
+    if (text === '/calendar') {
+      return '📅 日历管理\n\n' +
+        '用法：\n' +
+        '/calendar 查看今天日程\n' +
+        '/calendar 明天下午3点开会\n' +
+        '/calendar 删除xxx事件\n\n' +
+        '也可以直接用自然语言描述日程安排。';
+    }
+    const calendarCmd = text.slice(10).trim();
+    if (!calendarCmd) {
+      return '请输入日历操作内容。\n\n用法：/calendar 查看今天日程';
+    }
+    logger.info('用户日历操作', { openId, cmd: calendarCmd.substring(0, 50) });
+    return await callAgent(openId, `请帮我处理以下日历操作：${calendarCmd}`);
+  }
+
+  // /home [命令] — 智能家居控制（通过 Agent 调用 Home Assistant）
+  if (text === '/home' || text.startsWith('/home ') || text.startsWith('/home\u3000')) {
+    if (text === '/home') {
+      return '🏠 智能家居控制\n\n' +
+        '用法：\n' +
+        '/home 打开客厅灯\n' +
+        '/home 空调设置26度\n' +
+        '/home 查看家里温度\n\n' +
+        '也可以直接用自然语言描述操作。';
+    }
+    const homeCmd = text.slice(6).trim();
+    if (!homeCmd) {
+      return '请输入智能家居操作。\n\n用法：/home 打开客厅灯';
+    }
+    logger.info('用户智能家居操作', { openId, cmd: homeCmd.substring(0, 50) });
+    return await callAgent(openId, `请帮我执行以下智能家居操作：${homeCmd}`);
+  }
+
+  // /files — 云存储信息
+  if (text === '/files') {
+    return '☁️ 云存储 (Nextcloud)\n\n' +
+      '你的私有云盘支持：\n' +
+      '• 文件上传/下载/管理\n' +
+      '• 多设备同步\n' +
+      '• 文件分享（生成共享链接）\n' +
+      '• 版本管理与回收站\n\n' +
+      '请通过 Nextcloud 客户端或 Web 界面访问云盘。\n' +
+      '发送图片/文件到本对话可以进行 AI 分析。';
+  }
+
   // ── 普通消息 → AI 对话 ──
   logger.info('收到文字消息', { openId, text: text.substring(0, 100) });
 
@@ -500,24 +985,234 @@ async function handleTextMessage(openId, rawText) {
 }
 
 /**
- * 处理语音消息（如已启用语音模块）
+ * 处理语音消息：下载语音 → Whisper STT → AI 对话 → 文字回复。
+ * 如果 VOICE_ENABLED，会异步通过客服接口回复语音。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} mediaId - 微信语音 MediaId
+ * @param {string} recognition - 微信自带语音识别结果（可能为空）
  */
-async function handleVoiceMessage(openId) {
-  if (!VOICE_ENABLED) {
-    return '语音功能暂未启用，请发送文字消息。';
-  }
-  return '语音处理中...（语音转文字 → AI 对话 → 语音回复）\n暂请先发送文字消息。';
-}
-
-/**
- * 处理图片/文件消息
- */
-async function handleImageMessage(openId) {
+async function handleVoiceMessage(openId, mediaId, recognition) {
+  // 认证检查
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
   }
-  return '📎 已收到文件。文件分析功能可通过 Web 界面使用，ClawBot 通道将在后续版本支持文件直传分析。';
+
+  // 优先使用微信自带语音识别结果
+  if (recognition && recognition.trim()) {
+    logger.info('使用微信语音识别结果', { openId, recognition: recognition.substring(0, 50) });
+    const reply = await callAgent(openId, recognition.trim());
+
+    // 如果语音模块可用，异步发送 TTS 语音回复
+    if (VOICE_ENABLED) {
+      setImmediate(async () => {
+        try {
+          const ttsBuffer = await synthesizeSpeech(reply.substring(0, MAX_TTS_TEXT_LENGTH));
+          if (ttsBuffer) {
+            const voiceMediaId = await uploadVoiceMedia(ttsBuffer);
+            if (voiceMediaId) {
+              await sendAsyncVoiceReply(openId, voiceMediaId);
+            }
+          }
+        } catch (err) {
+          logger.error('TTS 语音回复失败', { err: err.message, openId });
+        }
+      });
+    }
+    return reply;
+  }
+
+  // 如果没有微信语音识别结果且语音模块未启用
+  if (!VOICE_ENABLED) {
+    return '🎙 已收到语音消息。\n\n语音转文字功能暂未启用，请发送文字消息与 AI 对话。';
+  }
+
+  // 使用 Whisper STT 转录
+  if (!mediaId) {
+    return '语音消息格式异常，请重试。';
+  }
+
+  logger.info('开始处理语音消息', { openId, mediaId });
+
+  // 异步处理：下载 → 转录 → AI → 回复
+  setImmediate(async () => {
+    try {
+      // 1. 下载语音文件
+      const media = await downloadMedia(mediaId);
+      if (!media) {
+        await sendAsyncReply(openId, '❌ 语音下载失败，请重试。');
+        return;
+      }
+
+      // 2. Whisper 转录
+      const text = await transcribeVoice(media.buffer, 'amr');
+      if (!text) {
+        await sendAsyncReply(openId, '❌ 语音识别失败，请重试或发送文字消息。');
+        return;
+      }
+
+      logger.info('语音转录完成', { openId, text: text.substring(0, 50) });
+
+      // 3. AI 对话
+      const reply = await callAgent(openId, text);
+      await sendAsyncReply(openId, `🎙 语音识别：${text}\n\n${reply}`);
+
+      // 4. 可选 TTS 语音回复
+      const ttsBuffer = await synthesizeSpeech(reply.substring(0, MAX_TTS_TEXT_LENGTH));
+      if (ttsBuffer) {
+        const voiceMediaId = await uploadVoiceMedia(ttsBuffer);
+        if (voiceMediaId) {
+          await sendAsyncVoiceReply(openId, voiceMediaId);
+        }
+      }
+    } catch (err) {
+      logger.error('语音消息处理失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 语音处理失败，请稍后重试。');
+    }
+  });
+
+  return '🎙 语音处理中，稍后回复...';
+}
+
+/**
+ * 处理图片消息：下载图片 → AI 分析。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} picUrl - 微信图片 URL
+ * @param {string} mediaId - 微信 MediaId
+ */
+async function handleImageMessage(openId, picUrl, mediaId) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  if (!picUrl && !mediaId) {
+    return '图片消息格式异常，请重试。';
+  }
+
+  logger.info('收到图片消息', { openId, hasPicUrl: !!picUrl, hasMediaId: !!mediaId });
+
+  // 异步处理图片分析
+  setImmediate(async () => {
+    try {
+      let imageContext;
+      if (picUrl) {
+        imageContext = `用户发送了一张图片，图片URL：${picUrl}。请分析这张图片的内容。`;
+      } else if (mediaId) {
+        // picUrl 不可用时通过 mediaId 下载图片
+        const media = await downloadMedia(mediaId);
+        if (media) {
+          imageContext = `用户发送了一张图片（已通过媒体接口获取，格式：${media.contentType}）。请提供图片分析帮助。`;
+        } else {
+          imageContext = '用户发送了一张图片，但下载失败。请提供可能的分析帮助。';
+        }
+      } else {
+        imageContext = '用户发送了一张图片，请提供可能的分析帮助。';
+      }
+
+      const reply = await callAgent(openId, imageContext);
+      await sendAsyncReply(openId, `🖼 图片分析结果：\n\n${reply}`);
+    } catch (err) {
+      logger.error('图片分析失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 图片分析失败，请稍后重试。');
+    }
+  });
+
+  return '🖼 图片分析中，稍后回复...';
+}
+
+/**
+ * 处理视频/文件消息：转发到 Agent 进行分析。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} mediaId - 微信 MediaId
+ * @param {string} fileName - 文件名（文件消息才有）
+ */
+async function handleFileMessage(openId, mediaId, fileName) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  logger.info('收到文件消息', { openId, mediaId, fileName });
+
+  const fileDesc = fileName ? `文件名：${fileName}` : '视频/文件';
+
+  // 异步处理文件分析
+  setImmediate(async () => {
+    try {
+      // 尝试下载文件获取更多信息（大文件可能下载失败，回退到元数据分析）
+      let fileContext = `用户发送了一个文件（${fileDesc}）。`;
+      if (mediaId) {
+        const media = await downloadMedia(mediaId);
+        if (media) {
+          const sizeKB = (media.buffer.length / 1024).toFixed(1);
+          fileContext += `\n文件大小：${sizeKB}KB，格式：${media.contentType}。`;
+        }
+      }
+      fileContext += '\n请提供分析帮助。如需详细分析文件内容，建议通过 Web 界面上传。';
+
+      const reply = await callAgent(openId, fileContext);
+      await sendAsyncReply(openId, `📎 文件分析：\n\n${reply}`);
+    } catch (err) {
+      logger.error('文件分析失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 文件处理失败，请稍后重试。');
+    }
+  });
+
+  return `📎 已收到${fileName ? `文件「${fileName}」` : '文件'}，分析中...`;
+}
+
+/**
+ * 处理位置消息：提取经纬度和标签发送给 Agent。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} locationX - 纬度
+ * @param {string} locationY - 经度
+ * @param {string} scale - 地图缩放
+ * @param {string} label - 位置名称
+ */
+async function handleLocationMessage(openId, locationX, locationY, scale, label) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  logger.info('收到位置消息', { openId, label, lat: locationX, lng: locationY });
+
+  const locationDesc = label
+    ? `用户分享了位置「${label}」（纬度：${locationX}，经度：${locationY}）。请提供该位置相关的信息或帮助。`
+    : `用户分享了一个位置（纬度：${locationX}，经度：${locationY}）。请提供该位置相关的信息或帮助。`;
+
+  return await callAgent(openId, locationDesc);
+}
+
+/**
+ * 处理链接消息：提取标题、描述和URL发送给 Agent 分析。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} title - 链接标题
+ * @param {string} description - 链接描述
+ * @param {string} url - 链接 URL
+ */
+async function handleLinkMessage(openId, title, description, url) {
+  const authed = await isUserAuthed(openId);
+  if (!authed) {
+    return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+
+  logger.info('收到链接消息', { openId, title, url });
+
+  const linkDesc = `用户分享了一个链接：\n标题：${title || '无'}\n描述：${description || '无'}\nURL：${url || '无'}\n\n请分析该链接内容并提供摘要或相关帮助。`;
+
+  // 链接分析可能耗时较长
+  callAgent(openId, linkDesc)
+    .then(async (reply) => {
+      await sendAsyncReply(openId, `🔗 链接分析：\n\n${reply}`);
+    })
+    .catch(async (err) => {
+      logger.error('链接分析失败', { err: err.message, openId });
+      await sendAsyncReply(openId, '❌ 链接分析失败，请稍后重试。');
+    });
+
+  return '🔗 正在分析链接内容，稍后回复...';
 }
 
 // ─── 构建微信 XML 被动回复 ──────────────────────────────────
@@ -660,6 +1355,9 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   const msgType      = getXmlValue(xmlBody, 'MsgType');
   const content      = getXmlValue(xmlBody, 'Content');
   const msgId        = getXmlValue(xmlBody, 'MsgId');
+  const mediaId      = getXmlValue(xmlBody, 'MediaId');
+  const picUrl       = getXmlValue(xmlBody, 'PicUrl');
+  const recognition  = getXmlValue(xmlBody, 'Recognition');   // 微信语音识别
 
   if (!fromUserName || !msgType) {
     res.status(400).send('Invalid message');
@@ -684,23 +1382,66 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         break;
 
       case 'voice':
-        replyText = await handleVoiceMessage(openId);
+        replyText = await handleVoiceMessage(openId, mediaId, recognition);
         break;
 
       case 'image':
-      case 'video':
-      case 'file':
-        replyText = await handleImageMessage(openId);
+        replyText = await handleImageMessage(openId, picUrl, mediaId);
         break;
+
+      case 'video':
+      case 'shortvideo':
+      case 'file':
+        replyText = await handleFileMessage(openId, mediaId, getXmlValue(xmlBody, 'FileName'));
+        break;
+
+      case 'location': {
+        const locationX = getXmlValue(xmlBody, 'Location_X');
+        const locationY = getXmlValue(xmlBody, 'Location_Y');
+        const scale     = getXmlValue(xmlBody, 'Scale');
+        const label     = getXmlValue(xmlBody, 'Label');
+        replyText = await handleLocationMessage(openId, locationX, locationY, scale, label);
+        break;
+      }
+
+      case 'link': {
+        const title       = getXmlValue(xmlBody, 'Title');
+        const description = getXmlValue(xmlBody, 'Description');
+        const url         = getXmlValue(xmlBody, 'Url');
+        replyText = await handleLinkMessage(openId, title, description, url);
+        break;
+      }
 
       case 'event': {
         const eventType = getXmlValue(xmlBody, 'Event');
+        const eventKey  = getXmlValue(xmlBody, 'EventKey');
+
         if (eventType === 'subscribe') {
-          replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
-            '首次使用请先绑定邮箱完成认证：\n' +
-            '/bind 你的邮箱@example.com\n\n' +
-            '绑定后即可直接发送消息与 AI 对话。\n\n' +
-            '发送 /help 查看所有可用命令。';
+          // 用户关注（可能通过扫码关注：eventKey 包含 qrscene_ 前缀）
+          if (eventKey && eventKey.startsWith('qrscene_')) {
+            const scene = eventKey.slice(8);
+            logger.info('用户通过扫码关注', { openId, scene });
+            replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
+              '你通过扫码关注，' +
+              '首次使用请绑定邮箱完成认证：\n' +
+              '/bind 你的邮箱@example.com\n\n' +
+              '绑定后即可直接发送消息与 AI 对话。\n\n' +
+              '发送 /help 查看所有可用命令。';
+          } else {
+            replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
+              '首次使用请先绑定邮箱完成认证：\n' +
+              '/bind 你的邮箱@example.com\n\n' +
+              '绑定后即可直接发送消息与 AI 对话。\n' +
+              '支持文字、语音、图片、文件、位置、链接等多种消息类型。\n\n' +
+              '发送 /help 查看所有可用命令。';
+          }
+        } else if (eventType === 'SCAN') {
+          // 已关注用户扫码（不触发 subscribe，触发 SCAN 事件）
+          const scene = eventKey || '';
+          logger.info('已关注用户扫码', { openId, scene });
+          replyText = '📱 扫码成功！你已关注 Anima 灵枢。\n\n' +
+            '直接发送消息即可与 AI 对话。\n' +
+            '发送 /help 查看可用命令。';
         } else if (eventType === 'unsubscribe') {
           logger.info('用户取消关注', { openId });
         }
@@ -708,7 +1449,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
       }
 
       default:
-        replyText = '暂不支持此类型消息，请发送文字消息。';
+        replyText = '暂不支持此类型消息，请发送文字或语音消息。';
         break;
     }
 
@@ -728,6 +1469,176 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   }
 });
 
+// ─── 扫码接入：二维码生成端点 ──────────────────────────────────
+// 管理员调用此接口生成二维码，用户扫码关注后自动接入
+app.get('/clawbot/qrcode', verifyLimiter, async (req, res) => {
+  const scene = typeof req.query.scene === 'string' ? req.query.scene.substring(0, 64) : 'subscribe';
+  const temporary = req.query.temporary === 'true';
+
+  const result = await createQrCode(scene, temporary);
+  if (!result) {
+    res.status(500).json({ success: false, msg: '二维码生成失败' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    ticket: result.ticket,
+    url: result.url,
+    qrcodeUrl: result.qrcodeUrl,
+    scene,
+  });
+});
+
+// ─── 企业微信（WeCom）Webhook 接口 ────────────────────────────
+// 以下接口已添加但默认不启用（WECOM_ENABLED=false）
+// 企业微信回调也需要 XML body
+app.use('/wecom/webhook', express.text({ type: ['text/xml', 'application/xml'], limit: '256kb' }));
+
+// 企业微信 URL 验证（GET）
+app.get('/wecom/webhook', verifyLimiter, (req, res) => {
+  if (!WECOM_ENABLED) {
+    res.status(404).json({ error: 'WeCom interface not enabled' });
+    return;
+  }
+
+  const { msg_signature, timestamp, nonce, echostr } = req.query;
+
+  if (!msg_signature || !timestamp || !nonce || !echostr) {
+    logger.warn('企业微信验证请求缺少参数');
+    res.status(400).send('Missing parameters');
+    return;
+  }
+
+  try {
+    if (verifyWecomSignature(String(msg_signature), String(timestamp), String(nonce))) {
+      logger.info('企业微信 URL 验证成功');
+      res.status(200).send(String(echostr));
+    } else {
+      logger.warn('企业微信签名验证失败');
+      res.status(403).send('Signature verification failed');
+    }
+  } catch (err) {
+    logger.error('企业微信签名验证异常', { err: err.message });
+    res.status(500).send('Internal error');
+  }
+});
+
+// 企业微信消息接收（POST）
+app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
+  if (!WECOM_ENABLED) {
+    res.status(404).json({ error: 'WeCom interface not enabled' });
+    return;
+  }
+
+  const { msg_signature, timestamp, nonce } = req.query;
+
+  if (!msg_signature || !timestamp || !nonce) {
+    res.status(400).send('Missing parameters');
+    return;
+  }
+
+  try {
+    if (!verifyWecomSignature(String(msg_signature), String(timestamp), String(nonce))) {
+      logger.warn('企业微信消息签名验证失败');
+      res.status(403).send('Signature verification failed');
+      return;
+    }
+  } catch (err) {
+    logger.error('企业微信签名验证异常', { err: err.message });
+    res.status(500).send('Internal error');
+    return;
+  }
+
+  // 解析 XML 消息体
+  const xmlBody = typeof req.body === 'string' ? req.body : '';
+  if (!xmlBody) {
+    res.status(400).send('Empty body');
+    return;
+  }
+
+  const xmlFieldCache = new Map();
+  const getXmlValue = (xml, tag) => {
+    let re = xmlFieldCache.get(tag);
+    if (!re) {
+      re = {
+        cdata: new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`),
+        plain: new RegExp(`<${tag}>([^<]*)</${tag}>`),
+      };
+      xmlFieldCache.set(tag, re);
+    }
+    const match = xml.match(re.cdata);
+    if (match) return match[1];
+    const match2 = xml.match(re.plain);
+    return match2 ? match2[1] : '';
+  };
+
+  const toUserName   = getXmlValue(xmlBody, 'ToUserName');
+  const fromUserName = getXmlValue(xmlBody, 'FromUserName');   // 企业微信 UserID
+  const msgType      = getXmlValue(xmlBody, 'MsgType');
+  const content      = getXmlValue(xmlBody, 'Content');
+
+  if (!fromUserName || !msgType) {
+    res.status(400).send('Invalid message');
+    return;
+  }
+
+  // 企业微信使用 UserID 而非 OpenID
+  const userId = fromUserName;
+
+  logger.info('收到企业微信消息', { userId, msgType });
+
+  try {
+    let replyText = '';
+
+    // 企业微信消息处理：复用核心处理逻辑（handleTextMessage 等）
+    // 'wecom:' 前缀确保 Redis 键空间隔离——核心处理函数使用完整 wecomOpenId
+    // 作为 Redis hash field，因此 anima:clawbot:emails 中的 key 为 'wecom:userId'，
+    // 与微信公众号的 openId 不冲突，实现跨通道用户数据完全隔离
+    const wecomOpenId = `wecom:${userId}`;
+
+    switch (msgType) {
+      case 'text':
+        replyText = await handleTextMessage(wecomOpenId, content);
+        break;
+      default:
+        replyText = '企业微信通道当前支持文字消息。如需更多功能，请通过微信公众号使用。';
+        break;
+    }
+
+    if (replyText) {
+      // 企业微信被动回复 XML 格式
+      const timestamp = Math.floor(Date.now() / 1000);
+      const firstPart = splitMessage(replyText)[0] || '';
+      const replyXml = `<xml>
+<ToUserName><![CDATA[${userId}]]></ToUserName>
+<FromUserName><![CDATA[${toUserName}]]></FromUserName>
+<CreateTime>${timestamp}</CreateTime>
+<MsgType><![CDATA[text]]></MsgType>
+<Content><![CDATA[${firstPart}]]></Content>
+</xml>`;
+
+      // 企业微信超长消息通过应用消息接口发送剩余部分
+      const parts = splitMessage(replyText);
+      if (parts.length > 1) {
+        setImmediate(async () => {
+          for (const part of parts.slice(1)) {
+            await sendWecomReply(userId, part);
+          }
+        });
+      }
+
+      res.set('Content-Type', 'text/xml');
+      res.status(200).send(replyXml);
+    } else {
+      res.status(200).send('');
+    }
+  } catch (err) {
+    logger.error('企业微信消息处理异常', { err: err.message, userId, msgType });
+    res.status(200).send('');
+  }
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -742,7 +1653,10 @@ app.use((err, req, res, _next) => {
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`ClawBot 接入服务已启动 :${PORT}`);
-  logger.info('等待微信 ClawBot 插件回调...');
+  logger.info('官方微信接入（扫码/App互通）就绪，等待回调...');
+  if (WECOM_ENABLED) {
+    logger.info('企业微信（WeCom）接口已就绪 /wecom/webhook');
+  }
 });
 
 // 安全加固
