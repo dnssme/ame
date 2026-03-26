@@ -1,8 +1,17 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.12
+ * Anima 灵枢 · Webhook 服务 v5.13
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.13 相对于 v5.12）：
+ *
+ *   #FIX-5.13-1  /billing/record 免费模型路径返回真实余额
+ *                原：免费模型成功响应硬编码 balance_fen:0，导致前端
+ *                在用户使用免费模型后将余额显示为 0（即使用户已充值）。
+ *                修：复用暂停检查查询同时获取 balance_fen，所有免费路径
+ *                响应（成功、幂等冲突、403暂停、429限额）均返回真实余额，
+ *                与 FIX-5.12-2（/billing/check）保持一致。
+ *
  * 修复记录（v5.12 相对于 v5.11）：
  *
  *   #FIX-5.12-1  免费模型路径新增用户暂停检查
@@ -979,13 +988,19 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     // ── 免费模型路径 ──────────────────────────────────────
     if (isFree) {
       // FIX-5.12-1: 免费模型也需检查用户暂停状态
+      // FIX-5.13-1: 同时获取 balance_fen，确保所有响应返回真实余额
       const suspendCheck = await client.query(
-        'SELECT is_suspended FROM user_billing WHERE user_email=$1',
+        'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
         [userEmail]
       );
+      const freeBalance = suspendCheck.rows.length > 0 ? Number(suspendCheck.rows[0].balance_fen) : 0;
+
       if (suspendCheck.rows.length > 0 && suspendCheck.rows[0].is_suspended) {
         await safeRollback(client, '/billing/record free model suspended');
-        return res.status(403).json({ success: false, msg: '账户已被暂停' });
+        return res.status(403).json({
+          success: false, msg: '账户已被暂停',
+          balance_fen: freeBalance, is_suspended: true,
+        });
       }
 
       const dailyCheck = await incrFreeDailyUsage(userEmail);
@@ -995,6 +1010,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
           success: false, is_free: true,
           msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
           daily_used: dailyCheck.used - 1, daily_limit: dailyCheck.limit,
+          balance_fen: freeBalance, is_suspended: false,
         });
       }
 
@@ -1019,7 +1035,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
             success:     true,
             is_free:     true,
             charged_fen: 0,
-            balance_fen: 0,
+            balance_fen: freeBalance,
             idempotent:  true,
             daily_used:  Math.max(0, dailyCheck.used - 1),
             daily_limit: dailyCheck.limit,
@@ -1038,7 +1054,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         success:     true,
         is_free:     true,
         charged_fen: 0,
-        balance_fen: 0,
+        balance_fen: freeBalance,
         daily_used:  dailyCheck.used,
         daily_limit: dailyCheck.limit,
       });
