@@ -611,6 +611,7 @@ async function sendAsyncVoiceReply(openId, voiceMediaId) {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
 const MAX_TEXT_LENGTH = 10000;
+const MAX_TTS_TEXT_LENGTH = 500;
 
 function stripControlChars(str) {
   return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
@@ -818,7 +819,7 @@ async function handleVoiceMessage(openId, mediaId, recognition) {
     if (VOICE_ENABLED) {
       setImmediate(async () => {
         try {
-          const ttsBuffer = await synthesizeSpeech(reply.substring(0, 500));
+          const ttsBuffer = await synthesizeSpeech(reply.substring(0, MAX_TTS_TEXT_LENGTH));
           if (ttsBuffer) {
             const voiceMediaId = await uploadVoiceMedia(ttsBuffer);
             if (voiceMediaId) {
@@ -869,7 +870,7 @@ async function handleVoiceMessage(openId, mediaId, recognition) {
       await sendAsyncReply(openId, `🎙 语音识别：${text}\n\n${reply}`);
 
       // 4. 可选 TTS 语音回复
-      const ttsBuffer = await synthesizeSpeech(reply.substring(0, 500));
+      const ttsBuffer = await synthesizeSpeech(reply.substring(0, MAX_TTS_TEXT_LENGTH));
       if (ttsBuffer) {
         const voiceMediaId = await uploadVoiceMedia(ttsBuffer);
         if (voiceMediaId) {
@@ -906,10 +907,20 @@ async function handleImageMessage(openId, picUrl, mediaId) {
   // 异步处理图片分析
   setImmediate(async () => {
     try {
-      // 通过 Agent 分析图片（使用图片 URL 或下载后描述）
-      const imageContext = picUrl
-        ? `用户发送了一张图片，图片URL：${picUrl}。请分析这张图片的内容。`
-        : '用户发送了一张图片，请提供可能的分析帮助。';
+      let imageContext;
+      if (picUrl) {
+        imageContext = `用户发送了一张图片，图片URL：${picUrl}。请分析这张图片的内容。`;
+      } else if (mediaId) {
+        // picUrl 不可用时通过 mediaId 下载图片
+        const media = await downloadMedia(mediaId);
+        if (media) {
+          imageContext = `用户发送了一张图片（已通过媒体接口获取，格式：${media.contentType}）。请提供图片分析帮助。`;
+        } else {
+          imageContext = '用户发送了一张图片，但下载失败。请提供可能的分析帮助。';
+        }
+      } else {
+        imageContext = '用户发送了一张图片，请提供可能的分析帮助。';
+      }
 
       const reply = await callAgent(openId, imageContext);
       await sendAsyncReply(openId, `🖼 图片分析结果：\n\n${reply}`);
@@ -941,7 +952,18 @@ async function handleFileMessage(openId, mediaId, fileName) {
   // 异步处理文件分析
   setImmediate(async () => {
     try {
-      const reply = await callAgent(openId, `用户发送了一个文件（${fileDesc}），请提供分析帮助。如需详细分析文件内容，建议通过 Web 界面上传。`);
+      // 尝试下载文件获取更多信息（大文件可能下载失败，回退到元数据分析）
+      let fileContext = `用户发送了一个文件（${fileDesc}）。`;
+      if (mediaId) {
+        const media = await downloadMedia(mediaId);
+        if (media) {
+          const sizeKB = (media.buffer.length / 1024).toFixed(1);
+          fileContext += `\n文件大小：${sizeKB}KB，格式：${media.contentType}。`;
+        }
+      }
+      fileContext += '\n请提供分析帮助。如需详细分析文件内容，建议通过 Web 界面上传。';
+
+      const reply = await callAgent(openId, fileContext);
       await sendAsyncReply(openId, `📎 文件分析：\n\n${reply}`);
     } catch (err) {
       logger.error('文件分析失败', { err: err.message, openId });
