@@ -1781,36 +1781,47 @@ app.put('/admin/users/:email/unsuspend', adminLimiter, requireAdmin, async (req,
 
 // ── FIX-5.15-4: 充值卡管理 ───────────────────────────────────
 
+const MAX_CREDIT_FEN          = 10_000_000; // 单张卡密最大面额（分），与 admin/adjust 上限一致
+const MAX_CARDS_PER_REQUEST   = 100;        // 单次批量创建卡密上限
+
 app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
   let { creditFen, label, count } = req.body ?? {};
 
   if (typeof creditFen !== 'number' || !Number.isInteger(creditFen) || creditFen <= 0) {
     return res.status(400).json({ success: false, msg: 'creditFen 必须为正整数（单位：分）' });
   }
-  if (creditFen > 10_000_000) {
-    return res.status(400).json({ success: false, msg: 'creditFen 不能超过 10,000,000 分（¥100,000）' });
+  if (creditFen > MAX_CREDIT_FEN) {
+    return res.status(400).json({ success: false, msg: `creditFen 不能超过 ${MAX_CREDIT_FEN.toLocaleString()} 分（¥${(MAX_CREDIT_FEN / 100).toLocaleString()}）` });
   }
   if (label != null && (typeof label !== 'string' || label.length > 128)) {
     return res.status(400).json({ success: false, msg: 'label 长度不能超过 128 字符' });
   }
 
-  const cardCount = (typeof count === 'number' && Number.isInteger(count) && count >= 1 && count <= 100)
+  const cardCount = (typeof count === 'number' && Number.isInteger(count) && count >= 1 && count <= MAX_CARDS_PER_REQUEST)
     ? count : 1;
 
   try {
-    const cards = [];
+    // 批量 INSERT：一条 SQL 插入所有卡密，避免循环中多次 DB 往返
+    const keys = [];
+    const valuePlaceholders = [];
+    const params = [];
+    const labelVal = label || null;
     for (let i = 0; i < cardCount; i++) {
       const cardKey = crypto.randomBytes(16).toString('hex').toUpperCase();
-      const result = await db.query(
-        `INSERT INTO recharge_cards (key, credit_fen, label)
-           VALUES ($1, $2, $3)
-           RETURNING id, key, credit_fen, label, created_at`,
-        [cardKey, creditFen, label || null]
-      );
-      cards.push(result.rows[0]);
+      keys.push(cardKey);
+      const base = i * 3;
+      valuePlaceholders.push(`($${base + 1}, $${base + 2}, $${base + 3})`);
+      params.push(cardKey, creditFen, labelVal);
     }
+    const result = await db.query(
+      `INSERT INTO recharge_cards (key, credit_fen, label)
+         VALUES ${valuePlaceholders.join(', ')}
+         RETURNING id, key, credit_fen, label, created_at`,
+      params
+    );
+
     logger.info('Recharge cards created', { count: cardCount, creditFen, label });
-    res.json({ success: true, cards });
+    res.json({ success: true, cards: result.rows });
   } catch (err) {
     logger.error('Card creation error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
