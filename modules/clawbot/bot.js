@@ -917,6 +917,14 @@ function stripControlChars(str) {
   return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }
 
+// ─── 菜单事件映射（微信公众号自定义菜单 CLICK 事件）──────────
+const MENU_HANDLERS = {
+  'MENU_HELP': '/help',
+  'MENU_BALANCE': '/balance',
+  'MENU_STATUS': '/status',
+  'MENU_CLEAR': '/clear',
+};
+
 // ─── 消息处理核心 ────────────────────────────────────────────
 
 /**
@@ -1438,10 +1446,11 @@ function requireServiceToken(req, res, next) {
   }
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  const expected = Buffer.from(SERVICE_TOKEN, 'utf8');
-  const provided = Buffer.from(token, 'utf8');
-  if (expected.length !== provided.length ||
-      !crypto.timingSafeEqual(expected, provided)) {
+  // 使用 HMAC 归一化为等长摘要，避免长度差异导致的时序泄漏
+  const hmacKey = Buffer.from('clawbot-auth', 'utf8');
+  const expected = crypto.createHmac('sha256', hmacKey).update(SERVICE_TOKEN).digest();
+  const provided = crypto.createHmac('sha256', hmacKey).update(token).digest();
+  if (!crypto.timingSafeEqual(expected, provided)) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
@@ -1652,13 +1661,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         } else if (eventType === 'CLICK') {
           // 菜单点击事件
           logger.info('用户点击菜单', { openId, eventKey });
-          const menuHandlers = {
-            'MENU_HELP': '/help',
-            'MENU_BALANCE': '/balance',
-            'MENU_STATUS': '/status',
-            'MENU_CLEAR': '/clear',
-          };
-          const cmd = menuHandlers[eventKey];
+          const cmd = MENU_HANDLERS[eventKey];
           if (cmd) {
             replyText = await handleTextMessage(openId, cmd);
           } else {
@@ -1908,7 +1911,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`ClawBot 接入服务 v1.1 已启动 :${PORT}`);
+  logger.info(`ClawBot 接入服务 v1.1 已启动，端口 ${PORT}`);
   logger.info('官方微信接入（扫码/App互通）就绪，等待回调...');
   if (WECOM_ENABLED) {
     logger.info('企业微信（WeCom）接口已就绪 /wecom/webhook');
@@ -1927,6 +1930,8 @@ server.maxRequestsPerSocket = 256;
 server.maxConnections = 1024;
 
 // ─── 优雅退出 ────────────────────────────────────────────────
+const SHUTDOWN_TIMEOUT_MS = GRACEFUL_SHUTDOWN_TIMEOUT * 1000;
+
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭（超时 ${GRACEFUL_SHUTDOWN_TIMEOUT}s）...`);
   clearInterval(sessionCleanupTimer);
@@ -1940,13 +1945,13 @@ const shutdown = (signal) => {
   // 优雅关闭超时后强制终止未完成连接
   setTimeout(() => {
     server.closeAllConnections();
-  }, (GRACEFUL_SHUTDOWN_TIMEOUT * 1000) / 2);
+  }, SHUTDOWN_TIMEOUT_MS / 2);
 
   // 强制退出兜底
   setTimeout(() => {
     if (redis) redis.disconnect();
     process.exit(1);
-  }, GRACEFUL_SHUTDOWN_TIMEOUT * 1000);
+  }, SHUTDOWN_TIMEOUT_MS);
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
