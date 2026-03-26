@@ -2446,6 +2446,7 @@ if (process.env.NODE_ENV !== 'production') {
 // FIX-5.25-1: PCI-DSS 2.1——ADMIN_TOKEN 与 SERVICE_TOKEN 不得相同，防止凭据复用
 if (ADMIN_TOKEN && SERVICE_TOKEN && ADMIN_TOKEN === SERVICE_TOKEN) {
   logger.error('ADMIN_TOKEN 与 SERVICE_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
+  process.exit(1);
 }
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
@@ -2483,10 +2484,9 @@ server.requestTimeout    = 30_000;
 server.maxHeadersCount   = 50;
 
 // FIX-5.25-1: CIS 进程管理——优雅关闭超时可配置，便于 K8s terminationGracePeriodSeconds 对齐
-const GRACEFUL_SHUTDOWN_TIMEOUT = Math.max(5000, Math.min(
-  parseInt(process.env.GRACEFUL_SHUTDOWN_TIMEOUT || '10000', 10) || 10000,
-  60000
-));
+// 有效范围 5-60 秒，默认 10 秒
+const GRACEFUL_SHUTDOWN_TIMEOUT_RAW = parseInt(process.env.GRACEFUL_SHUTDOWN_TIMEOUT || '10000', 10) || 10000;
+const GRACEFUL_SHUTDOWN_TIMEOUT = Math.max(5000, Math.min(GRACEFUL_SHUTDOWN_TIMEOUT_RAW, 60000));
 
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在优雅关闭...`);
