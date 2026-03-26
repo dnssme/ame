@@ -4,4 +4,5 @@ COPY package*.json ./
 RUN npm install --omit=dev && npm cache clean --force
 COPY processor.js ./
 USER node
+EXPOSE 3004
 CMD ["node", "processor.js"]
