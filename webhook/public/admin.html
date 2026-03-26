@@ -1160,6 +1160,7 @@ function esc(s) {
 }
 // FIX-5.22-1: PCI-DSS 6.5.7——完整双上下文转义（JS 字符串 + HTML 属性）
 // 防止 &quot; 等 HTML 实体注入突破属性边界
+// 顺序要点：& 必须在 "/</> 之前替换，避免 &quot; → &amp;quot; 双重编码
 function escAttr(s) {
   return String(s)
     .replace(/\\/g, '\\\\')

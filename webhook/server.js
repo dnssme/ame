@@ -1587,7 +1587,7 @@ let adminHtmlCache = null;
 let adminHtmlEtag = null;
 try {
   adminHtmlCache = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
-  adminHtmlEtag = '"' + crypto.createHash('sha256').update(adminHtmlCache).digest('hex').slice(0, 16) + '"';
+  adminHtmlEtag = '"' + crypto.createHash('sha256').update(adminHtmlCache).digest('hex') + '"';
 } catch {
   logger.warn('Admin dashboard HTML not found at startup', { path: ADMIN_HTML_PATH });
 }
