@@ -941,7 +941,7 @@ async function createCards() {
         <textarea readonly rows="${Math.min(cards.length, 10)}" style="width:100%;font-family:monospace;font-size:.85rem;
           background:var(--bg);color:var(--success);border:1px solid var(--border);border-radius:var(--radius);padding:.5rem">${keyList}</textarea>
         <p style="margin-top:.5rem;font-size:.78rem;color:var(--text3)">共 ${cards.length} 张，点击复制按钮即可复制全部卡密</p>`,
-        `<button class="btn btn-outline" onclick="copyText(\`${keyList.replace(/`/g, '\\`')}\`)">复制全部</button>
+        `<button class="btn btn-outline" onclick="copyText(\`${keyList.replace(/\\/g, '\\\\').replace(/`/g, '\\`')}\`)">复制全部</button>
          <button class="btn btn-primary" onclick="closeModal()">关闭</button>`);
     }
     loadCards();
@@ -1042,7 +1042,7 @@ function esc(s) {
   return d.innerHTML;
 }
 function escAttr(s) {
-  return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 function num(n) { return n != null ? Number(n).toFixed(4) : '—'; }
 function fmtTime(t) {
