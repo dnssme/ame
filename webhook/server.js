@@ -1532,10 +1532,11 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: `type 必须是 ${validTypes.join('/')} 之一` });
   }
   // FIX-5.12-4: recharge/refund 类型强制正数，避免产生语义矛盾的审计流水
-  if ((type === 'recharge' || type === 'refund') && amount_fen < 0) {
+  // 注：amount_fen === 0 已被上方校验拦截，此处 <= 0 为防御性兜底
+  if ((type === 'recharge' || type === 'refund') && amount_fen <= 0) {
     return res.status(400).json({
       success: false,
-      msg: `${type} 类型的 amount_fen 必须为正数（如需扣减请使用 admin_adjust 类型）`,
+      msg: `${type} 类型的 amount_fen 必须为正数（如需扣减请使用 admin_adjust 类型并传入负数）`,
     });
   }
   if (description != null && (typeof description !== 'string' || description.length > 500)) {
