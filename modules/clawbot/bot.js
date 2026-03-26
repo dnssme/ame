@@ -798,6 +798,7 @@ async function sendAsyncVoiceReply(openId, voiceMediaId) {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
 const MAX_TEXT_LENGTH = 10000;
+// TTS 文本上限：防止合成超时和音频过大（Coqui TTS 对超长文本性能下降）
 const MAX_TTS_TEXT_LENGTH = 500;
 
 function stripControlChars(str) {
@@ -909,7 +910,7 @@ async function handleTextMessage(openId, rawText) {
         await sendAsyncReply(openId, `🔍 搜索结果：\n\n${reply}`);
       })
       .catch(async (err) => {
-        logger.error('Search task failed', { err: err.message, openId });
+        logger.error('搜索任务失败', { err: err.message, openId });
         await sendAsyncReply(openId, '❌ 搜索失败，请稍后重试。');
       });
     return '🔍 正在搜索，请稍候...';
@@ -1590,8 +1591,10 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
   try {
     let replyText = '';
 
-    // 企业微信消息处理：复用核心处理逻辑
-    // 但使用 WeCom 独立的 Redis 键空间，通过 userId 前缀 'wecom:' 区分
+    // 企业微信消息处理：复用核心处理逻辑（handleTextMessage 等）
+    // 'wecom:' 前缀确保 Redis 键空间隔离——核心处理函数使用完整 wecomOpenId
+    // 作为 Redis hash field，因此 anima:clawbot:emails 中的 key 为 'wecom:userId'，
+    // 与微信公众号的 openId 不冲突，实现跨通道用户数据完全隔离
     const wecomOpenId = `wecom:${userId}`;
 
     switch (msgType) {
