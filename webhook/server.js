@@ -13,8 +13,8 @@
  *                  （仅显示前4后4），杜绝网络层/日志泄露全量密钥（PCI-DSS 3.4）。
  *                - modules.yml 解析改用 yaml.load 的 FAILSAFE_SCHEMA，
  *                  阻断 YAML 反序列化攻击向量（CIS 输入校验）。
- *                - 启动时校验关键环境变量（PG_PASSWORD、ADMIN_TOKEN、
- *                  SERVICE_TOKEN），缺失则 warn 并 fail-closed。
+ *                - 启动时校验关键环境变量（PG_PASSWORD），
+ *                  缺失则 warn（数据库连接失败时自动 fail-closed）。
  *                - 管理员写操作新增结构化审计日志（action/target/actor_ip），
  *                  满足 PCI-DSS 10.2 审计追踪要求。
  *                - 前端卡密「点击显示」5 秒后自动重新掩码（PCI-DSS 3.4）。
@@ -660,15 +660,16 @@ const MAX_TOKEN_VALUE = 10_000_000;
 // FIX-5.21-1: SSRF 防护——校验 URL 禁止内网/保留地址
 // PCI-DSS 1.3.x 网络安全要求：不允许从 DMZ 访问内网资源
 const PRIVATE_IP_RE = /^(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|0\.0\.0\.0)$/;
+const PRIVATE_IPV6_RE = /^(\[?)(::1|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe[89ab][0-9a-f]:)/i;
 function isValidBaseUrl(urlStr) {
   if (typeof urlStr !== 'string') return false;
   let parsed;
   try { parsed = new URL(urlStr); } catch { return false; }
-  // CIS: 生产环境仅允许 HTTPS
+  // 生产环境允许 HTTP/HTTPS（部分内部 provider 仍使用 HTTP）
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
   const host = parsed.hostname.toLowerCase();
-  // 阻断 localhost / IPv6 loopback / 内网保留 IP
-  if (host === 'localhost' || host === '[::1]' || PRIVATE_IP_RE.test(host)) return false;
+  // 阻断 localhost / IPv4 内网保留 IP / IPv6 loopback 与私有地址
+  if (host === 'localhost' || host === '[::1]' || PRIVATE_IP_RE.test(host) || PRIVATE_IPV6_RE.test(host)) return false;
   return true;
 }
 
