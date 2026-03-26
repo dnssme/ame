@@ -1,8 +1,36 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.14
+ * Anima 灵枢 · Webhook 服务 v5.15
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.15 相对于 v5.14）：
+ *
+ *   #FIX-5.15-1  /activate 卡密无效/已使用时返回 HTTP 403 而非 200
+ *                原：卡密无效或已使用时返回 HTTP 200 + success:false，
+ *                与其他所有拒绝响应（均使用 4xx 状态码）不一致，
+ *                导致前端无法通过 HTTP 状态码统一处理失败场景。
+ *                修：改为 res.status(403).json(...)。
+ *
+ *   #FIX-5.15-2  /billing/check 付费模型 402（安全上限）补齐 balance_fen
+ *                和 is_suspended 字段
+ *                原：FIX-5.14-2 补齐了 can_proceed 和 is_free，但仍缺少
+ *                balance_fen/is_suspended，与 /billing/record 402 不一致。
+ *                修：将用户余额查询移至安全上限检查之前，402 响应补齐
+ *                balance_fen 和 is_suspended 字段。
+ *
+ *   #FIX-5.15-3  新增管理员用户管理端点
+ *                商用系统缺少用户管理能力，管理员无法通过 API 暂停/
+ *                恢复用户或查看用户列表，需直接操作数据库。
+ *                新增：GET /admin/users（分页列表）、
+ *                PUT /admin/users/:email/suspend（暂停）、
+ *                PUT /admin/users/:email/unsuspend（恢复）。
+ *
+ *   #FIX-5.15-4  新增管理员充值卡管理端点
+ *                商用系统缺少卡密管理能力，管理员无法通过 API 生成
+ *                或查看充值卡，需直接操作数据库。
+ *                新增：POST /admin/cards（创建卡密）、
+ *                GET /admin/cards（分页列表）。
+ *
  * 修复记录（v5.14 相对于 v5.13）：
  *
  *   #FIX-5.14-1  /billing/record 付费模型路径所有拒绝响应补齐字段
@@ -647,9 +675,10 @@ app.post('/activate', activateLimiter, async (req, res) => {
         FOR UPDATE`,
       [cardKey]
     );
+    // FIX-5.15-1: 卡密无效/已使用返回 HTTP 403（原为 200，与其他拒绝响应不一致）
     if (cardRes.rows.length === 0) {
       await safeRollback(client, '/activate card lookup');
-      return res.json({ success: false, msg: '卡密无效或已使用' });
+      return res.status(403).json({ success: false, msg: '卡密无效或已使用' });
     }
 
     const card = cardRes.rows[0];
@@ -857,6 +886,24 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
     promptTokens: promptTk, historyTokens: historyTk,
   });
 
+  // FIX-5.15-2: 将用户余额查询移至安全上限检查之前，确保 402 响应也包含
+  //   balance_fen 和 is_suspended，与 /billing/record 402 响应格式对齐
+  let balance     = 0;
+  let isSuspended = false;
+  try {
+    const balRes = await db.query(
+      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
+      [userEmail]
+    );
+    if (balRes.rows.length > 0) {
+      balance     = Number(balRes.rows[0].balance_fen);
+      isSuspended = balRes.rows[0].is_suspended;
+    }
+  } catch (err) {
+    logger.error('Billing check error', { err: err.message, userEmail });
+    return res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+
   const MAX_SINGLE_REQUEST_FEN = getMaxSingleRequestFen();
   if (estimatedFen > MAX_SINGLE_REQUEST_FEN) {
     return res.status(402).json({
@@ -866,30 +913,19 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
       msg:           '预估费用超过单次安全上限，请新建对话或减少上下文。',
       estimated_fen: estimatedFen,
       limit_fen:     MAX_SINGLE_REQUEST_FEN,
-    });
-  }
-
-  try {
-    const balRes = await db.query(
-      'SELECT balance_fen, is_suspended FROM user_billing WHERE user_email=$1',
-      [userEmail]
-    );
-    const userExists  = balRes.rows.length > 0;
-    const balance     = userExists ? Number(balRes.rows[0].balance_fen) : 0;
-    const isSuspended = userExists ? balRes.rows[0].is_suspended : false;
-
-    res.json({
-      success:       true,
-      can_proceed:   !isSuspended && balance >= estimatedFen,
-      is_free:       false,
-      estimated_fen: estimatedFen,
       balance_fen:   balance,
       is_suspended:  isSuspended,
     });
-  } catch (err) {
-    logger.error('Billing check error', { err: err.message, userEmail });
-    res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
+
+  res.json({
+    success:       true,
+    can_proceed:   !isSuspended && balance >= estimatedFen,
+    is_free:       false,
+    estimated_fen: estimatedFen,
+    balance_fen:   balance,
+    is_suspended:  isSuspended,
+  });
 });
 
 // ─── 计费记录（内部服务专用）──────────────────────────────────
@@ -1670,6 +1706,146 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
     client.release();
+  }
+});
+
+// ── FIX-5.15-3: 用户管理 ─────────────────────────────────────
+
+app.get('/admin/users', adminLimiter, requireAdmin, async (req, res) => {
+  const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20, 1), 100);
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+
+  try {
+    const [result, countRes] = await Promise.all([
+      db.query(
+        `SELECT user_email, balance_fen, total_charged_fen, is_suspended, created_at, updated_at
+           FROM user_billing
+          ORDER BY created_at DESC
+          LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      ),
+      db.query('SELECT COUNT(*) AS total FROM user_billing'),
+    ]);
+    res.json({ success: true, users: result.rows, total: Number(countRes.rows[0]?.total ?? 0) });
+  } catch (err) {
+    logger.error('Admin users query error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+app.put('/admin/users/:email/suspend', adminLimiter, requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE user_billing SET is_suspended = true WHERE user_email = $1
+       RETURNING user_email, balance_fen, is_suspended`,
+      [email]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, msg: '用户不存在' });
+    }
+    logger.info('User suspended', { email });
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    logger.error('User suspend error', { err: err.message, email });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+app.put('/admin/users/:email/unsuspend', adminLimiter, requireAdmin, async (req, res) => {
+  const email = normalizeEmail(req.params.email);
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE user_billing SET is_suspended = false WHERE user_email = $1
+       RETURNING user_email, balance_fen, is_suspended`,
+      [email]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, msg: '用户不存在' });
+    }
+    logger.info('User unsuspended', { email });
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    logger.error('User unsuspend error', { err: err.message, email });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+// ── FIX-5.15-4: 充值卡管理 ───────────────────────────────────
+
+app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
+  let { creditFen, label, count } = req.body ?? {};
+
+  if (typeof creditFen !== 'number' || !Number.isInteger(creditFen) || creditFen <= 0) {
+    return res.status(400).json({ success: false, msg: 'creditFen 必须为正整数（单位：分）' });
+  }
+  if (creditFen > 10_000_000) {
+    return res.status(400).json({ success: false, msg: 'creditFen 不能超过 10,000,000 分（¥100,000）' });
+  }
+  if (label != null && (typeof label !== 'string' || label.length > 128)) {
+    return res.status(400).json({ success: false, msg: 'label 长度不能超过 128 字符' });
+  }
+
+  const cardCount = (typeof count === 'number' && Number.isInteger(count) && count >= 1 && count <= 100)
+    ? count : 1;
+
+  try {
+    const cards = [];
+    for (let i = 0; i < cardCount; i++) {
+      const cardKey = crypto.randomBytes(16).toString('hex').toUpperCase();
+      const result = await db.query(
+        `INSERT INTO recharge_cards (key, credit_fen, label)
+           VALUES ($1, $2, $3)
+           RETURNING id, key, credit_fen, label, created_at`,
+        [cardKey, creditFen, label || null]
+      );
+      cards.push(result.rows[0]);
+    }
+    logger.info('Recharge cards created', { count: cardCount, creditFen, label });
+    res.json({ success: true, cards });
+  } catch (err) {
+    logger.error('Card creation error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
+  }
+});
+
+app.get('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
+  const limit  = Math.min(Math.max(parseInt(req.query.limit  || '20', 10) || 20, 1), 100);
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+  const usedFilter = req.query.used;  // 'true', 'false', or undefined (all)
+
+  try {
+    let whereClause = '';
+    const params = [limit, offset];
+    if (usedFilter === 'true') {
+      whereClause = 'WHERE used = true';
+    } else if (usedFilter === 'false') {
+      whereClause = 'WHERE used = false';
+    }
+
+    const [result, countRes] = await Promise.all([
+      db.query(
+        `SELECT id, key, credit_fen, label, used, used_at, used_by, created_at
+           FROM recharge_cards
+          ${whereClause}
+          ORDER BY created_at DESC
+          LIMIT $1 OFFSET $2`,
+        params
+      ),
+      db.query(`SELECT COUNT(*) AS total FROM recharge_cards ${whereClause}`),
+    ]);
+    res.json({ success: true, cards: result.rows, total: Number(countRes.rows[0]?.total ?? 0) });
+  } catch (err) {
+    logger.error('Admin cards query error', { err: err.message });
+    res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
 
