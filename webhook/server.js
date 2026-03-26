@@ -755,7 +755,7 @@ const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
 const API_PROVIDER_RE = /^[a-zA-Z0-9._-]+$/;
 // FIX-5.24-1: modelName 字符集校验——仅允许字母、数字、连字符、下划线、点、冒号、斜杠
 // 模型名称含 provider:model 或 org/model 命名惯例（如 openai/gpt-4、claude-3:opus）
-const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/\-]+$/;
+const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
 
 function isValidEmail(email) {
   return typeof email === 'string' && email.length <= MAX_EMAIL_LEN && EMAIL_RE.test(email);
@@ -2406,7 +2406,7 @@ if (!process.env.PG_PASSWORD) {
 }
 // FIX-5.24-1: CIS Node.js 安全基线——生产环境必须设置 NODE_ENV=production
 if (process.env.NODE_ENV !== 'production') {
-  logger.warn('NODE_ENV 未设置为 production，生产环境请确保设置 NODE_ENV=production（CIS 安全基线）');
+  logger.warn(`NODE_ENV 当前为 "${process.env.NODE_ENV || 'undefined'}"，生产环境请确保设置 NODE_ENV=production（CIS 安全基线）`);
 }
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
