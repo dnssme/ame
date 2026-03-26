@@ -125,7 +125,9 @@ const INCR_EXPIRE_LUA =
   'if ttl == -1 then redis.call("EXPIRE", key, 86400) end\n' +
   'local c = tonumber(redis.call("GET", key) or "0")\n' +
   // FIX-5.10-2: >= limit（原为 > limit，在 c=limit 时会多做一次 INCR）
-  // FIX-5.11-1: 返回 limit+1（原返回 c=limit，导致 count<=limit 恒真，免费限额无效）
+  // FIX-5.11-1: 返回 limit+1 作为"已达限额"哨兵值，使调用方
+  //   count <= FREE_DAILY_LIMIT（即 limit+1 <= limit = false）正确触发拒绝。
+  //   原返回 c（= limit），导致 count <= limit 恒真，免费限额无效。
   'if c >= limit then return limit + 1 end\n' +
   'local new_c = redis.call("INCR", key)\n' +
   // 首次写入：设置 24h TTL（北京时间日期前缀确保次日自然重置）
@@ -1093,6 +1095,10 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
           String(usageId),
         ]
       );
+    } else {
+      logger.warn('付费模型 chargedFen=0，跳过流水记录（请检查模型定价配置，考虑标记为 is_free）', {
+        userEmail, modelName, inputTokens, outputTokens, priceIn, priceOut,
+      });
     }
 
     await client.query('COMMIT');
