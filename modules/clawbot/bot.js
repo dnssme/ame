@@ -450,10 +450,18 @@ const WECOM_AGENT_ID  = process.env.WECOM_AGENT_ID || '';
 const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || '';
 // OAuth scope：snsapi_base（静默授权）或 snsapi_userinfo（显式授权获取昵称头像）
 const OAUTH_SCOPE = process.env.OAUTH_SCOPE || 'snsapi_userinfo';
-// OAuth state 有效期（秒，默认 300 即 5 分钟）
-const OAUTH_STATE_TTL = Math.max(60, Math.min(600, parseInt(process.env.OAUTH_STATE_TTL || '300', 10)));
+// OAuth state 有效期（秒）
+const MIN_OAUTH_STATE_TTL = 60;
+const MAX_OAUTH_STATE_TTL = 600;
+const OAUTH_STATE_TTL = Math.max(MIN_OAUTH_STATE_TTL, Math.min(MAX_OAUTH_STATE_TTL, parseInt(process.env.OAUTH_STATE_TTL || '300', 10)));
+// OAuth state 长度（randomBytes(16) → 32 hex 字符）
+const OAUTH_STATE_BYTES = 16;
+const OAUTH_STATE_HEX_LEN = OAUTH_STATE_BYTES * 2;
+const OAUTH_STATE_RE = new RegExp(`^[a-f0-9]{${OAUTH_STATE_HEX_LEN}}$`);
 // OAuth CSRF state Redis 键前缀
 const REDIS_OAUTH_STATE_PREFIX = 'anima:clawbot:oauth_state:';
+// 日志截断长度
+const MAX_LOG_DATA_LENGTH = 200;
 
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
@@ -3540,7 +3548,7 @@ app.get('/clawbot/oauth', async (req, res) => {
 
   try {
     // 生成 CSRF state（PCI-DSS 6.5 防跨站请求伪造）
-    const state = crypto.randomBytes(16).toString('hex');
+    const state = crypto.randomBytes(OAUTH_STATE_BYTES).toString('hex');
     if (redis) {
       await redis.set(
         `${REDIS_OAUTH_STATE_PREFIX}${state}`,
@@ -3588,7 +3596,7 @@ app.get('/clawbot/oauth/callback', async (req, res) => {
   }
 
   // State 格式校验（防止注入）
-  if (!/^[a-f0-9]{32}$/.test(state)) {
+  if (!OAUTH_STATE_RE.test(state)) {
     res.status(400).json({ error: 'Invalid state format' });
     return;
   }
@@ -3630,7 +3638,7 @@ app.get('/clawbot/oauth/callback', async (req, res) => {
 
     const { openid, access_token: oauthAccessToken, scope: grantedScope } = tokenData;
     if (!openid) {
-      logger.error('OAuth 未返回 openid', { tokenData: JSON.stringify(tokenData).substring(0, 200) });
+      logger.error('OAuth 未返回 openid', { tokenData: JSON.stringify(tokenData).substring(0, MAX_LOG_DATA_LENGTH) });
       res.status(502).json({ error: 'No openid returned' });
       return;
     }
