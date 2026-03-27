@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.4
+# 微信 ClawBot 插件灵枢接入通道 v1.5
 
 ## 概述
 
@@ -11,6 +11,13 @@
 
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
+
+## v1.5 新特性
+
+- **Billing API 请求追踪贯通**：queryBalance 传递 X-Request-ID，实现全链路端到端请求追踪（企业级运维）
+- **Content-Type 强制校验**：管理端点 POST/PUT/PATCH 强制 application/json，拒绝其他类型（CIS 安全加固）
+- **Redis 启动连通性检查**：启动时 PING Redis 验证连接，确保认证/隔离基础设施就绪（企业级可靠性）
+- **结构化审计日志**：认证操作（bind/unbind/auth_check_fail/unsubscribe_cleanup）使用统一 audit 事件格式（PCI-DSS 10.2 增强）
 
 ## v1.4 新特性
 
@@ -61,10 +68,13 @@
 - **消息去重**：Redis msgId 去重防止重复消息处理
 - **取关数据清理**：用户取消关注时自动清除所有个人数据
 - **OpenID 格式校验**：拒绝畸形用户标识（PCI-DSS 6.5 输入验证）
+- **Content-Type 强制校验**：管理端点 POST/PUT/PATCH 强制 application/json（CIS）
+- **结构化审计日志**：认证操作统一 audit 事件格式（PCI-DSS 10.2）
 - 管理端点 SERVICE_TOKEN Bearer 认证保护
 - 管理端点速率限制（30/min，CIS）
 - 速率限制（验证端点 10/min，消息端点 300/min）
-- X-Request-ID 请求追踪（日志关联 + Agent API 贯通）
+- X-Request-ID 请求追踪（日志关联 + Agent API + Billing API 全链路贯通）
+- Redis 启动连通性检查（确认基础设施就绪）
 - 访问日志中间件（PCI-DSS 10.2）
 - 输入验证与控制字符过滤
 - 生产环境 NODE_TLS_REJECT_UNAUTHORIZED=0 拒绝启动（PCI-DSS 4.1）

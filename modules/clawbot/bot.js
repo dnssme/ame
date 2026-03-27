@@ -1,10 +1,33 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.4
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.5
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.5 相对于 v1.4）：
+ *
+ *   #ENT-1.5-1  Billing API 请求追踪贯通（企业级运维）
+ *               - queryBalance 传递 X-Request-ID，实现全链路
+ *                 端到端请求追踪（v1.4 仅 Agent API 传递）。
+ *
+ *   #ENT-1.5-2  管理端点 Content-Type 强制校验（CIS）
+ *               - POST/PUT/PATCH 到管理端点时，强制要求
+ *                 Content-Type: application/json，拒绝其他类型
+ *                （415 Unsupported Media Type）。与 webhook
+ *                 server.js 安全模式对齐。
+ *
+ *   #ENT-1.5-3  Redis 启动连通性检查（企业级可靠性）
+ *               - 启动时验证 Redis 连接可达，确保认证 / 隔离 /
+ *                 去重 / 速率限制等核心基础设施就绪。连接失败时
+ *                 记录错误日志并继续启动（降级运行）。
+ *
+ *   #ENT-1.5-4  结构化审计日志（PCI-DSS 10.2 增强）
+ *               - 认证相关操作（bind / unbind / auth_check_fail /
+ *                 unsubscribe_cleanup）使用统一 audit 事件格式，
+ *                 包含 action / openId / detail 字段，便于合规
+ *                 审计与 SIEM 集成。
  *
  * 修改记录（v1.4 相对于 v1.3）：
  *
@@ -321,9 +344,17 @@ const redis = REDIS_URL
   : null;
 
 if (redis) {
-  redis.connect().catch((err) => {
-    logger.error('Redis 连接失败（用户认证/绑定将不可用）', { err: err.message });
-  });
+  redis.connect()
+    .then(() => {
+      // 启动连通性检查：PING Redis 确认基础设施就绪
+      return redis.ping();
+    })
+    .then(() => {
+      logger.info('Redis 连接就绪（认证/隔离/去重/速率限制基础设施已确认）');
+    })
+    .catch((err) => {
+      logger.error('Redis 连接失败（用户认证/绑定将不可用）', { err: err.message });
+    });
   redis.on('error', (err) => {
     logger.error('Redis 连接错误', { err: err.message });
   });
@@ -690,12 +721,16 @@ async function callAgent(openId, message, requestId) {
 }
 
 // ─── 余额查询 ──────────────────────────────────────────────
-async function queryBalance(email) {
+async function queryBalance(email, requestId) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), BILLING_REQUEST_TIMEOUT_MS + 5_000);
 
   try {
+    const headers = {};
+    if (requestId) headers['X-Request-ID'] = requestId;
+
     const { body } = await request(`${BILLING_URL}/billing/balance/${encodeURIComponent(email)}`, {
+      headers,
       bodyTimeout: BILLING_REQUEST_TIMEOUT_MS,
       headersTimeout: BILLING_REQUEST_TIMEOUT_MS,
       signal: controller.signal,
@@ -1267,7 +1302,7 @@ async function handleTextMessage(openId, rawText, requestId) {
     }
     await setUserEmail(openId, email);
     await setUserAuthed(openId);
-    logger.info('用户绑定邮箱并完成认证', { openId, email });
+    logger.info('audit', { action: 'bind', openId, detail: `email=${email}` });
     return `✅ 已绑定计费邮箱：${email}\n\n你已通过认证，现在可以使用所有 AI 功能。\n后续对话将归入该账户计费。`;
   }
 
@@ -1275,7 +1310,7 @@ async function handleTextMessage(openId, rawText, requestId) {
   if (text === '/unbind') {
     const email = await getUserEmail(openId);
     await clearUserData(openId);
-    logger.info('用户主动解除绑定', { openId, email: email || 'N/A' });
+    logger.info('audit', { action: 'unbind', openId, detail: `email=${email || 'N/A'}` });
     return '✅ 已解除邮箱绑定并清除所有个人数据。\n\n' +
       '如需继续使用，请重新绑定邮箱：\n/bind 你的邮箱@example.com';
   }
@@ -1308,6 +1343,7 @@ async function handleTextMessage(openId, rawText, requestId) {
   // ── 认证检查（/bind 和 /help 不需要认证）──
   const authed = await isUserAuthed(openId);
   if (!authed) {
+    logger.info('audit', { action: 'auth_check_fail', openId, detail: 'unauthenticated_access_attempt' });
     return '🔒 请先绑定邮箱完成认证后使用。\n\n' +
       '发送：/bind 你的邮箱@example.com\n\n' +
       '绑定后即可使用所有 AI 功能。';
@@ -1319,7 +1355,7 @@ async function handleTextMessage(openId, rawText, requestId) {
     if (!email) {
       return '请先绑定邮箱：/bind yourname@example.com';
     }
-    return await queryBalance(email);
+    return await queryBalance(email, requestId);
   }
 
   // /model [name] — 切换模型
@@ -1838,6 +1874,21 @@ function requireServiceToken(req, res, next) {
 app.use('/clawbot/webhook', express.text({ type: ['text/xml', 'application/xml'], limit: '256kb' }));
 app.use(express.json({ limit: '256kb' }));
 
+// ─── Content-Type 强制校验（CIS 安全加固）──────────────────
+// 管理端点 POST/PUT/PATCH 必须为 application/json，与 webhook server.js 对齐
+// Webhook 端点使用 XML，不受此限制
+app.use((req, res, next) => {
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)
+      && !req.path.startsWith('/clawbot/webhook') && !req.path.startsWith('/wecom/webhook')) {
+    const ct = (req.headers['content-type'] || '').split(';')[0].trim();
+    if (ct !== 'application/json') {
+      res.status(415).json({ error: 'Unsupported Media Type: Content-Type must be application/json' });
+      return;
+    }
+  }
+  next();
+});
+
 // ─── 健康检查 ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const redisOk = redis ? redis.status === 'ready' : true;
@@ -1849,7 +1900,7 @@ app.get('/health', (req, res) => {
 app.get('/stats', adminLimiter, requireServiceToken, (req, res) => {
   const uptimeMs = Date.now() - stats.startedAt;
   res.json({
-    version: '1.4.0',
+    version: '1.5.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -2093,7 +2144,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
             '发送 /help 查看可用命令。';
         } else if (eventType === 'unsubscribe') {
           // 用户取消关注：清除所有用户数据（保证数据安全）
-          logger.info('用户取消关注，清除用户数据', { openId });
+          logger.info('audit', { action: 'unsubscribe_cleanup', openId, detail: 'user_unfollowed' });
           await clearUserData(openId);
         } else if (eventType === 'CLICK') {
           // 菜单点击事件
@@ -2532,7 +2583,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.4 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.5 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
