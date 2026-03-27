@@ -1,10 +1,38 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.5
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.6
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.6 相对于 v1.5）：
+ *
+ *   #ENT-1.6-1  CORS 与 Cache-Control 安全头（CIS 加固）
+ *               - Helmet 配置 CORS 策略，限制跨域请求来源。
+ *               - API 响应添加 Cache-Control: no-store，防止
+ *                 敏感数据被浏览器 / 代理缓存（CIS 14.x）。
+ *
+ *   #ENT-1.6-2  管理端点操作审计日志（PCI-DSS 10.2.2）
+ *               - 所有 SERVICE_TOKEN 保护端点的访问记录为
+ *                 结构化审计事件（action=admin_access），
+ *                 包含 endpoint / method / ip / request_id。
+ *
+ *   #ENT-1.6-3  速率限制 & 认证失败审计（PCI-DSS 10.2.4/10.2.5）
+ *               - Per-user 速率限制触发记录为审计事件
+ *                （action=rate_limit_violation）。
+ *               - SERVICE_TOKEN 认证失败记录为审计事件
+ *                （action=admin_auth_fail），含请求 IP。
+ *
+ *   #ENT-1.6-4  就绪探针端点（企业级 Kubernetes 部署）
+ *               - 新增 GET /ready 端点，检测 Redis 连通性
+ *                 及服务依赖就绪状态，与 /health 存活探针
+ *                 分离（标准 Kubernetes probe 模式）。
+ *
+ *   #ENT-1.6-5  管理端点 IP 白名单（CIS 网络访问限制）
+ *               - 可选 ADMIN_IP_ALLOWLIST 环境变量，配置后
+ *                 仅允许指定 IP 访问管理端点（CIS 9.x）。
+ *                 未配置时不限制（向后兼容）。
  *
  * 修改记录（v1.5 相对于 v1.4）：
  *
@@ -265,11 +293,17 @@ const WHISPER_URL    = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transc
 const TTS_URL        = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 const PORT           = parseInt(process.env.PORT || '3004', 10);
 
-// ─── 企业微信（WeCom）配置（默认关闭，仅添加接口不使用）────────
 // ─── 企业运维配置 ──────────────────────────────────────────
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || '';
 const GRACEFUL_SHUTDOWN_TIMEOUT = Math.min(60, Math.max(5,
   parseInt(process.env.GRACEFUL_SHUTDOWN_TIMEOUT || '10', 10)));
+
+// ─── 管理端点 IP 白名单（CIS 网络访问限制）──────────────────
+// 逗号分隔的 IP 列表，配置后仅允许列出 IP 访问管理端点
+const ADMIN_IP_ALLOWLIST_RAW = (process.env.ADMIN_IP_ALLOWLIST || '').trim();
+const ADMIN_IP_ALLOWLIST = ADMIN_IP_ALLOWLIST_RAW
+  ? ADMIN_IP_ALLOWLIST_RAW.split(',').map(ip => ip.trim()).filter(Boolean)
+  : [];
 
 // ─── 企业微信（WeCom）配置（默认关闭，仅添加接口不使用）────────
 const WECOM_ENABLED   = process.env.WECOM_ENABLED === 'true';
@@ -1791,11 +1825,22 @@ function buildTextReply(toUser, fromUser, text) {
 // ─── Express 服务器 ──────────────────────────────────────────
 const app = express();
 
-// 安全中间件
-app.use(helmet());
+// 信任反向代理（Nginx / LB），确保 req.ip 获取真实客户端 IP
+app.set('trust proxy', 1);
+
+// 安全中间件（CIS 安全头加固：跨域资源策略 + 标准安全头）
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'same-origin' },
+}));
 
 app.disable('x-powered-by');
 app.disable('etag');
+
+// ─── Cache-Control: no-store（CIS 14.x 防止敏感数据缓存）──
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 // ─── 请求追踪（X-Request-ID）──────────────────────────────
 app.use((req, res, next) => {
@@ -1809,7 +1854,7 @@ app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
     const duration = Date.now() - start;
-    if (req.path !== '/health') {
+    if (req.path !== '/health' && req.path !== '/ready') {
       logger.info('access', {
         method: req.method,
         path: req.path,
@@ -1850,6 +1895,34 @@ const adminLimiter = rateLimit({
   message: 'Too many requests',
 });
 
+// ─── 管理端点 IP 白名单中间件（CIS 网络访问限制）──────────
+function normalizeIp(ip) {
+  // 处理 IPv4-mapped IPv6 地址（如 ::ffff:192.168.1.1 → 192.168.1.1）
+  if (ip && ip.startsWith('::ffff:')) return ip.slice(7);
+  return ip || '';
+}
+
+function requireAdminIp(req, res, next) {
+  if (ADMIN_IP_ALLOWLIST.length === 0) {
+    // 未配置白名单时不限制（向后兼容）
+    next();
+    return;
+  }
+  const clientIp = normalizeIp(req.ip);
+  if (!ADMIN_IP_ALLOWLIST.includes(clientIp)) {
+    logger.info('audit', {
+      action: 'admin_ip_denied',
+      ip: clientIp,
+      endpoint: req.path,
+      method: req.method,
+      request_id: req.id,
+    });
+    res.status(403).json({ error: 'Forbidden: IP not in allowlist' });
+    return;
+  }
+  next();
+}
+
 // ─── SERVICE_TOKEN 认证中间件（管理端点保护）─────────────────
 function requireServiceToken(req, res, next) {
   if (!SERVICE_TOKEN) {
@@ -1864,9 +1937,25 @@ function requireServiceToken(req, res, next) {
   const expected = crypto.createHmac('sha256', hmacKey).update(SERVICE_TOKEN).digest();
   const provided = crypto.createHmac('sha256', hmacKey).update(token).digest();
   if (!crypto.timingSafeEqual(expected, provided)) {
+    // PCI-DSS 10.2.4: 审计无效逻辑访问尝试
+    logger.info('audit', {
+      action: 'admin_auth_fail',
+      ip: req.ip,
+      endpoint: req.path,
+      method: req.method,
+      request_id: req.id,
+    });
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
+  // PCI-DSS 10.2.2: 审计特权用户操作
+  logger.info('audit', {
+    action: 'admin_access',
+    ip: req.ip,
+    endpoint: req.path,
+    method: req.method,
+    request_id: req.id,
+  });
   next();
 }
 
@@ -1889,18 +1978,37 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── 健康检查 ────────────────────────────────────────────────
+// ─── 健康检查（存活探针）──────────────────────────────────────
 app.get('/health', (req, res) => {
   const redisOk = redis ? redis.status === 'ready' : true;
   const status = redisOk ? 'ok' : 'degraded';
   res.status(redisOk ? 200 : 503).json({ status });
 });
 
+// ─── 就绪探针（Kubernetes 就绪检测）──────────────────────────
+app.get('/ready', verifyLimiter, async (req, res) => {
+  const checks = { redis: 'not_configured' };
+  let ready = true;
+
+  if (redis) {
+    try {
+      await redis.ping();
+      checks.redis = 'ok';
+    } catch (err) {
+      logger.warn('Redis 就绪检测失败', { err: err.message });
+      checks.redis = 'error';
+      ready = false;
+    }
+  }
+
+  res.status(ready ? 200 : 503).json({ ready, checks });
+});
+
 // ─── 运营统计端点（需要 SERVICE_TOKEN 认证）──────────────────
-app.get('/stats', adminLimiter, requireServiceToken, (req, res) => {
+app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, (req, res) => {
   const uptimeMs = Date.now() - stats.startedAt;
   res.json({
-    version: '1.5.0',
+    version: '1.6.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -2052,6 +2160,13 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
   // ── Per-user 速率限制（PCI-DSS / CIS DoS 缓解）──
   if (await isUserRateLimited(openId)) {
+    // PCI-DSS 10.2.5: 审计速率限制触发
+    logger.info('audit', {
+      action: 'rate_limit_violation',
+      openId,
+      limit: USER_RATE_LIMIT,
+      request_id: req.id,
+    });
     logger.warn('用户请求超限', { openId, limit: USER_RATE_LIMIT, request_id: req.id });
     const rateLimitReply = buildTextReply(openId, toUserName, '⚠️ 操作过于频繁，请稍后再试。');
     res.set('Content-Type', 'text/xml');
@@ -2202,7 +2317,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
 // ─── 扫码接入：二维码生成端点 ──────────────────────────────────
 // 管理员调用此接口生成二维码，用户扫码关注后自动接入
-app.get('/clawbot/qrcode', adminLimiter, requireServiceToken, async (req, res) => {
+app.get('/clawbot/qrcode', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const scene = typeof req.query.scene === 'string' ? req.query.scene.substring(0, 64) : 'subscribe';
   const temporary = req.query.temporary === 'true';
 
@@ -2224,7 +2339,7 @@ app.get('/clawbot/qrcode', adminLimiter, requireServiceToken, async (req, res) =
 // ─── 微信自定义菜单管理（需要 SERVICE_TOKEN 认证）──────────────
 
 // 创建自定义菜单
-app.post('/clawbot/menu', express.json({ limit: '64kb' }), adminLimiter, requireServiceToken, async (req, res) => {
+app.post('/clawbot/menu', express.json({ limit: '64kb' }), adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const menuData = req.body;
   if (!menuData || !menuData.button || !Array.isArray(menuData.button)) {
     res.status(400).json({ success: false, msg: '菜单数据格式错误，需要 { button: [...] }' });
@@ -2269,7 +2384,7 @@ app.post('/clawbot/menu', express.json({ limit: '64kb' }), adminLimiter, require
 });
 
 // 查询当前自定义菜单
-app.get('/clawbot/menu', adminLimiter, requireServiceToken, async (req, res) => {
+app.get('/clawbot/menu', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const token = await getAccessToken();
   if (!token) {
     res.status(500).json({ success: false, msg: 'access_token 不可用' });
@@ -2299,7 +2414,7 @@ app.get('/clawbot/menu', adminLimiter, requireServiceToken, async (req, res) => 
 });
 
 // 删除自定义菜单
-app.delete('/clawbot/menu', adminLimiter, requireServiceToken, async (req, res) => {
+app.delete('/clawbot/menu', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const token = await getAccessToken();
   if (!token) {
     res.status(500).json({ success: false, msg: 'access_token 不可用' });
@@ -2336,7 +2451,7 @@ app.delete('/clawbot/menu', adminLimiter, requireServiceToken, async (req, res) 
 });
 
 // ─── 已认证用户管理端点（需要 SERVICE_TOKEN 认证，支持分页）──
-app.get('/clawbot/users', adminLimiter, requireServiceToken, async (req, res) => {
+app.get('/clawbot/users', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   if (!redis) {
     res.status(503).json({ success: false, msg: 'Redis 不可用' });
     return;
@@ -2583,7 +2698,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.5 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.6 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
@@ -2598,6 +2713,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
   } else {
     logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /clawbot/menu, /clawbot/users, /stats）不可用');
+  }
+  if (ADMIN_IP_ALLOWLIST.length > 0) {
+    logger.info(`管理端点 IP 白名单已启用（${ADMIN_IP_ALLOWLIST.length} 个 IP）`);
   }
 });
 

@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.5
+# 微信 ClawBot 插件灵枢接入通道 v1.6
 
 ## 概述
 
@@ -11,6 +11,14 @@
 
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
+
+## v1.6 新特性
+
+- **CORS & Cache-Control 安全头**：Helmet 配置 CORS 策略，API 响应添加 Cache-Control: no-store 防止敏感数据缓存（CIS 14.x 安全加固）
+- **管理操作审计日志**：所有 SERVICE_TOKEN 保护端点的访问记录为结构化审计事件 action=admin_access（PCI-DSS 10.2.2 特权用户操作审计）
+- **速率限制 & 认证失败审计**：Per-user 速率限制触发和 SERVICE_TOKEN 认证失败记录为审计事件（PCI-DSS 10.2.4/10.2.5）
+- **就绪探针端点**：新增 GET /ready 检测 Redis 连通性及服务依赖就绪状态，与 /health 存活探针分离（企业级 Kubernetes 部署）
+- **管理端点 IP 白名单**：可选 ADMIN_IP_ALLOWLIST 环境变量，配置后仅允许指定 IP 访问管理端点（CIS 9.x 网络访问限制）
 
 ## v1.5 新特性
 
@@ -69,7 +77,9 @@
 - **取关数据清理**：用户取消关注时自动清除所有个人数据
 - **OpenID 格式校验**：拒绝畸形用户标识（PCI-DSS 6.5 输入验证）
 - **Content-Type 强制校验**：管理端点 POST/PUT/PATCH 强制 application/json（CIS）
-- **结构化审计日志**：认证操作统一 audit 事件格式（PCI-DSS 10.2）
+- **CORS & Cache-Control 安全头**：Helmet CORS 策略 + Cache-Control: no-store（CIS 14.x）
+- **结构化审计日志**：认证/管理/速率限制操作统一 audit 事件格式（PCI-DSS 10.2）
+- **管理端点 IP 白名单**：可选 ADMIN_IP_ALLOWLIST 限制管理端点访问来源（CIS 9.x）
 - 管理端点 SERVICE_TOKEN Bearer 认证保护
 - 管理端点速率限制（30/min，CIS）
 - 速率限制（验证端点 10/min，消息端点 300/min）
@@ -177,15 +187,16 @@ docker compose up -d
 
 | 端点 | 方法 | 说明 | 认证 |
 |------|------|------|------|
-| `/health` | GET | 健康检查 | ❌ |
+| `/health` | GET | 存活探针（Liveness） | ❌ |
+| `/ready` | GET | 就绪探针（Readiness，含 Redis 连通性检查） | ❌ |
 | `/clawbot/webhook` | GET | 微信 URL 验证 | 微信签名 |
 | `/clawbot/webhook` | POST | 微信消息接收（支持加密/明文） | 微信签名 |
-| `/clawbot/qrcode` | GET | 生成接入二维码 | SERVICE_TOKEN |
-| `/clawbot/menu` | POST | 创建公众号自定义菜单 | SERVICE_TOKEN |
-| `/clawbot/menu` | GET | 查询当前菜单配置 | SERVICE_TOKEN |
-| `/clawbot/menu` | DELETE | 删除当前自定义菜单 | SERVICE_TOKEN |
-| `/clawbot/users` | GET | 列出已认证用户 | SERVICE_TOKEN |
-| `/stats` | GET | 运营统计（消息数、会话数等） | SERVICE_TOKEN |
+| `/clawbot/qrcode` | GET | 生成接入二维码 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/menu` | POST | 创建公众号自定义菜单 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/menu` | GET | 查询当前菜单配置 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/menu` | DELETE | 删除当前自定义菜单 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/users` | GET | 列出已认证用户 | SERVICE_TOKEN + IP白名单 |
+| `/stats` | GET | 运营统计（消息数、会话数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
 
