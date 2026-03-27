@@ -1482,8 +1482,9 @@ async function dbVerifyApiKey(rawKey) {
       [keyHash]
     );
     if (result.rows.length > 0) {
-      // 更新最后使用时间（异步）
-      pgPool.query(`UPDATE clawbot_api_keys SET last_used_at = NOW() WHERE key_hash = $1`, [keyHash]).catch(() => {});
+      // 更新最后使用时间（异步，不阻塞验证流程）
+      pgPool.query(`UPDATE clawbot_api_keys SET last_used_at = NOW() WHERE key_hash = $1`, [keyHash])
+        .catch((e) => logger.error('更新 API 密钥使用时间失败', { err: e.message }));
       return result.rows[0];
     }
     return null;
@@ -1593,29 +1594,29 @@ async function runComplianceScan() {
   const findings = [];
   let pciCompliant = 0;
   let cisCompliant = 0;
-  const pciTotal = 10;
-  const cisTotal = 7;
+  let pciTotal = 0;
+  let cisTotal = 0;
 
-  // PCI-DSS 检查
-  if (SESSION_ENCRYPT_KEY) pciCompliant++; else findings.push({ control: 'PCI-DSS 3.4', detail: 'Session encryption not configured' });
-  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') pciCompliant++; else findings.push({ control: 'PCI-DSS 4.1', detail: 'TLS validation disabled' });
-  pciCompliant++; // 6.4.1 WAF always compliant (external)
-  pciCompliant++; // 6.5 Input validation always compliant
-  pciCompliant++; // 7.1 Access control always compliant
-  pciCompliant++; // 8.1.6 Login lockout always compliant
-  pciCompliant++; // 8.1.8 Session timeout always compliant
-  if (SERVICE_TOKEN && SERVICE_TOKEN.length >= 32) pciCompliant++; else findings.push({ control: 'PCI-DSS 8.2.3', detail: 'SERVICE_TOKEN not configured or too short' });
-  if (pgPool) pciCompliant++; else findings.push({ control: 'PCI-DSS 10.2', detail: 'PostgreSQL audit logging not configured' });
-  pciCompliant++; // 10.7 Log retention always compliant
+  // PCI-DSS 检查（每项 pciTotal++ 后检查结果）
+  pciTotal++; if (SESSION_ENCRYPT_KEY) pciCompliant++; else findings.push({ control: 'PCI-DSS 3.4', detail: 'Session encryption not configured' });
+  pciTotal++; if (process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') pciCompliant++; else findings.push({ control: 'PCI-DSS 4.1', detail: 'TLS validation disabled' });
+  pciTotal++; pciCompliant++; // 6.4.1 WAF always compliant (external)
+  pciTotal++; pciCompliant++; // 6.5 Input validation always compliant
+  pciTotal++; pciCompliant++; // 7.1 Access control always compliant
+  pciTotal++; pciCompliant++; // 8.1.6 Login lockout always compliant
+  pciTotal++; pciCompliant++; // 8.1.8 Session timeout always compliant
+  pciTotal++; if (SERVICE_TOKEN && SERVICE_TOKEN.length >= 32) pciCompliant++; else findings.push({ control: 'PCI-DSS 8.2.3', detail: 'SERVICE_TOKEN not configured or too short' });
+  pciTotal++; if (pgPool) pciCompliant++; else findings.push({ control: 'PCI-DSS 10.2', detail: 'PostgreSQL audit logging not configured' });
+  pciTotal++; pciCompliant++; // 10.7 Log retention always compliant
 
   // CIS 检查
-  cisCompliant++; // Security headers always compliant
-  if (ADMIN_IP_ALLOWLIST.length > 0) cisCompliant++; else findings.push({ control: 'CIS 9.x', detail: 'Admin IP allowlist not configured' });
-  cisCompliant++; // DoS mitigation always compliant
-  cisCompliant++; // Data isolation always compliant
-  cisCompliant++; // Encryption in transit always compliant
-  cisCompliant++; // Content-type enforcement always compliant
-  cisCompliant++; // Permissions-Policy always compliant
+  cisTotal++; cisCompliant++; // Security headers always compliant
+  cisTotal++; if (ADMIN_IP_ALLOWLIST.length > 0) cisCompliant++; else findings.push({ control: 'CIS 9.x', detail: 'Admin IP allowlist not configured' });
+  cisTotal++; cisCompliant++; // DoS mitigation always compliant
+  cisTotal++; cisCompliant++; // Data isolation always compliant
+  cisTotal++; cisCompliant++; // Encryption in transit always compliant
+  cisTotal++; cisCompliant++; // Content-type enforcement always compliant
+  cisTotal++; cisCompliant++; // Permissions-Policy always compliant
 
   const totalControls = pciTotal + cisTotal;
   const compliantCount = pciCompliant + cisCompliant;
@@ -6211,7 +6212,7 @@ app.post('/clawbot/plugin/verify', adminLimiter, (req, res) => {
     .update(signPayload).digest('hex');
 
   logger.info('插件验证挑战响应', { challenge: challenge.substring(0, 16) });
-  dbAuditLog({ openId: 'platform', action: 'plugin_verify', detail: `challenge=${challenge.substring(0, 16)}` });
+  dbAuditLog({ openId: 'system:platform', action: 'plugin_verify', detail: `challenge=${challenge.substring(0, 16)}` });
 
   res.json({
     success: true,
@@ -6472,7 +6473,7 @@ app.post('/clawbot/plugin/negotiate', adminLimiter, (req, res) => {
   }
 
   logger.info('能力协商', { platform_version: platVer, requested: reqCaps ? reqCaps.length : 'all' });
-  dbAuditLog({ openId: 'platform', action: 'plugin_negotiate', detail: `platform=${platVer || 'unknown'},requested=${reqCaps ? reqCaps.length : 'all'}` });
+  dbAuditLog({ openId: 'system:platform', action: 'plugin_negotiate', detail: `platform=${platVer || 'unknown'},requested=${reqCaps ? reqCaps.length : 'all'}` });
 
   res.json({
     success: true,
@@ -6604,7 +6605,7 @@ app.post('/clawbot/tenants/:tenantId/keys', adminLimiter, requireAdminIp, requir
   }
   // 验证 scopes
   const validScopes = ['read', 'write', 'admin'];
-  if (scopes && (!Array.isArray(scopes) || scopes.some(s => !validScopes.includes(s)))) {
+  if (scopes && (!Array.isArray(scopes) || scopes.some(s => typeof s !== 'string' || !validScopes.includes(s)))) {
     res.status(400).json({ success: false, msg: `Invalid scopes (valid: ${validScopes.join(', ')})` });
     return;
   }

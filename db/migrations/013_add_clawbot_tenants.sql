@@ -55,6 +55,9 @@ CREATE INDEX IF NOT EXISTS idx_clawbot_tenants_plan
     ON clawbot_tenants(plan);
 
 -- API 密钥表（企业级密钥生命周期管理）
+-- 注意：CASCADE 删除策略 — 租户删除时自动级联删除关联 API 密钥。
+-- 设计决策：租户删除表示完全退出，无需保留密钥记录。
+-- 审计追踪通过 clawbot_audit_log 独立保存。
 CREATE TABLE IF NOT EXISTS clawbot_api_keys (
     id              BIGSERIAL PRIMARY KEY,
     tenant_id       VARCHAR(64) NOT NULL REFERENCES clawbot_tenants(tenant_id) ON DELETE CASCADE,
