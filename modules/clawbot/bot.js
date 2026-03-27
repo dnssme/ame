@@ -561,7 +561,7 @@ const UNBIND_CONFIRM_TTL = 120; // 解绑确认有效期 120 秒
 // 管理端 CSRF token Redis 键前缀
 const REDIS_ADMIN_CSRF_PREFIX = 'anima:clawbot:admin_csrf:';
 const ADMIN_CSRF_TTL = 600; // 管理 CSRF token 有效期 600 秒
-// 模板消息相关
+// 模板消息 ID 格式校验（微信模板 ID 由字母数字下划线连字符组成，如 "OPENTM207335432"）
 const TEMPLATE_MSG_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 
 if (!CLAWBOT_TOKEN) {
@@ -1647,6 +1647,7 @@ async function transferToKf(openId, kfAccount) {
       msgtype: 'transfer_customer_service',
     };
     if (kfAccount) {
+      // WeChat API 要求 TransInfo/KfAccount 使用 PascalCase（官方文档规范）
       payload.TransInfo = { KfAccount: kfAccount };
     }
 
@@ -1767,12 +1768,14 @@ async function saveQuickReplyRules(rules) {
  */
 async function matchQuickReply(text) {
   const rules = await getQuickReplyRules();
+  const lower = text.toLowerCase();
   for (const rule of rules) {
-    if (rule.matchType === 'exact' && text === rule.keyword) {
+    const kw = (rule.keyword || '').toLowerCase();
+    if (rule.matchType === 'exact' && lower === kw) {
       stats.quickReplyHits++;
       return rule.reply;
     }
-    if (rule.matchType === 'fuzzy' && text.includes(rule.keyword)) {
+    if (rule.matchType === 'fuzzy' && lower.includes(kw)) {
       stats.quickReplyHits++;
       return rule.reply;
     }
@@ -2340,24 +2343,22 @@ async function handleTextMessage(openId, rawText, requestId) {
 
   // /unbind — 解除绑定并清除所有数据（PCI-DSS v4.0 敏感操作二次确认）
   if (text === '/unbind') {
-    // 设置确认标记，要求用户发送 /unbind confirm 确认
-    if (redis) {
-      await redis.set(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`, '1', 'EX', UNBIND_CONFIRM_TTL);
+    if (!redis) {
+      return '❌ 系统服务暂时不可用，请稍后重试。';
     }
+    // 设置确认标记，要求用户发送 /unbind confirm 确认
+    await redis.set(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`, '1', 'EX', UNBIND_CONFIRM_TTL);
     return '⚠️ 解绑将清除你的所有个人数据（邮箱、会话、偏好），此操作不可恢复。\n\n' +
       `确认解绑请在 ${UNBIND_CONFIRM_TTL} 秒内发送：\n/unbind confirm`;
   }
   if (text === '/unbind confirm') {
-    // 检查确认标记
-    let confirmed = false;
-    if (redis) {
-      const flag = await redis.get(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`);
-      confirmed = flag === '1';
-      await redis.del(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`);
-    } else {
-      confirmed = true; // 无 Redis 时直接允许
+    if (!redis) {
+      return '❌ 系统服务暂时不可用，请稍后重试。';
     }
-    if (!confirmed) {
+    // 检查确认标记
+    const flag = await redis.get(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`);
+    await redis.del(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`);
+    if (flag !== '1') {
       return '❌ 解绑确认已过期或未发起。请先发送 /unbind 再确认。';
     }
     const email = await getUserEmail(openId);
