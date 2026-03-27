@@ -1,12 +1,12 @@
-# 微信 ClawBot 插件接入模块 v1.1
+# 微信 ClawBot 插件灵枢接入通道 v1.2
 
 ## 概述
 
 基于微信官方 ClawBot 插件 API，将 Anima 灵枢 AI 助手接入微信。
-**使用官方微信接入方式**（扫码关注 / App 互通），不使用企业微信作为主接入方式。
+**使用官方微信接入方式**（扫码关注 / App 互通），完全契合官方接入要求。
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
-所有功能均需登录认证后使用，用户数据强隔离保证安全。
+所有功能均需登录认证后使用，用户数据强隔离保证安全。符合企业级商业运维模式。
 
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
@@ -17,6 +17,7 @@
 |------|------|------|
 | **微信公众号扫码** | 用户扫描二维码关注公众号，即可使用 AI | ✅ 默认启用 |
 | **微信 App 互通** | 通过 Open Platform 跨应用通信 | ✅ 默认启用 |
+| **安全模式** | AES-256-CBC 消息加解密（配置 EncodingAESKey 自动启用） | ✅ 已支持 |
 | 企业微信（WeCom） | 企业微信应用消息接口 | ⬜ 已添加，默认不启用 |
 
 ## 功能
@@ -29,9 +30,11 @@
 - 位置消息 → 位置相关 AI 服务
 - 链接消息 → 链接内容分析
 - 菜单事件 → CLICK / VIEW 处理
+- 自定义菜单管理 API（创建/查询/删除）
 - 模板消息发送（结构化通知）
 - 消息分段发送（适配微信 2000 字符上限）
 - 长耗时任务异步回复（通过客服消息接口）
+- 消息去重（Redis msgId 5 分钟去重窗口）
 
 ### 扫码接入
 - 二维码生成端点（`GET /clawbot/qrcode`）
@@ -41,8 +44,11 @@
 
 ### 安全与认证
 - 微信签名验证（token + timestamp + nonce SHA1，timing-safe）
+- **AES-256-CBC 消息加解密**（安全模式 / 兼容模式，完全契合官方接入）
 - **强制登录认证**：用户必须绑定邮箱后才可使用 AI 功能
 - **用户强隔离**：独立 Redis 键空间、独立会话、独立计费
+- **消息去重**：Redis msgId 去重防止重复消息处理
+- **取关数据清理**：用户取消关注时自动清除所有个人数据
 - 管理端点 SERVICE_TOKEN Bearer 认证保护
 - 速率限制（验证端点 10/min，消息端点 300/min）
 - X-Request-ID 请求追踪（日志关联）
@@ -51,6 +57,7 @@
 
 ### 整合功能（基础命令）
 - /bind <邮箱> — 绑定计费邮箱（必须，首次使用前完成认证）
+- /unbind — 解除邮箱绑定并清除个人数据
 - /balance — 查询账户余额
 - /status — 查看账户状态（认证、邮箱、模型、会话信息）
 - /model <模型名> — 切换 AI 模型
@@ -84,7 +91,7 @@ docker compose up -d
    - 设置服务器 URL 为 `https://your-domain/clawbot/webhook`
    - 设置 Token（自定义，与 .env 中 CLAWBOT_TOKEN 一致）
    - 设置 EncodingAESKey（可自动生成）
-   - 选择消息加解密方式：明文模式
+   - 选择消息加解密方式：明文模式 或 安全模式（配置 CLAWBOT_ENCODING_AES_KEY 后自动支持）
 4. 将以上信息填入 `.env` 文件
 
 ## 架构
@@ -147,8 +154,12 @@ docker compose up -d
 |------|------|------|------|
 | `/health` | GET | 健康检查 | ❌ |
 | `/clawbot/webhook` | GET | 微信 URL 验证 | 微信签名 |
-| `/clawbot/webhook` | POST | 微信消息接收 | 微信签名 |
+| `/clawbot/webhook` | POST | 微信消息接收（支持加密/明文） | 微信签名 |
 | `/clawbot/qrcode` | GET | 生成接入二维码 | SERVICE_TOKEN |
+| `/clawbot/menu` | POST | 创建公众号自定义菜单 | SERVICE_TOKEN |
+| `/clawbot/menu` | GET | 查询当前菜单配置 | SERVICE_TOKEN |
+| `/clawbot/menu` | DELETE | 删除当前自定义菜单 | SERVICE_TOKEN |
+| `/clawbot/users` | GET | 列出已认证用户 | SERVICE_TOKEN |
 | `/stats` | GET | 运营统计（消息数、会话数等） | SERVICE_TOKEN |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
@@ -167,7 +178,7 @@ docker compose up -d
 | 菜单链接 (VIEW) | 记录日志 | ❌ |
 | 扫码关注 | 欢迎消息 + 场景识别 | ❌ |
 | 已关注扫码 | 扫码确认消息 | ❌ |
-| 取关事件 | 记录日志 | ❌ |
+| 取关事件 | 清除用户数据 + 记录日志 | ❌ |
 
 ## 用户隔离
 
@@ -180,6 +191,7 @@ docker compose up -d
 | `anima:clawbot:emails` | Hash | openid → email 绑定映射 |
 | `anima:clawbot:user_models` | Hash | openid → 当前模型选择 |
 | `anima:clawbot:authed` | Set | 已认证用户 openid 集合 |
+| `anima:clawbot:dedup:{msgId}` | String | 消息去重（TTL=5min） |
 
 ### 企业微信（WeCom）
 
