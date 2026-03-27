@@ -56,8 +56,8 @@ channels:
 
   clawbot:
     enabled: true
-    version: "2.1.0"
-    description: "微信 ClawBot 灵枢接入通道 (v2.1)
+    version: "2.2.0"
+    description: "微信 ClawBot 灵枢接入通道 (v2.2)
       - OAuth2.0 网页授权 + 签名验证 + AES 加解密 + 消息去重
       - 菜单管理 + 用户管理 + 强制认证 + 用户隔离
       - Per-user 速率限制 + 管理端点限速 + 就绪探针
@@ -70,6 +70,7 @@ channels:
       - 永久素材管理 + 数据统计分析代理
       - 模板消息 API + 客服会话转接 + 快捷回复规则管理
       - 小程序卡片消息 + 统一工具入口 + 敏感操作二次确认
+      - 模板消息送达回调 + 群发完成回调 + 快捷回复认证修复
       - 企业级运维 + PCI-DSS v4.0/CIS v8，含企业微信接口但默认不启用"
     node: VPS-B
     path: ./clawbot/

@@ -1,10 +1,34 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.1
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.2
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v2.2 相对于 v2.1）：
+ *
+ *   #ENT-2.2-1  快捷回复认证修复（PCI-DSS 7.1 强制登录）
+ *               - 快捷回复规则匹配从认证检查之前移至之后。
+ *               - 修复未登录用户可触发快捷回复的安全漏洞。
+ *               - 确保"所有用户必须登录才可使用"的安全要求。
+ *
+ *   #ENT-2.2-2  模板消息送达回调（TEMPLATESENDJOBFINISH）
+ *               - 新增 TEMPLATESENDJOBFINISH 事件处理。
+ *               - 模板消息送达状态自动回写 clawbot_template_log
+ *                 表（status: delivered / failed）。
+ *               - 送达回调审计日志（PCI-DSS 10.2.2）。
+ *
+ *   #ENT-2.2-3  群发完成回调（MASSSENDJOBFINISH）
+ *               - 新增 MASSSENDJOBFINISH 事件处理。
+ *               - 群发完成结果（发送量/过滤量/成功量/失败量）
+ *                 持久化到 clawbot_broadcast_log 表。
+ *               - 新增 DB Migration 010 clawbot_broadcast_log。
+ *               - 群发完成审计日志（PCI-DSS 10.2.2）。
+ *
+ *   #ENT-2.2-4  统计指标增强（企业级运维）
+ *               - 新增 templateCallbacks / broadcastCallbacks
+ *                 统计计数器，完善 /stats 运维可观测性。
  *
  * 修改记录（v2.1 相对于 v2.0）：
  *
@@ -619,6 +643,8 @@ const stats = {
   oauthInitiated: 0,
   oauthCompleted: 0,
   templatesSent: 0,
+  templateCallbacks: 0,
+  broadcastCallbacks: 0,
   kfTransfers: 0,
   quickReplyHits: 0,
 };
@@ -1811,6 +1837,33 @@ async function dbTemplateLog(log) {
   }
 }
 
+// ─── v2.2 群发消息完成回调 DB 日志 ──────────────────────────────
+
+/**
+ * 记录群发消息完成回调日志到 DB（PCI-DSS 10.2.2）。
+ * @param {Object} log - 群发完成信息
+ */
+async function dbBroadcastLog(log) {
+  if (!pgPool) return;
+  const { msgId, status, totalCount, filterCount, sentCount, errorCount } = log;
+  try {
+    await pgPool.query(
+      `INSERT INTO clawbot_broadcast_log (msg_id, status, total_count, filter_count, sent_count, error_count)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        msgId || null,
+        status || 'unknown',
+        totalCount || 0,
+        filterCount || 0,
+        sentCount || 0,
+        errorCount || 0,
+      ]
+    );
+  } catch (err) {
+    logger.error('群发消息日志写入 DB 失败', { err: err.message, msgId });
+  }
+}
+
 // ─── 扫码接入：二维码生成 ──────────────────────────────────────
 
 /**
@@ -2301,15 +2354,6 @@ async function handleTextMessage(openId, rawText, requestId) {
     return '❌ 消息过长（最多 10000 字符），请精简后重试。';
   }
 
-  // ── v2.1 快捷回复规则优先匹配（命令之前）──
-  if (!text.startsWith('/')) {
-    const quickReply = await matchQuickReply(text);
-    if (quickReply) {
-      logger.info('快捷回复命中', { openId, keyword: text.substring(0, 50) });
-      return quickReply;
-    }
-  }
-
   // ── 命令处理 ──
 
   // 命令统计
@@ -2454,6 +2498,18 @@ async function handleTextMessage(openId, rawText, requestId) {
     return '⛔ 你的账户已被暂停使用。\n\n如有疑问，请联系管理员。';
   }
 
+  // ── v2.2 快捷回复规则匹配（认证 + 封禁检查之后，命令之前）──
+  // v2.1 中快捷回复在认证检查之前，导致未登录用户可触发快捷回复，
+  // 违反"所有用户必须登录才可使用"的安全要求（PCI-DSS 7.1）。
+  if (!text.startsWith('/')) {
+    const quickReply = await matchQuickReply(text);
+    if (quickReply) {
+      stats.quickReplyHits++;
+      logger.info('快捷回复命中', { openId, keyword: text.substring(0, 50) });
+      return quickReply;
+    }
+  }
+
   // /balance — 查询余额
   if (text === '/balance') {
     const email = await getUserEmail(openId);
@@ -2530,7 +2586,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       `会话消息数：${sessionMsgCount}\n\n` +
       `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
       `导出时间：${new Date().toISOString()}\n` +
-      `版本：灵枢接入通道 v2.1\n\n` +
+      `版本：灵枢接入通道 v2.2\n\n` +
       '⚠️ 请妥善保管导出数据，避免泄露个人信息。';
   }
 
@@ -3519,6 +3575,51 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           // 上报地理位置事件（用户开启自动上报后定期推送）
           logger.debug('用户地理位置上报', { openId, eventType });
           // 不回复，仅记录
+        } else if (eventType === 'TEMPLATESENDJOBFINISH') {
+          // v2.2: 模板消息送达结果回调（官方事件推送）
+          const msgId = getXmlValue(xmlBody, 'MsgID');
+          const status = getXmlValue(xmlBody, 'Status');
+          logger.info('模板消息送达回调', { openId, msgId, status });
+          stats.templateCallbacks++;
+          // 更新模板消息日志状态（PCI-DSS 10.2.2 审计完整性）
+          if (pgPool && msgId) {
+            const dbStatus = status === 'success' ? 'delivered' : 'failed';
+            pgPool.query(
+              'UPDATE clawbot_template_log SET status = $1, detail = $2 WHERE msgid = $3',
+              [dbStatus, `callback_status=${status}`, parseInt(msgId, 10)]
+            ).catch((err) => {
+              logger.error('更新模板消息送达状态失败', { err: err.message, msgId });
+            });
+          }
+          dbAuditLog({ openId, action: 'template_callback', detail: `msgid=${msgId},status=${status}`, requestId: req.id });
+          // 不回复用户（系统回调事件）
+        } else if (eventType === 'MASSSENDJOBFINISH') {
+          // v2.2: 群发消息完成回调（官方事件推送）
+          const msgId = getXmlValue(xmlBody, 'MsgID');
+          const status = getXmlValue(xmlBody, 'Status');
+          const totalCount = getXmlValue(xmlBody, 'TotalCount');
+          const filterCount = getXmlValue(xmlBody, 'FilterCount');
+          const sentCount = getXmlValue(xmlBody, 'SentCount');
+          const errorCount = getXmlValue(xmlBody, 'ErrorCount');
+          logger.info('群发消息完成回调', { openId, msgId, status, totalCount, filterCount, sentCount, errorCount });
+          stats.broadcastCallbacks++;
+          // 记录群发完成审计日志（PCI-DSS 10.2.2）
+          dbAuditLog({
+            openId: 'system',
+            action: 'broadcast_callback',
+            detail: `msgid=${msgId},status=${status},total=${totalCount},filter=${filterCount},sent=${sentCount},error=${errorCount}`,
+            requestId: req.id,
+          });
+          // 持久化群发完成记录
+          dbBroadcastLog({
+            msgId: msgId ? parseInt(msgId, 10) : null,
+            status: status === 'send success' || status === 'sendsuccess' ? 'success' : 'failed',
+            totalCount: totalCount ? parseInt(totalCount, 10) : 0,
+            filterCount: filterCount ? parseInt(filterCount, 10) : 0,
+            sentCount: sentCount ? parseInt(sentCount, 10) : 0,
+            errorCount: errorCount ? parseInt(errorCount, 10) : 0,
+          });
+          // 不回复用户（系统回调事件）
         }
         break;
       }
@@ -5033,7 +5134,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v2.1 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v2.2 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通/模板消息/小程序卡片）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
@@ -5046,7 +5147,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
   if (SERVICE_TOKEN) {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
-    logger.info('v2.1 新增端点：模板消息(/clawbot/template)、客服转接(/clawbot/kf)、快捷回复(/clawbot/quickreply)、小程序(/clawbot/miniprogram)');
+    logger.info('v2.2 新增：模板送达回调(TEMPLATESENDJOBFINISH)、群发完成回调(MASSSENDJOBFINISH)、快捷回复认证修复');
   } else {
     logger.warn('SERVICE_TOKEN 未设置，管理端点不可用');
   }
@@ -5058,7 +5159,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`审计日志保留：${AUDIT_RETENTION_DAYS} 天（PCI-DSS 10.7）`);
   logger.info('敏感操作二次确认已启用（PCI-DSS v4.0）');
   if (pgPool) {
-    logger.info('PostgreSQL 审计日志/用户记录/模板消息日志持久化已启用');
+    logger.info('PostgreSQL 审计日志/用户记录/模板消息日志/群发完成日志持久化已启用');
   }
   if (OAUTH_REDIRECT_URI) {
     logger.info(`微信 OAuth2.0 网页授权已配置（scope=${OAUTH_SCOPE}）`);
