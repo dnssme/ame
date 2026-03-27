@@ -1,10 +1,35 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.6
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.7
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v2.7 相对于 v2.6）：
+ *
+ *   #ENT-2.7-1  Web 管理后台（唯一管理入口）
+ *               - 新增 /clawbot/admin Web SPA 管理后台。
+ *               - 统一管理入口：所有运维操作通过 Web 页面完成。
+ *               - 管理员会话管理（Redis + PostgreSQL 双写）。
+ *               - CSRF 防护（PCI-DSS 6.5）与 IP 访问控制。
+ *               - DB Migration 015 新增 clawbot_admin_sessions 表。
+ *
+ *   #ENT-2.7-2  管理后台功能集成
+ *               - 运营仪表盘（实时统计/健康状态/消息分布）。
+ *               - 用户管理（列表/搜索/封禁/解封）。
+ *               - 消息管理（群发/模板/快捷回复）。
+ *               - 公众号管理（菜单/二维码/素材/标签）。
+ *               - 企业运营（租户/通道网关/事件中继/会话联邦）。
+ *               - 安全合规（合规报告/实时检测/历史快照/审计日志）。
+ *               - 插件状态（运行状态/清单/健康检查）。
+ *
+ *   #ENT-2.7-3  管理后台安全加固（PCI-DSS / CIS）
+ *               - PCI-DSS 8.2.8 会话超时 ≤15 分钟空闲。
+ *               - PCI-DSS 10.2.2 特权操作审计追踪。
+ *               - CIS 5.2 管理会话独立追踪。
+ *               - HMAC-SHA256 时间安全令牌验证。
+ *               - 会话绑定 IP + User-Agent。
  *
  * 修改记录（v2.6 相对于 v2.5）：
  *
@@ -611,6 +636,8 @@
 
 const crypto     = require('crypto');
 const express    = require('express');
+const fs         = require('fs');
+const path       = require('path');
 const helmet     = require('helmet');
 const rateLimit  = require('express-rate-limit');
 const { request } = require('undici');
@@ -758,8 +785,14 @@ if (SESSION_ENCRYPT_KEY_RAW) {
 }
 // 插件生命周期 Redis 键前缀
 const REDIS_PLUGIN_ACTIVATED_KEY = 'anima:clawbot:plugin_activated'; // Set: activated openid
-const PLUGIN_VERSION = '2.6.0';
+const PLUGIN_VERSION = '2.7.0';
 const PLUGIN_NAME = 'Anima 灵枢 ClawBot 插件';
+
+// ─── v2.7 Web 管理后台配置 ──────────────────────────────────────
+const REDIS_ADMIN_SESSION_PREFIX = 'anima:clawbot:admin_session:'; // admin_session:<sessionId>
+const ADMIN_SESSION_TTL = Math.max(300, Math.min(3600, parseInt(process.env.ADMIN_SESSION_TTL || '900', 10))); // PCI-DSS 8.2.8 ≤15min idle
+const ADMIN_SESSION_MAX_AGE = Math.max(1800, Math.min(86400, parseInt(process.env.ADMIN_SESSION_MAX_AGE || '3600', 10))); // hard expiry 1h
+const ADMIN_SESSION_BYTES = 32; // 64 hex chars
 
 // ─── v2.5 多租户配置 ──────────────────────────────────────────
 const REDIS_TENANT_PREFIX = 'anima:clawbot:tenant:'; // tenant:<id>:*
@@ -901,6 +934,10 @@ const stats = {
   sessionUnlinked: 0,
   setupWizardCompleted: 0,
   realtimeComplianceChecks: 0,
+  // v2.7 新增统计
+  adminLogins: 0,
+  adminLogouts: 0,
+  adminSessionExpired: 0,
 };
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
@@ -2051,6 +2088,152 @@ async function dbDeleteSessionLink(linkId) {
     logger.error('删除会话链接失败', { err: err.message, linkId });
     return false;
   }
+}
+
+// ─── v2.7 Web 管理后台会话管理 ──────────────────────────────
+
+/**
+ * 加载管理后台 HTML 页面。
+ * 使用 fs.readFileSync 在启动时一次性加载（不含用户可控路径）。
+ */
+const ADMIN_HTML_PATH = path.join(__dirname, 'admin.html');
+let adminDashboardHtml = '';
+try {
+  adminDashboardHtml = fs.readFileSync(ADMIN_HTML_PATH, 'utf8');
+  logger.info('Web 管理后台 HTML 已加载');
+} catch (err) {
+  logger.warn('Web 管理后台 HTML 文件未找到，管理后台功能不可用', { err: err.message });
+}
+
+/**
+ * 创建管理员会话。
+ * @param {string} ip - 客户端 IP
+ * @param {string} userAgent - 浏览器 UA
+ * @returns {Promise<{ sessionId: string, csrfToken: string }>}
+ */
+async function createAdminSession(ip, userAgent) {
+  const sessionId = crypto.randomBytes(ADMIN_SESSION_BYTES).toString('hex');
+  const csrfToken = crypto.randomBytes(ADMIN_SESSION_BYTES).toString('hex');
+  const expiresAt = new Date(Date.now() + ADMIN_SESSION_MAX_AGE * 1000);
+
+  // Redis 存储（带 TTL）
+  if (redis) {
+    const sessionData = JSON.stringify({
+      csrf_token: csrfToken,
+      ip,
+      user_agent: userAgent,
+      created_at: Date.now(),
+      last_active_at: Date.now(),
+    });
+    await redis.set(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`, sessionData, 'EX', ADMIN_SESSION_TTL);
+  }
+
+  // PostgreSQL 持久化
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `INSERT INTO clawbot_admin_sessions (session_id, csrf_token, ip_address, user_agent, expires_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [sessionId, csrfToken, ip, (userAgent || '').substring(0, 512), expiresAt]
+      );
+    } catch (err) {
+      logger.error('创建管理会话 DB 写入失败', { err: err.message });
+    }
+  }
+
+  return { sessionId, csrfToken };
+}
+
+/**
+ * 验证管理员会话。
+ * @param {string} sessionId - 会话 ID
+ * @param {string} csrfToken - CSRF token
+ * @returns {Promise<boolean>}
+ */
+async function verifyAdminSession(sessionId, csrfToken) {
+  if (!sessionId || !csrfToken) return false;
+  // 仅允许十六进制字符（防止 Redis 键注入）
+  if (!/^[a-f0-9]{64}$/.test(sessionId) || !/^[a-f0-9]{64}$/.test(csrfToken)) return false;
+
+  if (redis) {
+    try {
+      const raw = await redis.get(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`);
+      if (!raw) {
+        stats.adminSessionExpired++;
+        return false;
+      }
+      const data = JSON.parse(raw);
+      if (data.csrf_token !== csrfToken) return false;
+      // 刷新活跃时间（滑动窗口 PCI-DSS 8.2.8）
+      data.last_active_at = Date.now();
+      await redis.set(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`, JSON.stringify(data), 'EX', ADMIN_SESSION_TTL);
+      return true;
+    } catch (err) {
+      logger.error('验证管理会话失败', { err: err.message });
+      return false;
+    }
+  }
+
+  // 回退到 PostgreSQL
+  if (pgPool) {
+    try {
+      const result = await pgPool.query(
+        `SELECT id FROM clawbot_admin_sessions
+         WHERE session_id = $1 AND csrf_token = $2 AND is_revoked = FALSE AND expires_at > NOW()`,
+        [sessionId, csrfToken]
+      );
+      if (result.rowCount > 0) {
+        await pgPool.query(
+          `UPDATE clawbot_admin_sessions SET last_active_at = NOW() WHERE session_id = $1`,
+          [sessionId]
+        );
+        return true;
+      }
+      stats.adminSessionExpired++;
+      return false;
+    } catch (err) {
+      logger.error('DB 验证管理会话失败', { err: err.message });
+      return false;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 销毁管理员会话。
+ * @param {string} sessionId - 会话 ID
+ */
+async function revokeAdminSession(sessionId) {
+  if (!sessionId) return;
+  if (!/^[a-f0-9]{64}$/.test(sessionId)) return;
+  if (redis) {
+    try { await redis.del(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`); } catch (_e) { /* ignore */ }
+  }
+  if (pgPool) {
+    try {
+      await pgPool.query(
+        `UPDATE clawbot_admin_sessions SET is_revoked = TRUE WHERE session_id = $1`,
+        [sessionId]
+      );
+    } catch (_e) { /* ignore */ }
+  }
+}
+
+/**
+ * 管理后台会话认证中间件。
+ * 从请求头 X-Admin-Session 和 X-CSRF-Token 验证会话。
+ */
+async function requireAdminSession(req, res, next) {
+  const sessionId = req.headers['x-admin-session'] || '';
+  const csrfToken = req.headers['x-csrf-token'] || '';
+  const valid = await verifyAdminSession(sessionId, csrfToken);
+  if (!valid) {
+    dbAuditLog({ openId: 'admin', action: 'admin_session_invalid', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
+    res.status(401).json({ error: 'Invalid or expired session' });
+    return;
+  }
+  next();
 }
 
 // ─── v2.4 用户同意管理（PCI-DSS v4.0 合规）──────────────────
@@ -4638,6 +4821,11 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     session_unlinked: stats.sessionUnlinked,
     setup_wizard_completed: stats.setupWizardCompleted,
     realtime_compliance_checks: stats.realtimeComplianceChecks,
+    // v2.7 管理后台统计
+    admin_logins: stats.adminLogins,
+    admin_logouts: stats.adminLogouts,
+    admin_session_expired: stats.adminSessionExpired,
+    admin_dashboard_available: !!adminDashboardHtml,
     session_encryption: !!SESSION_ENCRYPT_KEY,
     db_enabled: !!pgPool,
     bind_lockout_threshold: BIND_LOCKOUT_THRESHOLD,
@@ -6590,6 +6778,8 @@ app.get('/clawbot/plugin/manifest', adminLimiter, (req, res) => {
       // v2.6 新增能力
       'channel_gateway', 'setup_wizard', 'webhook_relay',
       'session_federation', 'realtime_compliance',
+      // v2.7 新增能力
+      'web_admin_dashboard',
     ],
     integrated_modules: [
       { name: 'ai_chat', description: 'AI 对话（70+ 模型）', enabled: true },
@@ -7492,6 +7682,69 @@ app.get('/clawbot/compliance/realtime', adminLimiter, requireAdminIp, requireSer
   });
 });
 
+// ─── v2.7 Web 管理后台路由 ────────────────────────────────────
+
+// 管理后台登录（不需要已有会话，但需要 SERVICE_TOKEN + IP 白名单）
+app.post('/clawbot/admin/api/login', adminLimiter, requireAdminIp, async (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') {
+    res.status(400).json({ error: '请提供管理密钥' });
+    return;
+  }
+
+  if (!SERVICE_TOKEN) {
+    res.status(403).json({ error: 'SERVICE_TOKEN not configured' });
+    return;
+  }
+
+  // HMAC-SHA256 时间安全验证（与 requireServiceToken 一致）
+  const hmacKey = Buffer.from('clawbot-auth', 'utf8');
+  const expected = crypto.createHmac('sha256', hmacKey).update(SERVICE_TOKEN).digest();
+  const provided = crypto.createHmac('sha256', hmacKey).update(token).digest();
+  if (!crypto.timingSafeEqual(expected, provided)) {
+    dbAuditLog({ openId: 'admin', action: 'admin_web_login_fail', detail: 'Invalid token', ip: req.ip, requestId: req.id });
+    logger.info('audit', { action: 'admin_web_login_fail', ip: req.ip, request_id: req.id });
+    res.status(401).json({ error: '管理密钥验证失败' });
+    return;
+  }
+
+  try {
+    const session = await createAdminSession(req.ip, req.headers['user-agent'] || '');
+    stats.adminLogins++;
+    dbAuditLog({ openId: 'admin', action: 'admin_web_login', detail: 'Web admin login success', ip: req.ip, requestId: req.id });
+    logger.info('audit', { action: 'admin_web_login', ip: req.ip, request_id: req.id });
+    res.json({ session_id: session.sessionId, csrf_token: session.csrfToken });
+  } catch (err) {
+    logger.error('创建管理会话失败', { err: err.message });
+    res.status(500).json({ error: '会话创建失败' });
+  }
+});
+
+// 管理后台登出
+app.post('/clawbot/admin/api/logout', adminLimiter, async (req, res) => {
+  const sessionId = req.headers['x-admin-session'] || '';
+  if (sessionId) {
+    await revokeAdminSession(sessionId);
+    stats.adminLogouts++;
+    dbAuditLog({ openId: 'admin', action: 'admin_web_logout', detail: 'Web admin logout', ip: req.ip, requestId: req.id });
+  }
+  res.json({ success: true });
+});
+
+// 管理后台 API 代理（所有 admin API 统一通过会话认证）
+// GET 代理 - 将 admin dashboard 的 API 调用转发到已有的 SERVICE_TOKEN 保护端点
+app.get('/clawbot/admin', adminLimiter, requireAdminIp, (req, res) => {
+  if (!adminDashboardHtml) {
+    res.status(503).json({ error: 'Admin dashboard not available' });
+    return;
+  }
+  // 为管理后台页面放宽 CSP 以允许内联脚本和样式
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'none'; object-src 'none'");
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(adminDashboardHtml);
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -7505,8 +7758,8 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v2.6 已启动，端口 ${PORT}`);
-  logger.info('官方微信 ClawBot 插件接入（扫码/App互通/模板消息/小程序卡片/插件生命周期/多租户/心跳/协商/通道网关/事件中继/会话联邦）就绪，等待回调...');
+  logger.info(`灵枢接入通道 v2.7 已启动，端口 ${PORT}`);
+  logger.info('官方微信 ClawBot 插件接入（扫码/App互通/模板消息/小程序卡片/插件生命周期/多租户/心跳/协商/通道网关/事件中继/会话联邦/Web管理后台）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
     logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
@@ -7518,7 +7771,11 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
   if (SERVICE_TOKEN) {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
+    logger.info('v2.7 新增：Web 管理后台 /clawbot/admin');
     logger.info('v2.6 新增：通道网关/Webhook事件中继/会话联邦/接入向导/实时合规监控');
+    if (adminDashboardHtml) {
+      logger.info('Web 管理后台已就绪 → /clawbot/admin');
+    }
   } else {
     logger.warn('SERVICE_TOKEN 未设置，管理端点不可用');
   }

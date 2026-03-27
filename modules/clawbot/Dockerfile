@@ -2,7 +2,7 @@ FROM node:20-slim
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev && npm cache clean --force
-COPY bot.js ./
+COPY bot.js admin.html ./
 USER node
 EXPOSE 3004
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
