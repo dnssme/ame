@@ -56,8 +56,11 @@ channels:
 
   clawbot:
     enabled: true
-    version: "2.2.0"
-    description: "微信 ClawBot 灵枢接入通道 (v2.2)
+    version: "2.3.0"
+    description: "微信 ClawBot 灵枢接入通道 (v2.3)
+      - 官方 ClawBot 插件清单端点 + 插件状态端点
+      - 插件生命周期事件（activate/deactivate/update）
+      - 会话静态加密 AES-256-GCM（PCI-DSS 3.4）
       - OAuth2.0 网页授权 + 签名验证 + AES 加解密 + 消息去重
       - 菜单管理 + 用户管理 + 强制认证 + 用户隔离
       - Per-user 速率限制 + 管理端点限速 + 就绪探针
