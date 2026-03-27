@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.2
+# 微信 ClawBot 插件灵枢接入通道 v1.4
 
 ## 概述
 
@@ -7,9 +7,19 @@
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
 所有功能均需登录认证后使用，用户数据强隔离保证安全。符合企业级商业运维模式。
+符合 PCI-DSS 和 CIS 安全标准。
 
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
+
+## v1.4 新特性
+
+- **Per-user 速率限制**：基于 Redis 滑动窗口的用户级速率限制（默认 30 次/分钟），防止单一用户 DoS（PCI-DSS / CIS）
+- **管理端点速率限制**：所有 SERVICE_TOKEN 保护的管理端点统一限速 30 次/分钟（CIS）
+- **用户管理端点分页**：GET /clawbot/users 支持 page / limit 参数，适应大规模用户（企业级扩展性）
+- **请求追踪贯通**：Agent API 调用传递 X-Request-ID，实现端到端请求追踪（企业级运维）
+- **OpenID 格式校验**：Webhook 消息处理入口验证用户标识格式（PCI-DSS 6.5 输入验证）
+- **版本对齐**：修复 /stats 端点版本号
 
 ## 接入方式
 
@@ -47,13 +57,17 @@
 - **AES-256-CBC 消息加解密**（安全模式 / 兼容模式，完全契合官方接入）
 - **强制登录认证**：用户必须绑定邮箱后才可使用 AI 功能
 - **用户强隔离**：独立 Redis 键空间、独立会话、独立计费
+- **Per-user 速率限制**：基于 Redis 滑动窗口的用户级限速（默认 30 次/分钟，PCI-DSS / CIS）
 - **消息去重**：Redis msgId 去重防止重复消息处理
 - **取关数据清理**：用户取消关注时自动清除所有个人数据
+- **OpenID 格式校验**：拒绝畸形用户标识（PCI-DSS 6.5 输入验证）
 - 管理端点 SERVICE_TOKEN Bearer 认证保护
+- 管理端点速率限制（30/min，CIS）
 - 速率限制（验证端点 10/min，消息端点 300/min）
-- X-Request-ID 请求追踪（日志关联）
+- X-Request-ID 请求追踪（日志关联 + Agent API 贯通）
 - 访问日志中间件（PCI-DSS 10.2）
 - 输入验证与控制字符过滤
+- 生产环境 NODE_TLS_REJECT_UNAUTHORIZED=0 拒绝启动（PCI-DSS 4.1）
 
 ### 整合功能（基础命令）
 - /bind <邮箱> — 绑定计费邮箱（必须，首次使用前完成认证）
@@ -68,7 +82,8 @@
 - /search <关键词> — 网页搜索（通过 Agent 调用 DuckDuckGo）
 - /calendar [操作] — 日历管理（通过 Agent 调用 Nextcloud CalDAV）
 - /home [命令] — 智能家居控制（通过 Agent 调用 Home Assistant）
-- /files — 云存储信息（Nextcloud WebDAV）
+- /files [操作] — 云存储管理（通过 Agent 调用 Nextcloud WebDAV，支持文件查询/搜索）
+- /email [操作] — 邮件管理（通过 Agent 调用 IMAP/SMTP，支持查看/搜索/发送邮件）
 
 ## 部署节点
 
