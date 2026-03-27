@@ -1,9 +1,12 @@
-# 微信 ClawBot 插件灵枢接入通道 v2.2
+# 微信 ClawBot 插件灵枢接入通道 v2.3
 
 ## 概述
 
 基于微信官方 ClawBot 插件 API，将 Anima 灵枢 AI 助手接入微信。
-**使用官方微信接入方式**（扫码关注 / App 互通 / OAuth2.0 网页授权），完全契合官方接入要求。
+**使用官方微信接入方式**（扫码关注 / App 互通 / OAuth2.0 网页授权 / 官方插件商店），完全契合官方接入要求。
+
+2026年3月22日，腾讯官方宣布在微信中推出"ClawBot"插件。本通道 v2.3 全面对接官方 ClawBot 插件 API，
+新增插件清单端点、插件状态端点、插件生命周期事件处理，使普通用户可通过微信插件商店一键激活灵枢接入通道。
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
 所有功能均需登录认证后使用，用户数据强隔离保证安全。符合企业级商业运维模式。
@@ -12,7 +15,17 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v2.2 新特性
+## v2.3 新特性
+
+- **官方 ClawBot 插件清单端点**：新增 `GET /clawbot/plugin/manifest` 端点，返回插件能力声明、版本、已集成功能模块列表、安全合规信息，供微信平台在插件商店中验证插件合规性与能力集。响应结构符合微信 ClawBot 插件开放规范。
+- **插件状态端点**：新增 `GET /clawbot/plugin/status` 端点（需 SERVICE_TOKEN 认证），返回插件运行状态、基础设施连接状态、已认证用户数、插件激活用户数、运营指标，供运维与微信平台监控插件健康度。
+- **插件生命周期事件处理**：Webhook 事件处理器新增 `plugin_activate`、`plugin_deactivate`、`plugin_update` 三种事件类型。插件激活/停用自动记录审计日志（PCI-DSS 10.2.2）并持久化到新增 `clawbot_plugin_log` 表。
+- **会话静态加密（PCI-DSS 3.4）**：Redis 会话持久化采用 AES-256-GCM 加密存储。通过环境变量 `SESSION_ENCRYPT_KEY` 配置 32 字节密钥。会话数据解密仅在内存中进行（L1 缓存层）。向后兼容未加密的旧数据。
+- **增强用户接入引导**：subscribe 欢迎消息新增 ClawBot 插件入口提示。`/tools` 命令新增插件管理信息展示。`/guide` 命令新增插件激活步骤引导。
+- **统计指标增强**：`/stats` 端点新增 `pluginActivations`（插件激活次数）、`pluginDeactivations`（插件停用次数）、`pluginQueries`（插件查询次数）、`session_encryption`（会话加密状态）计数器。
+- **数据库迁移 011**：新增 `clawbot_plugin_log` 表记录插件生命周期事件（activate/deactivate/update）。
+
+## v2.2 新特性（历史版本）
 
 - **快捷回复认证修复（PCI-DSS 7.1）**：快捷回复规则匹配从认证检查之前移至之后，修复未登录用户可触发快捷回复的安全漏洞。确保「所有用户必须登录才可使用」的安全要求（PCI-DSS 7.1 访问控制）。
 - **模板消息送达回调（TEMPLATESENDJOBFINISH）**：新增 TEMPLATESENDJOBFINISH 事件处理，微信推送模板消息送达/失败结果时，自动回写 `clawbot_template_log` 表的 `status` 字段（delivered/failed），实现模板消息全生命周期追踪（PCI-DSS 10.2.2）。
