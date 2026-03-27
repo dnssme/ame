@@ -1,9 +1,9 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.8
+# 微信 ClawBot 插件灵枢接入通道 v1.9
 
 ## 概述
 
 基于微信官方 ClawBot 插件 API，将 Anima 灵枢 AI 助手接入微信。
-**使用官方微信接入方式**（扫码关注 / App 互通），完全契合官方接入要求。
+**使用官方微信接入方式**（扫码关注 / App 互通 / OAuth2.0 网页授权），完全契合官方接入要求。
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
 所有功能均需登录认证后使用，用户数据强隔离保证安全。符合企业级商业运维模式。
@@ -12,7 +12,16 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v1.8 新特性
+## v1.9 新特性
+
+- **微信 OAuth2.0 网页授权**：新增 `/clawbot/oauth` 和 `/clawbot/oauth/callback` 端点，用户可通过微信网页授权一键绑定身份，无需手动 `/bind` 邮箱（普通用户轻松接入）。支持 `snsapi_base`（静默授权）和 `snsapi_userinfo`（显式授权获取昵称头像）两种 scope。Redis CSRF state 防护（PCI-DSS 6.5）。
+- **功能导航 /guide**：新增 `/guide` 命令，分类展示灵枢接入通道全部能力（AI 对话、工具集、安全管理、消息类型），引导新用户快速上手，降低使用门槛。
+- **增强欢迎消息**：subscribe 欢迎消息展示全部功能亮点，引导用户通过 `/guide` 了解详细功能。
+- **Nginx 反向代理集成**：ClawBot 流量统一经 Nginx 反向代理，享受 ModSecurity WAF、TLS 终结、安全头、边缘限速（PCI-DSS 6.4.1 / CIS 13）。Webhook 限速 300r/m，管理端点限速 30r/m，OAuth 走 login 限速 5r/m。
+- **OAuth 统计与审计**：`/stats` 端点新增 `oauth_initiated` / `oauth_completed` 指标，OAuth 授权事件记录审计日志（PCI-DSS 10.2.1）。
+- **数据库迁移 008**：`clawbot_users` 新增 `oauth_scope` 列，记录用户授权方式（email / snsapi_base / snsapi_userinfo）。
+
+## v1.8 新特性（历史版本）
 
 - **PostgreSQL 审计日志持久化**：所有审计事件持久化写入 clawbot_audit_log 表（与 Redis/Winston 日志并行），确保审计记录不可丢失（PCI-DSS 10.2 增强）
 - **PostgreSQL 用户记录持久化**：用户 bind/unbind/block/unblock 操作同步写入 clawbot_users 表，Redis 仍为 L1 实时状态层（企业级用户管理）
@@ -62,6 +71,7 @@
 |------|------|------|
 | **微信公众号扫码** | 用户扫描二维码关注公众号，即可使用 AI | ✅ 默认启用 |
 | **微信 App 互通** | 通过 Open Platform 跨应用通信 | ✅ 默认启用 |
+| **OAuth2.0 网页授权** | 用户点击链接一键授权绑定，无需手动 /bind（配置 OAUTH_REDIRECT_URI 启用） | ✅ 已支持 |
 | **安全模式** | AES-256-CBC 消息加解密（配置 EncodingAESKey 自动启用） | ✅ 已支持 |
 | 企业微信（WeCom） | 企业微信应用消息接口 | ⬜ 已添加，默认不启用 |
 
