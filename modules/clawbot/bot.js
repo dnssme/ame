@@ -1565,7 +1565,8 @@ async function handleVoiceMessage(openId, mediaId, recognition, requestId) {
       logger.info('语音转录完成', { openId, text: text.substring(0, 50) });
 
       // 3. AI 对话
-      const reply = await callAgent(openId, text, requestId);      await sendAsyncReply(openId, `🎙 语音识别：${text}\n\n${reply}`);
+      const reply = await callAgent(openId, text, requestId);
+      await sendAsyncReply(openId, `🎙 语音识别：${text}\n\n${reply}`);
 
       // 4. 可选 TTS 语音回复
       const ttsBuffer = await synthesizeSpeech(reply.substring(0, MAX_TTS_TEXT_LENGTH));
@@ -2291,8 +2292,8 @@ app.get('/clawbot/users', adminLimiter, requireServiceToken, async (req, res) =>
   }
 
   // 分页参数（企业级扩展性）
-  const page = Math.max(1, parseInt(req.query.page || '1', 10) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50', 10) || 50));
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50', 10)));
 
   try {
     // 获取所有已认证用户
