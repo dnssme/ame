@@ -10008,7 +10008,7 @@ app.post('/clawbot/plugin/sdk/events', adminLimiter, async (req, res) => {
 
 // ─── v3.0 企业运维增强（ENT-3.0-6）──────────────────────────────
 
-app.get('/clawbot/ops/dashboard', requireAdminIp, requireServiceToken, async (req, res) => {
+app.get('/clawbot/ops/dashboard', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const uptimeMs = Date.now() - stats.startedAt;
   const uptimeHours = Math.round(uptimeMs / 3600_000 * 100) / 100;
 
@@ -10076,7 +10076,7 @@ app.get('/clawbot/ops/dashboard', requireAdminIp, requireServiceToken, async (re
   });
 });
 
-app.post('/clawbot/ops/alerts', requireAdminIp, requireServiceToken, async (req, res) => {
+app.post('/clawbot/ops/alerts', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const { tenant_id, alert_type, severity, message, threshold, current_value } = req.body || {};
 
   if (!alert_type || typeof alert_type !== 'string' || alert_type.length > 64) {
@@ -10116,7 +10116,7 @@ app.post('/clawbot/ops/alerts', requireAdminIp, requireServiceToken, async (req,
   res.json({ success: true, alert });
 });
 
-app.get('/clawbot/ops/alerts', requireAdminIp, requireServiceToken, async (req, res) => {
+app.get('/clawbot/ops/alerts', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const tenantId = (req.query.tenant_id || 'default').toString();
   const status = (req.query.status || '').toString() || null;
 
@@ -10124,7 +10124,7 @@ app.get('/clawbot/ops/alerts', requireAdminIp, requireServiceToken, async (req, 
   res.json({ success: true, tenant_id: tenantId, total: alerts.length, alerts });
 });
 
-app.get('/clawbot/ops/cost', requireAdminIp, requireServiceToken, async (req, res) => {
+app.get('/clawbot/ops/cost', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const tenantId = (req.query.tenant_id || 'default').toString();
   const dateFrom = (req.query.from || new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10)).toString();
   const dateTo = (req.query.to || new Date().toISOString().slice(0, 10)).toString();
@@ -10164,7 +10164,7 @@ app.get('/clawbot/ops/cost', requireAdminIp, requireServiceToken, async (req, re
 
 // ─── v3.0 合规证据采集（ENT-3.0-7）──────────────────────────────
 
-app.get('/clawbot/compliance/evidence', requireAdminIp, requireServiceToken, async (req, res) => {
+app.get('/clawbot/compliance/evidence', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   stats.complianceEvidenceCollected++;
 
   const evidence = {
