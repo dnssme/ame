@@ -1876,10 +1876,12 @@ app.use(express.json({ limit: '256kb' }));
 
 // ─── Content-Type 强制校验（CIS 安全加固）──────────────────
 // 管理端点 POST/PUT/PATCH 必须为 application/json，与 webhook server.js 对齐
+// Webhook 端点使用 XML，不受此限制
 app.use((req, res, next) => {
-  if (['POST', 'PUT', 'PATCH'].includes(req.method) && !req.path.includes('/webhook')) {
-    const ct = req.headers['content-type'] || '';
-    if (!ct.includes('application/json')) {
+  if (['POST', 'PUT', 'PATCH'].includes(req.method)
+      && !req.path.startsWith('/clawbot/webhook') && !req.path.startsWith('/wecom/webhook')) {
+    const ct = (req.headers['content-type'] || '').split(';')[0].trim();
+    if (ct !== 'application/json') {
       res.status(415).json({ error: 'Unsupported Media Type: Content-Type must be application/json' });
       return;
     }
