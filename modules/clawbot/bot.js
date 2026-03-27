@@ -1986,7 +1986,7 @@ app.get('/health', (req, res) => {
 });
 
 // ─── 就绪探针（Kubernetes 就绪检测）──────────────────────────
-app.get('/ready', async (req, res) => {
+app.get('/ready', verifyLimiter, async (req, res) => {
   const checks = { redis: 'not_configured' };
   let ready = true;
 
