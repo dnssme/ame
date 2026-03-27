@@ -1,10 +1,46 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.6
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.7
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.7 相对于 v1.6）：
+ *
+ *   #ENT-1.7-1  Redis 会话持久化（企业级可靠性）
+ *               - 会话上下文由内存 Map 迁移至 Redis Hash，
+ *                 容器重启后会话不丢失（企业级可靠性）。
+ *               - 内存 LRU 缓存作为 L1 热层，Redis 作为 L2
+ *                 持久层（双层缓存架构）。
+ *               - 每用户会话 JSON 序列化存储，独立 TTL。
+ *
+ *   #ENT-1.7-2  管理员封禁/解封用户（CIS 访问控制）
+ *               - POST /clawbot/users/:openId/block — 封禁用户
+ *               - DELETE /clawbot/users/:openId/block — 解封用户
+ *               - 封禁用户发送消息时返回"账户已暂停"提示。
+ *               - 封禁/解封操作记录审计日志（PCI-DSS 10.2.2）。
+ *
+ *   #ENT-1.7-3  用户数据导出 /export（PCI-DSS 数据可移植性）
+ *               - 新增 /export 命令，用户可导出个人数据：
+ *                 绑定邮箱、模型偏好、会话历史、账户状态。
+ *               - 符合 PCI-DSS 数据可移植性要求。
+ *
+ *   #ENT-1.7-4  微信用户资料自动获取（增强用户管理）
+ *               - 用户关注时自动调用 getUserInfo API 获取
+ *                 昵称等基础资料（需用户授权）。
+ *               - 管理端点 /clawbot/users 返回用户昵称信息。
+ *
+ *   #ENT-1.7-5  增强菜单事件处理（完整 ClawBot 功能）
+ *               - 新增 scancode_push / scancode_waitmsg 扫码
+ *                 菜单事件处理。
+ *               - 新增 pic_sysphoto / pic_photo_or_album /
+ *                 pic_weixin 拍照菜单事件处理。
+ *               - 新增 location_select 选择位置菜单事件处理。
+ *
+ *   #ENT-1.7-6  消息统计增强（运营监控）
+ *               - /stats 新增 blocked_users / export_count 指标。
+ *               - 管理端点返回更详细的用户状态统计。
  *
  * 修改记录（v1.6 相对于 v1.5）：
  *
@@ -218,6 +254,11 @@
  *   - 消息分段发送（适配微信消息长度限制）
  *   - 用户数据自动清理（取关时）
  *   - 已认证用户管理端点
+ *   - 用户封禁/解封管理（管理员）
+ *   - /export 数据导出（PCI-DSS 数据可移植性）
+ *   - Redis 会话持久化（容器重启不丢失）
+ *   - 微信用户资料自动获取（昵称）
+ *   - 增强菜单事件处理（扫码/拍照/位置选择）
  */
 
 const crypto     = require('crypto');
@@ -402,6 +443,9 @@ const REDIS_EMAIL_KEY  = 'anima:clawbot:emails';      // Hash: openid → email
 const REDIS_MODELS_KEY = 'anima:clawbot:user_models';  // Hash: openid → model
 const REDIS_AUTH_KEY   = 'anima:clawbot:authed';       // Set:  已认证用户 openid
 const REDIS_DEDUP_PREFIX = 'anima:clawbot:dedup:';     // String: msgId 去重（TTL=5min）
+const REDIS_BLOCKED_KEY = 'anima:clawbot:blocked';     // Set:  被封禁用户 openid
+const REDIS_NICKNAMES_KEY = 'anima:clawbot:nicknames'; // Hash: openid → nickname
+const REDIS_SESSION_PREFIX = 'anima:clawbot:session:'; // String: openid → JSON会话（TTL=SESSION_TTL）
 
 // 企业微信使用独立键空间，与公众号通道完全隔离
 const WECOM_EMAIL_KEY  = 'anima:wecom:emails';         // Hash: userid → email
@@ -466,18 +510,91 @@ async function setUserModel(openId, model) {
   }
 }
 
-// ─── 会话上下文（强隔离：每用户独立会话）──────────────────────
+// ─── 用户封禁管理（CIS 访问控制）──────────────────────────────
+async function isUserBlocked(openId) {
+  if (!redis) return false;
+  try {
+    return await redis.sismember(REDIS_BLOCKED_KEY, openId) === 1;
+  } catch (err) {
+    logger.error('Redis sismember 失败（blocked）', { err: err.message, openId });
+    return false;
+  }
+}
+
+async function setUserBlocked(openId, blocked) {
+  if (!redis) return;
+  try {
+    if (blocked) {
+      await redis.sadd(REDIS_BLOCKED_KEY, openId);
+    } else {
+      await redis.srem(REDIS_BLOCKED_KEY, openId);
+    }
+  } catch (err) {
+    logger.error('Redis 封禁操作失败', { err: err.message, openId, blocked });
+  }
+}
+
+// ─── 用户昵称管理（微信用户资料缓存）──────────────────────────
+async function getUserNickname(openId) {
+  if (!redis) return undefined;
+  try {
+    return await redis.hget(REDIS_NICKNAMES_KEY, openId) || undefined;
+  } catch (err) {
+    logger.error('Redis hget 失败（nicknames）', { err: err.message, openId });
+    return undefined;
+  }
+}
+
+async function setUserNickname(openId, nickname) {
+  if (!redis) return;
+  try {
+    await redis.hset(REDIS_NICKNAMES_KEY, openId, nickname);
+  } catch (err) {
+    logger.error('Redis hset 失败（nicknames）', { err: err.message, openId });
+  }
+}
+
+// ─── 会话上下文（双层缓存：内存 L1 + Redis L2 持久化）──────
+// 内存 Map 作为 L1 热缓存，Redis 作为 L2 持久层
+// 容器重启时 L1 丢失，但 L2 中的会话自动恢复
 const sessions = new Map();
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '3600', 10) * 1000;
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 
-function getSession(openId) {
-  const session = sessions.get(openId);
-  if (session && Date.now() - session.lastActive < SESSION_TTL) {
-    session.lastActive = Date.now();
-    return session;
+async function getSession(openId) {
+  // L1: 内存热缓存
+  const cached = sessions.get(openId);
+  if (cached && Date.now() - cached.lastActive < SESSION_TTL) {
+    cached.lastActive = Date.now();
+    return cached;
   }
-  // LRU 淘汰：找到最久未活跃的会话删除
+
+  // L2: Redis 持久层（容器重启后恢复）
+  if (redis) {
+    try {
+      const stored = await redis.get(`${REDIS_SESSION_PREFIX}${openId}`);
+      if (stored) {
+        const session = JSON.parse(stored);
+        session.lastActive = Date.now();
+        // 回填 L1 缓存
+        evictIfNeeded();
+        sessions.set(openId, session);
+        return session;
+      }
+    } catch (err) {
+      logger.error('Redis 会话恢复失败', { err: err.message, openId });
+    }
+  }
+
+  // 创建新会话
+  evictIfNeeded();
+  const newSession = { messages: [], lastActive: Date.now() };
+  sessions.set(openId, newSession);
+  return newSession;
+}
+
+/** LRU 淘汰：超过上限时删除最久未活跃的会话 */
+function evictIfNeeded() {
   if (sessions.size >= MAX_SESSIONS) {
     let oldest = null;
     let oldestKey = null;
@@ -489,9 +606,24 @@ function getSession(openId) {
     }
     if (oldestKey) sessions.delete(oldestKey);
   }
-  const newSession = { messages: [], lastActive: Date.now() };
-  sessions.set(openId, newSession);
-  return newSession;
+}
+
+/** 会话持久化到 Redis（异步，不阻塞消息处理） */
+async function persistSession(openId) {
+  if (!redis) return;
+  const session = sessions.get(openId);
+  if (!session) return;
+  try {
+    const ttlSec = Math.ceil(SESSION_TTL / 1000);
+    await redis.set(
+      `${REDIS_SESSION_PREFIX}${openId}`,
+      JSON.stringify(session),
+      'EX',
+      ttlSec
+    );
+  } catch (err) {
+    logger.error('Redis 会话持久化失败', { err: err.message, openId });
+  }
 }
 
 // 定期清理过期会话
@@ -679,6 +811,9 @@ async function clearUserData(openId) {
       redis.hdel(REDIS_EMAIL_KEY, openId),
       redis.hdel(REDIS_MODELS_KEY, openId),
       redis.srem(REDIS_AUTH_KEY, openId),
+      redis.srem(REDIS_BLOCKED_KEY, openId),
+      redis.hdel(REDIS_NICKNAMES_KEY, openId),
+      redis.del(`${REDIS_SESSION_PREFIX}${openId}`),
     ]);
     logger.info('用户数据已清除', { openId });
   } catch (err) {
@@ -709,7 +844,7 @@ function isLongRunningTask(message) {
 
 // ─── Agent API 调用 ──────────────────────────────────────────
 async function callAgent(openId, message, requestId) {
-  const session = getSession(openId);
+  const session = await getSession(openId);
   session.messages.push({ role: 'user', content: message });
 
   if (session.messages.length > 20) {
@@ -742,6 +877,8 @@ async function callAgent(openId, message, requestId) {
     const data = await body.json();
     const reply = data.reply || data.choices?.[0]?.message?.content || '抱歉，我暂时无法回答。';
     session.messages.push({ role: 'assistant', content: reply });
+    // 异步持久化会话到 Redis（不阻塞响应）
+    persistSession(openId).catch(() => {});
     return reply;
   } catch (err) {
     clearTimeout(timeoutId);
@@ -915,6 +1052,44 @@ async function createQrCode(sceneStr = 'subscribe', temporary = false) {
   } catch (err) {
     clearTimeout(timeoutId);
     logger.error('生成二维码异常', { err: err.message });
+    return null;
+  }
+}
+
+// ─── 微信用户资料获取（自动获取昵称等信息）──────────────────
+/**
+ * 调用微信 API 获取用户基本信息。
+ * 用户关注公众号后即可获取 openid 对应的昵称等基础信息。
+ * @param {string} openId - 用户 OpenID
+ * @returns {Promise<{nickname: string}|null>}
+ */
+async function fetchUserInfo(openId) {
+  const token = await getAccessToken();
+  if (!token) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const url = `https://api.weixin.qq.com/cgi-bin/user/info?access_token=${encodeURIComponent(token)}&openid=${encodeURIComponent(openId)}&lang=zh_CN`;
+    const { body } = await request(url, {
+      bodyTimeout: 10_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.subscribe !== undefined && data.nickname) {
+      await setUserNickname(openId, data.nickname);
+      return { nickname: data.nickname };
+    }
+    if (data.errcode) {
+      logger.warn('获取用户资料失败', { errcode: data.errcode, errmsg: data.errmsg, openId });
+    }
+    return null;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取用户资料异常', { err: err.message, openId });
     return null;
   }
 }
@@ -1358,7 +1533,8 @@ async function handleTextMessage(openId, rawText, requestId) {
       '/balance — 查询账户余额\n' +
       '/status — 查看账户状态\n' +
       '/model <模型名> — 切换 AI 模型\n' +
-      '/clear — 清除对话上下文\n\n' +
+      '/clear — 清除对话上下文\n' +
+      '/export — 导出个人数据\n\n' +
       '【工具】\n' +
       '/search <关键词> — 网页搜索\n' +
       '/calendar [操作] — 日历管理\n' +
@@ -1381,6 +1557,12 @@ async function handleTextMessage(openId, rawText, requestId) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n' +
       '发送：/bind 你的邮箱@example.com\n\n' +
       '绑定后即可使用所有 AI 功能。';
+  }
+
+  // ── 封禁检查（CIS 访问控制）──
+  if (await isUserBlocked(openId)) {
+    logger.info('audit', { action: 'blocked_access_attempt', openId });
+    return '⛔ 你的账户已被暂停使用。\n\n如有疑问，请联系管理员。';
   }
 
   // /balance — 查询余额
@@ -1412,6 +1594,9 @@ async function handleTextMessage(openId, rawText, requestId) {
   // /clear — 清除上下文
   if (text === '/clear') {
     sessions.delete(openId);
+    if (redis) {
+      redis.del(`${REDIS_SESSION_PREFIX}${openId}`).catch(() => {});
+    }
     logger.info('用户清除对话上下文', { openId });
     return '🗑 对话上下文已清除。';
   }
@@ -1422,13 +1607,40 @@ async function handleTextMessage(openId, rawText, requestId) {
     const model = (await getUserModel(openId)) || DEFAULT_MODEL;
     const session = sessions.get(openId);
     const sessionMsgCount = session ? session.messages.length : 0;
+    const nickname = await getUserNickname(openId);
     return '📊 账户状态\n\n' +
       `✅ 认证：已通过\n` +
+      (nickname ? `👤 昵称：${nickname}\n` : '') +
       `📧 邮箱：${email || '未绑定'}\n` +
       `🤖 模型：${model}\n` +
       `💬 当前会话消息数：${sessionMsgCount}\n` +
       `🔗 通道：灵枢接入通道（微信公众号）\n\n` +
       '发送 /help 查看所有命令。';
+  }
+
+  // /export — 导出个人数据（PCI-DSS 数据可移植性）
+  if (text === '/export') {
+    const email = await getUserEmail(openId);
+    const model = (await getUserModel(openId)) || DEFAULT_MODEL;
+    const nickname = await getUserNickname(openId);
+    const session = sessions.get(openId);
+    const sessionMsgCount = session ? session.messages.length : 0;
+    const recentMessages = session
+      ? session.messages.slice(-10).map((m, i) => `  ${i + 1}. [${m.role}] ${m.content.substring(0, 100)}${m.content.length > 100 ? '...' : ''}`).join('\n')
+      : '  无会话记录';
+    logger.info('audit', { action: 'export', openId, detail: 'user_data_export' });
+    stats.exportCount = (stats.exportCount || 0) + 1;
+    return '📋 个人数据导出\n\n' +
+      `【账户信息】\n` +
+      `通道：灵枢接入通道（微信公众号）\n` +
+      (nickname ? `昵称：${nickname}\n` : '') +
+      `邮箱：${email || '未绑定'}\n` +
+      `模型：${model}\n` +
+      `认证状态：已通过\n` +
+      `会话消息数：${sessionMsgCount}\n\n` +
+      `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
+      `导出时间：${new Date().toISOString()}\n` +
+      `版本：灵枢接入通道 v1.7`;
   }
 
   // /search <query> — 网页搜索（通过 Agent 调用 DuckDuckGo）
@@ -1578,6 +1790,10 @@ async function handleVoiceMessage(openId, mediaId, recognition, requestId) {
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
   }
+  // 封禁检查
+  if (await isUserBlocked(openId)) {
+    return '⛔ 你的账户已被暂停使用。如有疑问，请联系管理员。';
+  }
 
   // 优先使用微信自带语音识别结果
   if (recognition && recognition.trim()) {
@@ -1666,6 +1882,9 @@ async function handleImageMessage(openId, picUrl, mediaId, requestId) {
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
   }
+  if (await isUserBlocked(openId)) {
+    return '⛔ 你的账户已被暂停使用。如有疑问，请联系管理员。';
+  }
 
   if (!picUrl && !mediaId) {
     return '图片消息格式异常，请重试。';
@@ -1713,6 +1932,9 @@ async function handleFileMessage(openId, mediaId, fileName, requestId) {
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
   }
+  if (await isUserBlocked(openId)) {
+    return '⛔ 你的账户已被暂停使用。如有疑问，请联系管理员。';
+  }
 
   logger.info('收到文件消息', { openId, mediaId, fileName });
 
@@ -1756,6 +1978,9 @@ async function handleLocationMessage(openId, locationX, locationY, scale, label,
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
   }
+  if (await isUserBlocked(openId)) {
+    return '⛔ 你的账户已被暂停使用。如有疑问，请联系管理员。';
+  }
 
   logger.info('收到位置消息', { openId, label, lat: locationX, lng: locationY });
 
@@ -1777,6 +2002,9 @@ async function handleLinkMessage(openId, title, description, url, requestId) {
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
+  }
+  if (await isUserBlocked(openId)) {
+    return '⛔ 你的账户已被暂停使用。如有疑问，请联系管理员。';
   }
 
   logger.info('收到链接消息', { openId, title, url });
@@ -2005,10 +2233,14 @@ app.get('/ready', verifyLimiter, async (req, res) => {
 });
 
 // ─── 运营统计端点（需要 SERVICE_TOKEN 认证）──────────────────
-app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, (req, res) => {
+app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
   const uptimeMs = Date.now() - stats.startedAt;
+  let blockedCount = 0;
+  if (redis) {
+    try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
+  }
   res.json({
-    version: '1.6.0',
+    version: '1.7.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -2022,6 +2254,8 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, (req, res) 
     total_commands: stats.totalCommands,
     commands_by_name: stats.commandsByName,
     total_errors: stats.totalErrors,
+    blocked_users: blockedCount,
+    export_count: stats.exportCount || 0,
   });
 });
 
@@ -2233,6 +2467,14 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
         if (eventType === 'subscribe') {
           // 用户关注（可能通过扫码关注：eventKey 包含 qrscene_ 前缀）
+          // 异步获取用户资料（不阻塞欢迎消息）
+          setImmediate(async () => {
+            try {
+              await fetchUserInfo(openId);
+            } catch (err) {
+              logger.error('获取用户资料失败', { err: err.message, openId });
+            }
+          });
           if (eventKey && eventKey.startsWith('qrscene_')) {
             const scene = eventKey.slice(8);
             logger.info('用户通过扫码关注', { openId, scene });
@@ -2273,6 +2515,35 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         } else if (eventType === 'VIEW') {
           // 菜单链接跳转事件（仅记录日志，用户已跳转到目标 URL）
           logger.info('用户点击菜单链接', { openId, url: eventKey });
+        } else if (eventType === 'scancode_push' || eventType === 'scancode_waitmsg') {
+          // 扫码菜单事件（扫码推事件 / 扫码等待结果事件）
+          const scanResult = getXmlValue(xmlBody, 'ScanResult');
+          const scanType = getXmlValue(xmlBody, 'ScanType');
+          logger.info('用户扫码菜单事件', { openId, eventType, scanType, scanResult: (scanResult || '').substring(0, 100) });
+          if (scanResult) {
+            replyText = await handleTextMessage(openId, `扫码结果：${scanResult}`, req.id);
+          } else {
+            replyText = '📷 未识别到扫码内容，请重试。';
+          }
+        } else if (eventType === 'pic_sysphoto' || eventType === 'pic_photo_or_album' || eventType === 'pic_weixin') {
+          // 拍照菜单事件（系统拍照 / 拍照或相册 / 微信相册）
+          logger.info('用户拍照菜单事件', { openId, eventType, eventKey });
+          replyText = '📸 已收到拍照请求，请发送图片给我进行 AI 分析。';
+        } else if (eventType === 'location_select') {
+          // 位置选择菜单事件
+          const locX = getXmlValue(xmlBody, 'Location_X');
+          const locY = getXmlValue(xmlBody, 'Location_Y');
+          const locLabel = getXmlValue(xmlBody, 'Label');
+          logger.info('用户位置选择菜单事件', { openId, eventType, lat: locX, lng: locY, label: locLabel });
+          if (locX && locY) {
+            replyText = await handleLocationMessage(openId, locX, locY, '', locLabel, req.id);
+          } else {
+            replyText = '📍 未获取到位置信息，请重新选择。';
+          }
+        } else if (eventType === 'LOCATION') {
+          // 上报地理位置事件（用户开启自动上报后定期推送）
+          logger.debug('用户地理位置上报', { openId, eventType });
+          // 不回复，仅记录
         }
         break;
       }
@@ -2473,7 +2744,9 @@ app.get('/clawbot/users', adminLimiter, requireAdminIp, requireServiceToken, asy
     for (const openId of pageUsers) {
       const email = await redis.hget(REDIS_EMAIL_KEY, openId) || '';
       const model = await redis.hget(REDIS_MODELS_KEY, openId) || DEFAULT_MODEL;
-      users.push({ openId, email, model });
+      const nickname = await redis.hget(REDIS_NICKNAMES_KEY, openId) || '';
+      const blocked = await redis.sismember(REDIS_BLOCKED_KEY, openId) === 1;
+      users.push({ openId, email, model, nickname, blocked });
     }
 
     res.json({
@@ -2488,6 +2761,56 @@ app.get('/clawbot/users', adminLimiter, requireAdminIp, requireServiceToken, asy
     logger.error('查询已认证用户失败', { err: err.message });
     res.status(500).json({ success: false, msg: '查询失败' });
   }
+});
+
+// ─── 用户封禁端点（CIS 访问控制管理）──────────────────────────
+// POST /clawbot/users/:openId/block — 封禁用户
+app.post('/clawbot/users/:openId/block', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { openId } = req.params;
+  if (!openId || !OPENID_RE.test(openId)) {
+    res.status(400).json({ success: false, msg: 'Invalid openId' });
+    return;
+  }
+  if (!redis) {
+    res.status(503).json({ success: false, msg: 'Redis 不可用' });
+    return;
+  }
+
+  const reason = (req.body && typeof req.body.reason === 'string') ? req.body.reason.substring(0, 500) : '';
+
+  await setUserBlocked(openId, true);
+  logger.info('audit', {
+    action: 'block_user',
+    openId,
+    reason,
+    ip: req.ip,
+    request_id: req.id,
+  });
+
+  res.json({ success: true, msg: `用户 ${openId} 已封禁`, reason });
+});
+
+// DELETE /clawbot/users/:openId/block — 解封用户
+app.delete('/clawbot/users/:openId/block', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { openId } = req.params;
+  if (!openId || !OPENID_RE.test(openId)) {
+    res.status(400).json({ success: false, msg: 'Invalid openId' });
+    return;
+  }
+  if (!redis) {
+    res.status(503).json({ success: false, msg: 'Redis 不可用' });
+    return;
+  }
+
+  await setUserBlocked(openId, false);
+  logger.info('audit', {
+    action: 'unblock_user',
+    openId,
+    ip: req.ip,
+    request_id: req.id,
+  });
+
+  res.json({ success: true, msg: `用户 ${openId} 已解封` });
 });
 
 // ─── 企业微信（WeCom）Webhook 接口 ────────────────────────────
@@ -2698,7 +3021,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.6 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.7 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {

@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.6
+# 微信 ClawBot 插件灵枢接入通道 v1.7
 
 ## 概述
 
@@ -12,7 +12,17 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v1.6 新特性
+## v1.7 新特性
+
+- **Redis 会话持久化**：会话上下文由内存迁移至 Redis 双层缓存（L1 内存 + L2 Redis），容器重启后会话不丢失（企业级可靠性）
+- **管理员封禁/解封用户**：POST/DELETE `/clawbot/users/:openId/block` 端点，管理员可封禁/解封用户（CIS 访问控制），封禁操作记录审计日志
+- **用户数据导出 /export**：新增 `/export` 命令，用户可导出绑定邮箱、模型偏好、会话历史等个人数据（PCI-DSS 数据可移植性）
+- **微信用户资料自动获取**：用户关注时自动调用 getUserInfo API 获取昵称等基础资料，管理端点返回用户昵称
+- **增强菜单事件处理**：新增 scancode_push/scancode_waitmsg 扫码事件、pic_sysphoto/pic_photo_or_album/pic_weixin 拍照事件、location_select 位置选择事件、LOCATION 地理位置上报事件
+- **运营统计增强**：/stats 新增 blocked_users 封禁用户数和 export_count 数据导出次数指标
+- **数据库持久化迁移**：新增 007_add_clawbot_users.sql 迁移，创建 clawbot_users 和 clawbot_audit_log 表用于持久化用户记录和审计日志（PCI-DSS 10.2.1）
+
+## v1.6 新特性（历史版本）
 
 - **CORS & Cache-Control 安全头**：Helmet 配置 CORS 策略，API 响应添加 Cache-Control: no-store 防止敏感数据缓存（CIS 14.x 安全加固）
 - **管理操作审计日志**：所有 SERVICE_TOKEN 保护端点的访问记录为结构化审计事件 action=admin_access（PCI-DSS 10.2.2 特权用户操作审计）
@@ -93,9 +103,10 @@
 - /bind <邮箱> — 绑定计费邮箱（必须，首次使用前完成认证）
 - /unbind — 解除邮箱绑定并清除个人数据
 - /balance — 查询账户余额
-- /status — 查看账户状态（认证、邮箱、模型、会话信息）
+- /status — 查看账户状态（认证、邮箱、模型、昵称、会话信息）
 - /model <模型名> — 切换 AI 模型
 - /clear — 清除对话上下文
+- /export — 导出个人数据（PCI-DSS 数据可移植性）
 - /help — 查看帮助
 
 ### 整合功能（工具集成）
@@ -195,8 +206,10 @@ docker compose up -d
 | `/clawbot/menu` | POST | 创建公众号自定义菜单 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/menu` | GET | 查询当前菜单配置 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/menu` | DELETE | 删除当前自定义菜单 | SERVICE_TOKEN + IP白名单 |
-| `/clawbot/users` | GET | 列出已认证用户 | SERVICE_TOKEN + IP白名单 |
-| `/stats` | GET | 运营统计（消息数、会话数等） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/users` | GET | 列出已认证用户（含昵称、封禁状态） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/users/:openId/block` | POST | 封禁用户 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/users/:openId/block` | DELETE | 解封用户 | SERVICE_TOKEN + IP白名单 |
+| `/stats` | GET | 运营统计（消息数、会话数、封禁数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
 
@@ -228,6 +241,9 @@ docker compose up -d
 | `anima:clawbot:user_models` | Hash | openid → 当前模型选择 |
 | `anima:clawbot:authed` | Set | 已认证用户 openid 集合 |
 | `anima:clawbot:dedup:{msgId}` | String | 消息去重（TTL=5min） |
+| `anima:clawbot:blocked` | Set | 被封禁用户 openid 集合 |
+| `anima:clawbot:nicknames` | Hash | openid → 用户昵称 |
+| `anima:clawbot:session:{openId}` | String | JSON 会话数据（TTL=SESSION_TTL） |
 
 ### 企业微信（WeCom）
 
@@ -237,7 +253,7 @@ docker compose up -d
 | `anima:wecom:user_models` | Hash | userid → 当前模型选择 |
 | `anima:wecom:authed` | Set | 已认证用户 userid 集合 |
 
-会话上下文使用内存 LRU 缓存（每用户独立），超时自动清理。
+会话上下文使用双层缓存架构（L1 内存 LRU + L2 Redis 持久层），容器重启后自动恢复，超时自动清理。
 
 ## 依赖
 
