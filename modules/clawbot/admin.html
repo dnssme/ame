@@ -1168,7 +1168,8 @@ async function loadWxAuthorizers(){
       el.innerHTML='<p>暂无授权方</p>';return;
     }
     el.innerHTML='<table><tr><th>授权方 AppID</th><th>名称</th><th>类型</th><th>状态</th><th>授权时间</th><th>操作</th></tr>'+
-      d.authorizers.map(a=>'<tr><td>'+esc(a.authorizer_appid)+'</td><td>'+esc(a.authorizer_name||'-')+'</td><td>'+esc(a.authorizer_type)+'</td><td>'+esc(a.status)+'</td><td>'+new Date(a.authorized_at).toLocaleString()+'</td><td>'+(a.status==='active'?'<button class="btn btn-danger btn-sm" onclick="revokeAuthorizer(\''+esc(a.authorizer_appid)+'\')">吊销</button>':'<span style="color:var(--text-muted)">已吊销</span>')+'</td></tr>').join('')+'</table>';
+      d.authorizers.map(a=>'<tr><td>'+esc(a.authorizer_appid)+'</td><td>'+esc(a.authorizer_name||'-')+'</td><td>'+esc(a.authorizer_type)+'</td><td>'+esc(a.status)+'</td><td>'+new Date(a.authorized_at).toLocaleString()+'</td><td>'+(a.status==='active'?'<button class="btn btn-danger btn-sm revoke-btn" data-appid="'+esc(a.authorizer_appid)+'">吊销</button>':'<span style="color:var(--text-muted)">已吊销</span>')+'</td></tr>').join('')+'</table>';
+    el.querySelectorAll('.revoke-btn').forEach(btn=>{btn.addEventListener('click',()=>revokeAuthorizer(btn.dataset.appid))});
   }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
 }
 

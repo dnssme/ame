@@ -11242,8 +11242,9 @@ app.post('/clawbot/compliance/scan', adminLimiter, requireAdminIp, requireServic
 // 接收微信开放平台 component_verify_ticket 推送
 app.post('/clawbot/component/verify_ticket', webhookLimiter, async (req, res) => {
   stats.componentVerifyTickets++;
-  // 微信推送 XML 格式的 component_verify_ticket
-  // 此处简化处理，实际生产需解密 XML
+  // 微信推送 component_verify_ticket
+  // 生产环境中微信以加密 XML 格式推送，需先解密后解析
+  // 当前通过 Express JSON 中间件接收已解析的请求体
   const { ComponentVerifyTicket, AppId } = req.body || {};
 
   if (!ComponentVerifyTicket || typeof ComponentVerifyTicket !== 'string') {
@@ -11251,8 +11252,8 @@ app.post('/clawbot/component/verify_ticket', webhookLimiter, async (req, res) =>
     return;
   }
 
-  // 验证 AppId 匹配
-  if (AppId && AppId !== COMPONENT_APPID && COMPONENT_APPID) {
+  // 验证 AppId 匹配（仅在配置了 COMPONENT_APPID 时校验）
+  if (COMPONENT_APPID && AppId && AppId !== COMPONENT_APPID) {
     res.status(403).json({ success: false, msg: 'AppId mismatch' });
     return;
   }
@@ -11273,7 +11274,7 @@ app.get('/clawbot/component/auth_callback', adminLimiter, async (req, res) => {
   stats.componentAuthCallbacks++;
   const { auth_code, expires_in } = req.query || {};
 
-  if (!auth_code || typeof auth_code !== 'string' || auth_code.length > 256) {
+  if (!auth_code || typeof auth_code !== 'string' || auth_code.length > 256 || !/^[a-zA-Z0-9_-]+$/.test(auth_code)) {
     res.status(400).json({ success: false, msg: 'Missing or invalid auth_code' });
     return;
   }
@@ -11627,7 +11628,7 @@ app.use((err, req, res, _next) => {
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`灵枢接入通道 v3.2 已启动，端口 ${PORT}`);
-  logger.info('官方微信 OpenClaw 开放平台接入（扫码/App互通/模板消息/小程序卡片/插件生命周期/多租户/心跳/协商/通道网关/事件中继/会话联邦/Web管理后台/客服系统/内容管理/订阅消息/个性化菜单/自助接入/统一登录/功能门户/微信原生登录/集成调度/行级安全/企业计费/合规自动化/开放平台组件授权/强制认证网关/强隔离/CIS合规基线）就绪，等待回调...');
+  logger.info('微信开放平台官方接入（扫码/App互通/模板消息/小程序卡片/插件生命周期/多租户/心跳/协商/通道网关/事件中继/会话联邦/Web管理后台/客服系统/内容管理/订阅消息/个性化菜单/自助接入/统一登录/功能门户/微信原生登录/集成调度/行级安全/企业计费/合规自动化/开放平台组件授权/强制认证网关/强隔离/CIS合规基线）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
     logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
