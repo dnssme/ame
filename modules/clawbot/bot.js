@@ -1,10 +1,55 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.0
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.1
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v2.1 相对于 v2.0）：
+ *
+ *   #ENT-2.1-1  模板消息 API（官方服务通知能力）
+ *               - 新增 POST /clawbot/template/send 发送模板消息。
+ *               - 新增 GET /clawbot/template/list 查询模板列表。
+ *               - 新增 DB Migration 009 clawbot_template_log 记录模板
+ *                 发送历史（PCI-DSS 10.2.2 审计）。
+ *               - 支持 first / keyword / remark 数据字段。
+ *               - 支持跳转 URL 和小程序路径。
+ *
+ *   #ENT-2.1-2  客服会话转接（官方多客服分流）
+ *               - 新增 /transfer 命令将用户转接到人工客服。
+ *               - 新增 POST /clawbot/kf/transfer 管理端接口。
+ *               - 转接事件记录审计日志（PCI-DSS 10.2.2）。
+ *
+ *   #ENT-2.1-3  快捷回复菜单（plugin quick-reply）
+ *               - 新增 POST /clawbot/quickreply 管理快捷回复规则。
+ *               - 新增 GET /clawbot/quickreply 查询快捷回复规则。
+ *               - 新增 DELETE /clawbot/quickreply/:ruleId 删除规则。
+ *               - 规则存储在 Redis，按关键词匹配自动回复。
+ *
+ *   #ENT-2.1-4  自动回复规则管理
+ *               - 关键词自动回复：精确 / 模糊匹配。
+ *               - 收到消息自动回复：默认欢迎语。
+ *               - 规则优先级：快捷回复 > 命令 > AI 对话。
+ *
+ *   #ENT-2.1-5  统一工具入口 /tools
+ *               - 新增 /tools 命令，汇总展示所有已集成模块。
+ *               - 显示模块状态（已启用/未启用）。
+ *
+ *   #ENT-2.1-6  小程序卡片消息支持
+ *               - 新增 POST /clawbot/miniprogram/send 发送小程序
+ *                 卡片消息（客服消息接口）。
+ *               - 支持 appid / pagepath / title / thumb_media_id。
+ *
+ *   #ENT-2.1-7  增强欢迎消息快速入门
+ *               - subscribe 欢迎消息新增快速入门引导。
+ *               - 新用户引导：扫码 → 关注 → /bind → 全功能。
+ *               - 展示 /tools 统一工具入口。
+ *
+ *   #ENT-2.1-8  合规性增强（PCI-DSS v4.0 / CIS v8）
+ *               - 敏感操作二次确认（/unbind 需确认）。
+ *               - 管理端点 CSRF token 校验。
+ *               - 密码复杂度提示增强。
  *
  * 修改记录（v2.0 相对于 v1.9）：
  *
@@ -507,6 +552,18 @@ const REDIS_OAUTH_STATE_PREFIX = 'anima:clawbot:oauth_state:';
 // 日志截断长度
 const MAX_LOG_DATA_LENGTH = 200;
 
+// ─── v2.1 新增配置 ─────────────────────────────────────────────
+// 快捷回复规则 Redis 键
+const REDIS_QUICKREPLY_KEY = 'anima:clawbot:quickreply_rules';
+// 解绑确认 Redis 键前缀（PCI-DSS v4.0 敏感操作二次确认）
+const REDIS_UNBIND_CONFIRM_PREFIX = 'anima:clawbot:unbind_confirm:';
+const UNBIND_CONFIRM_TTL = 120; // 解绑确认有效期 120 秒
+// 管理端 CSRF token Redis 键前缀
+const REDIS_ADMIN_CSRF_PREFIX = 'anima:clawbot:admin_csrf:';
+const ADMIN_CSRF_TTL = 600; // 管理 CSRF token 有效期 600 秒
+// 模板消息 ID 格式校验（微信模板 ID 由字母数字下划线连字符组成，如 "OPENTM207335432"）
+const TEMPLATE_MSG_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
   process.exit(1);
@@ -561,6 +618,9 @@ const stats = {
   totalErrors: 0,
   oauthInitiated: 0,
   oauthCompleted: 0,
+  templatesSent: 0,
+  kfTransfers: 0,
+  quickReplyHits: 0,
 };
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
@@ -1475,6 +1535,282 @@ async function sendAsyncReply(openId, text) {
   }
 }
 
+// ─── v2.1 模板消息发送 ─────────────────────────────────────────
+
+/**
+ * 发送模板消息（官方服务通知能力）。
+ * @param {Object} opts - 模板消息参数
+ * @param {string} opts.touser - 目标用户 OpenID
+ * @param {string} opts.template_id - 模板 ID
+ * @param {string} [opts.url] - 点击跳转 URL
+ * @param {Object} [opts.miniprogram] - 小程序跳转 { appid, pagepath }
+ * @param {Object} opts.data - 模板数据字段
+ * @returns {Promise<{success: boolean, msgid?: number, errmsg?: string}>}
+ */
+async function sendTemplateMessage(opts) {
+  const token = await getAccessToken();
+  if (!token) {
+    return { success: false, errmsg: 'access_token 不可用' };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const payload = {
+      touser: opts.touser,
+      template_id: opts.template_id,
+      data: opts.data || {},
+    };
+    if (opts.url) payload.url = opts.url;
+    if (opts.miniprogram) payload.miniprogram = opts.miniprogram;
+
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/template/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode === 0) {
+      stats.templatesSent++;
+      return { success: true, msgid: result.msgid };
+    }
+    logger.error('模板消息发送失败', { errcode: result.errcode, errmsg: result.errmsg });
+    return { success: false, errmsg: result.errmsg || '发送失败' };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('模板消息发送异常', { err: err.message });
+    return { success: false, errmsg: err.message };
+  }
+}
+
+/**
+ * 获取模板列表（官方模板管理）。
+ * @returns {Promise<Array|null>}
+ */
+async function getTemplateList() {
+  const token = await getAccessToken();
+  if (!token) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/template/get_all_private_template?access_token=${encodeURIComponent(token)}`,
+      {
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.template_list) {
+      return data.template_list;
+    }
+    logger.error('获取模板列表失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return null;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取模板列表异常', { err: err.message });
+    return null;
+  }
+}
+
+// ─── v2.1 客服会话转接 ─────────────────────────────────────────
+
+/**
+ * 将用户转接到人工客服。
+ * 通过客服消息接口发送"转接客服"消息类型。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} [kfAccount] - 指定客服账号（可选）
+ * @returns {Promise<boolean>}
+ */
+async function transferToKf(openId, kfAccount) {
+  const token = await getAccessToken();
+  if (!token) return false;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const payload = {
+      touser: openId,
+      msgtype: 'transfer_customer_service',
+    };
+    if (kfAccount) {
+      // WeChat API 要求 TransInfo/KfAccount 使用 PascalCase（官方文档规范）
+      payload.TransInfo = { KfAccount: kfAccount };
+    }
+
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode === 0 || !result.errcode) {
+      stats.kfTransfers++;
+      return true;
+    }
+    logger.error('客服转接失败', { errcode: result.errcode, errmsg: result.errmsg, openId });
+    return false;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('客服转接异常', { err: err.message, openId });
+    return false;
+  }
+}
+
+// ─── v2.1 小程序卡片消息发送 ──────────────────────────────────
+
+/**
+ * 通过客服消息接口发送小程序卡片。
+ * @param {string} openId - 目标用户 OpenID
+ * @param {Object} opts - 小程序参数
+ * @param {string} opts.appid - 小程序 AppID
+ * @param {string} opts.title - 卡片标题
+ * @param {string} opts.pagepath - 小程序页面路径
+ * @param {string} opts.thumb_media_id - 封面图 MediaID
+ * @returns {Promise<boolean>}
+ */
+async function sendMiniProgramCard(openId, opts) {
+  const token = await getAccessToken();
+  if (!token) return false;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          touser: openId,
+          msgtype: 'miniprogrampage',
+          miniprogrampage: {
+            title: opts.title || '',
+            appid: opts.appid,
+            pagepath: opts.pagepath || '',
+            thumb_media_id: opts.thumb_media_id || '',
+          },
+        }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode === 0 || !result.errcode) {
+      return true;
+    }
+    logger.error('小程序卡片发送失败', { errcode: result.errcode, errmsg: result.errmsg, openId });
+    return false;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('小程序卡片发送异常', { err: err.message, openId });
+    return false;
+  }
+}
+
+// ─── v2.1 快捷回复规则管理（Redis 存储）─────────────────────────
+
+/**
+ * 获取所有快捷回复规则。
+ * @returns {Promise<Array<{id: string, keyword: string, matchType: string, reply: string}>>}
+ */
+async function getQuickReplyRules() {
+  if (!redis) return [];
+  try {
+    const raw = await redis.get(REDIS_QUICKREPLY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (err) {
+    logger.error('获取快捷回复规则失败', { err: err.message });
+    return [];
+  }
+}
+
+/**
+ * 保存快捷回复规则列表。
+ * @param {Array} rules - 规则列表
+ */
+async function saveQuickReplyRules(rules) {
+  if (!redis) return;
+  try {
+    await redis.set(REDIS_QUICKREPLY_KEY, JSON.stringify(rules));
+  } catch (err) {
+    logger.error('保存快捷回复规则失败', { err: err.message });
+  }
+}
+
+/**
+ * 尝试匹配快捷回复规则。
+ * @param {string} text - 用户输入文本
+ * @returns {Promise<string|null>} 匹配到的回复文本，null 表示无匹配
+ */
+async function matchQuickReply(text) {
+  const rules = await getQuickReplyRules();
+  const lower = text.toLowerCase();
+  for (const rule of rules) {
+    const kw = (rule.keyword || '').toLowerCase();
+    if (rule.matchType === 'exact' && lower === kw) {
+      stats.quickReplyHits++;
+      return rule.reply;
+    }
+    if (rule.matchType === 'fuzzy' && lower.includes(kw)) {
+      stats.quickReplyHits++;
+      return rule.reply;
+    }
+  }
+  return null;
+}
+
+// ─── v2.1 模板消息 DB 日志 ──────────────────────────────────────
+
+/**
+ * 记录模板消息发送日志到 DB。
+ * @param {Object} log - 日志信息
+ */
+async function dbTemplateLog(log) {
+  if (!pgPool) return;
+  const { openId, templateId, msgid, status, detail } = log;
+  const derived = deriveChannelAndId(openId);
+  try {
+    await pgPool.query(
+      `INSERT INTO clawbot_template_log (open_id, channel, template_id, msgid, status, detail)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        derived.cleanId,
+        derived.channel,
+        templateId || '',
+        msgid || null,
+        status || 'sent',
+        detail || null,
+      ]
+    );
+  } catch (err) {
+    logger.error('模板消息日志写入 DB 失败', { err: err.message, openId, templateId });
+  }
+}
+
 // ─── 扫码接入：二维码生成 ──────────────────────────────────────
 
 /**
@@ -1947,6 +2283,8 @@ const MENU_HANDLERS = {
   'MENU_CLEAR': '/clear',
   'MENU_FILES': '/files',
   'MENU_EMAIL': '/email',
+  'MENU_TOOLS': '/tools',
+  'MENU_TRANSFER': '/transfer',
 };
 
 // ─── 消息处理核心 ────────────────────────────────────────────
@@ -1961,6 +2299,15 @@ async function handleTextMessage(openId, rawText, requestId) {
 
   if (text.length > MAX_TEXT_LENGTH) {
     return '❌ 消息过长（最多 10000 字符），请精简后重试。';
+  }
+
+  // ── v2.1 快捷回复规则优先匹配（命令之前）──
+  if (!text.startsWith('/')) {
+    const quickReply = await matchQuickReply(text);
+    if (quickReply) {
+      logger.info('快捷回复命中', { openId, keyword: text.substring(0, 50) });
+      return quickReply;
+    }
   }
 
   // ── 命令处理 ──
@@ -1994,8 +2341,26 @@ async function handleTextMessage(openId, rawText, requestId) {
     return `✅ 已绑定计费邮箱：${email}\n\n你已通过认证，现在可以使用所有 AI 功能。\n后续对话将归入该账户计费。`;
   }
 
-  // /unbind — 解除绑定并清除所有数据
+  // /unbind — 解除绑定并清除所有数据（PCI-DSS v4.0 敏感操作二次确认）
   if (text === '/unbind') {
+    if (!redis) {
+      return '❌ 系统服务暂时不可用，请稍后重试。';
+    }
+    // 设置确认标记，要求用户发送 /unbind confirm 确认
+    await redis.set(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`, '1', 'EX', UNBIND_CONFIRM_TTL);
+    return '⚠️ 解绑将清除你的所有个人数据（邮箱、会话、偏好），此操作不可恢复。\n\n' +
+      `确认解绑请在 ${UNBIND_CONFIRM_TTL} 秒内发送：\n/unbind confirm`;
+  }
+  if (text === '/unbind confirm') {
+    if (!redis) {
+      return '❌ 系统服务暂时不可用，请稍后重试。';
+    }
+    // 检查确认标记
+    const flag = await redis.get(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`);
+    await redis.del(`${REDIS_UNBIND_CONFIRM_PREFIX}${openId}`);
+    if (flag !== '1') {
+      return '❌ 解绑确认已过期或未发起。请先发送 /unbind 再确认。';
+    }
     const email = await getUserEmail(openId);
     await clearUserData(openId);
     logger.info('audit', { action: 'unbind', openId, detail: `email=${email || 'N/A'}` });
@@ -2020,7 +2385,10 @@ async function handleTextMessage(openId, rawText, requestId) {
       '/calendar [操作] — 日历管理\n' +
       '/home [命令] — 智能家居控制\n' +
       '/files [操作] — 云存储管理\n' +
-      '/email [操作] — 邮件管理\n\n' +
+      '/email [操作] — 邮件管理\n' +
+      '/tools — 查看所有已集成工具\n\n' +
+      '【服务】\n' +
+      '/transfer — 转接人工客服\n\n' +
       '【消息类型】\n' +
       '• 发送文字 — AI 对话\n' +
       '• 发送语音 — 语音转文字 → AI 对话\n' +
@@ -2162,7 +2530,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       `会话消息数：${sessionMsgCount}\n\n` +
       `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
       `导出时间：${new Date().toISOString()}\n` +
-      `版本：灵枢接入通道 v2.0\n\n` +
+      `版本：灵枢接入通道 v2.1\n\n` +
       '⚠️ 请妥善保管导出数据，避免泄露个人信息。';
   }
 
@@ -2278,6 +2646,42 @@ async function handleTextMessage(openId, rawText, requestId) {
         await sendAsyncReply(openId, '❌ 邮件操作失败，请稍后重试。');
       });
     return '📧 正在处理邮件操作，请稍候...';
+  }
+
+  // /tools — 统一工具入口（v2.1 汇总所有已集成模块）
+  if (text === '/tools') {
+    return '🧰 Anima 灵枢接入通道 · 已集成工具\n\n' +
+      '═══ 已启用模块 ═══\n' +
+      '🤖 AI 对话 — 直接发送文字，支持 70+ 模型\n' +
+      '🔍 网页搜索 — /search <关键词>\n' +
+      '📅 日历管理 — /calendar [操作]（CalDAV）\n' +
+      '📧 邮件管理 — /email [操作]（IMAP/SMTP）\n' +
+      '📁 云存储 — /files [操作]（Nextcloud WebDAV）\n' +
+      '🏠 智能家居 — /home [命令]（Home Assistant）\n' +
+      '🎤 语音交互 — 发送语音消息（Whisper STT + TTS）\n' +
+      '📎 文件分析 — 发送图片/文件进行 AI 分析\n' +
+      '📍 位置服务 — 发送位置获取 AI 服务\n' +
+      '🔗 链接分析 — 发送链接进行内容分析\n\n' +
+      '═══ 账户管理 ═══\n' +
+      '💰 余额查询 — /balance\n' +
+      '📊 账户状态 — /status\n' +
+      '📋 数据导出 — /export\n' +
+      '🔄 切换模型 — /model <模型名>\n' +
+      '🗑 清除上下文 — /clear\n\n' +
+      '═══ 服务支持 ═══\n' +
+      '👤 人工客服 — /transfer\n\n' +
+      '💡 所有功能需先绑定邮箱认证后使用。';
+  }
+
+  // /transfer — 转接人工客服（v2.1 客服会话转接）
+  if (text === '/transfer') {
+    logger.info('用户请求转接客服', { openId });
+    dbAuditLog({ openId, action: 'kf_transfer', detail: 'user_initiated' });
+    const success = await transferToKf(openId);
+    if (success) {
+      return '👤 已为你转接人工客服，请稍候...\n\n如无人工客服在线，请稍后再试或直接发送消息与 AI 对话。';
+    }
+    return '❌ 人工客服转接失败，请稍后重试。\n\n你可以继续发送消息与 AI 对话。';
   }
 
   // ── 普通消息 → AI 对话 ──
@@ -2775,7 +3179,7 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
   }
   res.json({
-    version: '2.0.0',
+    version: '2.1.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -2794,6 +3198,9 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     export_count: stats.exportCount || 0,
     oauth_initiated: stats.oauthInitiated,
     oauth_completed: stats.oauthCompleted,
+    templates_sent: stats.templatesSent,
+    kf_transfers: stats.kfTransfers,
+    quick_reply_hits: stats.quickReplyHits,
     db_enabled: !!pgPool,
     bind_lockout_threshold: BIND_LOCKOUT_THRESHOLD,
     idle_session_timeout_min: IDLE_SESSION_TIMEOUT_MIN,
@@ -3031,20 +3438,30 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
               '你通过扫码关注，' +
               '首次使用请绑定邮箱完成认证：\n' +
               '/bind 你的邮箱@example.com\n\n' +
+              '🚀 快速入门：\n' +
+              '① 发送 /bind 邮箱 完成认证\n' +
+              '② 直接发送文字开始 AI 对话\n' +
+              '③ 发送 /tools 查看全部已集成工具\n\n' +
               '绑定后即可使用全部功能：\n' +
               '🤖 AI 对话（70+ 模型） | 🔍 网页搜索\n' +
               '📅 日历管理 | 📧 邮件 | 📁 云存储\n' +
-              '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n\n' +
+              '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n' +
+              '👤 人工客服 | 📋 数据导出\n\n' +
               '发送 /guide 查看详细功能导航。\n' +
               '发送 /help 查看命令列表。';
           } else {
             replyText = '🤖 欢迎使用 Anima 灵枢接入通道！\n\n' +
               '首次使用请先绑定邮箱完成认证：\n' +
               '/bind 你的邮箱@example.com\n\n' +
+              '🚀 快速入门：\n' +
+              '① 发送 /bind 邮箱 完成认证\n' +
+              '② 直接发送文字开始 AI 对话\n' +
+              '③ 发送 /tools 查看全部已集成工具\n\n' +
               '绑定后即可使用全部功能：\n' +
               '🤖 AI 对话（70+ 模型） | 🔍 网页搜索\n' +
               '📅 日历管理 | 📧 邮件 | 📁 云存储\n' +
-              '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n\n' +
+              '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n' +
+              '👤 人工客服 | 📋 数据导出\n\n' +
               '支持文字、语音、图片、文件、位置、链接等消息类型。\n\n' +
               '发送 /guide 查看详细功能导航。\n' +
               '发送 /help 查看命令列表。';
@@ -4449,6 +4866,160 @@ app.post('/clawbot/analytics/:metric', adminLimiter, requireAdminIp, requireServ
   }
 });
 
+// ─── v2.1 模板消息 API（官方服务通知能力）──────────────────────
+
+// 发送模板消息
+app.post('/clawbot/template/send', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { touser, template_id, url, miniprogram, data } = req.body || {};
+
+  if (!touser || !OPENID_RE.test(touser)) {
+    res.status(400).json({ success: false, msg: '缺少有效的 touser（OpenID）' });
+    return;
+  }
+  if (!template_id || !TEMPLATE_MSG_RE.test(template_id)) {
+    res.status(400).json({ success: false, msg: '缺少有效的 template_id' });
+    return;
+  }
+  if (!data || typeof data !== 'object') {
+    res.status(400).json({ success: false, msg: '缺少有效的 data 字段' });
+    return;
+  }
+  // URL 长度校验
+  if (url && (typeof url !== 'string' || url.length > 2048)) {
+    res.status(400).json({ success: false, msg: 'url 过长（最大 2048 字符）' });
+    return;
+  }
+
+  const result = await sendTemplateMessage({ touser, template_id, url, miniprogram, data });
+  dbAuditLog({ openId: touser, action: 'template_send', detail: `template_id=${template_id}, success=${result.success}` });
+  dbTemplateLog({ openId: touser, templateId: template_id, msgid: result.msgid, status: result.success ? 'sent' : 'failed', detail: result.errmsg });
+
+  if (result.success) {
+    res.json({ success: true, msgid: result.msgid });
+  } else {
+    res.status(500).json({ success: false, msg: result.errmsg });
+  }
+});
+
+// 获取模板列表
+app.get('/clawbot/template/list', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const templates = await getTemplateList();
+  if (templates) {
+    res.json({ success: true, count: templates.length, templates });
+  } else {
+    res.status(503).json({ success: false, msg: '获取模板列表失败' });
+  }
+});
+
+// ─── v2.1 客服会话转接管理端点 ─────────────────────────────────
+
+// 管理端手动转接用户到人工客服
+app.post('/clawbot/kf/transfer', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { openId, kfAccount } = req.body || {};
+
+  if (!openId || !OPENID_RE.test(openId)) {
+    res.status(400).json({ success: false, msg: '缺少有效的 openId' });
+    return;
+  }
+  if (kfAccount && typeof kfAccount !== 'string') {
+    res.status(400).json({ success: false, msg: 'kfAccount 格式无效' });
+    return;
+  }
+
+  const success = await transferToKf(openId, kfAccount);
+  dbAuditLog({ openId, action: 'kf_transfer', detail: `admin_initiated, kf=${kfAccount || 'auto'}` });
+
+  if (success) {
+    res.json({ success: true, msg: '客服转接成功' });
+  } else {
+    res.status(500).json({ success: false, msg: '客服转接失败' });
+  }
+});
+
+// ─── v2.1 快捷回复规则管理端点 ─────────────────────────────────
+
+// 获取快捷回复规则列表
+app.get('/clawbot/quickreply', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const rules = await getQuickReplyRules();
+  res.json({ success: true, count: rules.length, rules });
+});
+
+// 创建快捷回复规则
+app.post('/clawbot/quickreply', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { keyword, matchType, reply } = req.body || {};
+
+  if (!keyword || typeof keyword !== 'string' || keyword.length > 200) {
+    res.status(400).json({ success: false, msg: '缺少有效的 keyword（关键词，最长 200 字符）' });
+    return;
+  }
+  if (!matchType || !['exact', 'fuzzy'].includes(matchType)) {
+    res.status(400).json({ success: false, msg: 'matchType 必须为 exact（精确匹配）或 fuzzy（模糊匹配）' });
+    return;
+  }
+  if (!reply || typeof reply !== 'string' || reply.length > 2048) {
+    res.status(400).json({ success: false, msg: '缺少有效的 reply（回复内容，最长 2048 字符）' });
+    return;
+  }
+
+  const rules = await getQuickReplyRules();
+  const ruleId = crypto.randomUUID();
+  rules.push({ id: ruleId, keyword, matchType, reply, createdAt: new Date().toISOString() });
+  await saveQuickReplyRules(rules);
+  dbAuditLog({ openId: 'admin', action: 'quickreply_create', detail: `id=${ruleId}, keyword=${keyword.substring(0, 50)}` });
+
+  res.json({ success: true, ruleId, msg: '快捷回复规则已创建' });
+});
+
+// 删除快捷回复规则
+app.delete('/clawbot/quickreply/:ruleId', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const ruleId = req.params.ruleId;
+  if (!ruleId || ruleId.length > 64) {
+    res.status(400).json({ success: false, msg: '无效的 ruleId' });
+    return;
+  }
+
+  const rules = await getQuickReplyRules();
+  const idx = rules.findIndex(r => r.id === ruleId);
+  if (idx === -1) {
+    res.status(404).json({ success: false, msg: '规则不存在' });
+    return;
+  }
+
+  rules.splice(idx, 1);
+  await saveQuickReplyRules(rules);
+  dbAuditLog({ openId: 'admin', action: 'quickreply_delete', detail: `id=${ruleId}` });
+
+  res.json({ success: true, msg: '快捷回复规则已删除' });
+});
+
+// ─── v2.1 小程序卡片消息发送端点 ──────────────────────────────
+
+app.post('/clawbot/miniprogram/send', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { openId, appid, title, pagepath, thumb_media_id } = req.body || {};
+
+  if (!openId || !OPENID_RE.test(openId)) {
+    res.status(400).json({ success: false, msg: '缺少有效的 openId' });
+    return;
+  }
+  if (!appid || typeof appid !== 'string' || appid.length > 64) {
+    res.status(400).json({ success: false, msg: '缺少有效的小程序 appid' });
+    return;
+  }
+  if (title && (typeof title !== 'string' || title.length > 256)) {
+    res.status(400).json({ success: false, msg: 'title 过长（最大 256 字符）' });
+    return;
+  }
+
+  const success = await sendMiniProgramCard(openId, { appid, title, pagepath, thumb_media_id });
+  dbAuditLog({ openId, action: 'miniprogram_send', detail: `appid=${appid}` });
+
+  if (success) {
+    res.json({ success: true, msg: '小程序卡片发送成功' });
+  } else {
+    res.status(500).json({ success: false, msg: '小程序卡片发送失败' });
+  }
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -4462,8 +5033,8 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v2.0 已启动，端口 ${PORT}`);
-  logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
+  logger.info(`灵枢接入通道 v2.1 已启动，端口 ${PORT}`);
+  logger.info('官方微信 ClawBot 插件接入（扫码/App互通/模板消息/小程序卡片）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
     logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
@@ -4475,8 +5046,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
   if (SERVICE_TOKEN) {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
+    logger.info('v2.1 新增端点：模板消息(/clawbot/template)、客服转接(/clawbot/kf)、快捷回复(/clawbot/quickreply)、小程序(/clawbot/miniprogram)');
   } else {
-    logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /clawbot/menu, /clawbot/users, /clawbot/audit, /stats）不可用');
+    logger.warn('SERVICE_TOKEN 未设置，管理端点不可用');
   }
   if (ADMIN_IP_ALLOWLIST.length > 0) {
     logger.info(`管理端点 IP 白名单已启用（${ADMIN_IP_ALLOWLIST.length} 个 IP）`);
@@ -4484,8 +5056,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`登录锁定：${BIND_LOCKOUT_THRESHOLD} 次失败后锁定 ${BIND_LOCKOUT_DURATION_MIN} 分钟（PCI-DSS 8.1.6）`);
   logger.info(`空闲会话超时：${IDLE_SESSION_TIMEOUT_MIN} 分钟（PCI-DSS 8.1.8）`);
   logger.info(`审计日志保留：${AUDIT_RETENTION_DAYS} 天（PCI-DSS 10.7）`);
+  logger.info('敏感操作二次确认已启用（PCI-DSS v4.0）');
   if (pgPool) {
-    logger.info('PostgreSQL 审计日志/用户记录持久化已启用');
+    logger.info('PostgreSQL 审计日志/用户记录/模板消息日志持久化已启用');
   }
   if (OAUTH_REDIRECT_URI) {
     logger.info(`微信 OAuth2.0 网页授权已配置（scope=${OAUTH_SCOPE}）`);

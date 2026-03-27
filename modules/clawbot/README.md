@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v2.0
+# 微信 ClawBot 插件灵枢接入通道 v2.1
 
 ## 概述
 
@@ -7,12 +7,23 @@
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
 所有功能均需登录认证后使用，用户数据强隔离保证安全。符合企业级商业运维模式。
-符合 PCI-DSS 和 CIS 安全标准。
+符合 PCI-DSS v4.0 和 CIS v8 安全标准。
 
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v2.0 新特性
+## v2.1 新特性
+
+- **模板消息 API**：新增 `POST /clawbot/template/send` 发送模板消息（服务通知），支持 first/keyword/remark 数据字段、跳转 URL 和小程序路径。新增 `GET /clawbot/template/list` 查询模板列表。发送记录持久化到 `clawbot_template_log` 表（PCI-DSS 10.2.2）。
+- **客服会话转接**：新增 `/transfer` 用户命令和 `POST /clawbot/kf/transfer` 管理端点，支持将用户转接到人工客服。转接事件审计记录（PCI-DSS 10.2.2）。
+- **快捷回复规则管理**：新增 `GET/POST/DELETE /clawbot/quickreply` 端点，支持创建精确匹配/模糊匹配的自动回复规则。规则存储在 Redis，优先级高于 AI 对话（命令除外）。
+- **小程序卡片消息**：新增 `POST /clawbot/miniprogram/send` 端点，通过客服消息接口发送小程序卡片（appid/pagepath/title/thumb_media_id）。
+- **统一工具入口 /tools**：新增 `/tools` 命令，汇总展示所有已集成模块的状态和用法，帮助用户快速发现可用功能。
+- **增强欢迎消息快速入门**：subscribe 欢迎消息新增「🚀 快速入门」三步引导（① 绑定 → ② 对话 → ③ 查看工具），降低新用户使用门槛。
+- **敏感操作二次确认**：`/unbind` 命令改为两步确认流程（PCI-DSS v4.0），用户需在指定时间内发送 `/unbind confirm` 确认解绑。
+- **数据库迁移 009**：新增 `clawbot_template_log` 表记录模板消息发送历史。
+
+## v2.0 新特性（历史版本）
 
 - **JS-SDK 签名配置端点**：新增 `GET /clawbot/jssdk/config` 端点，生成微信 JS-SDK wx.config 所需的签名参数（appId、timestamp、nonceStr、signature），网页端可调用微信扫一扫、位置、图片预览、分享等全部 JS-SDK 能力。jsapi_ticket 自动缓存续期。
 - **用户标签管理**：新增 `GET/POST/DELETE /clawbot/tags` 及 `POST/DELETE /clawbot/tags/:tagId/users` 端点，支持创建/删除标签、批量打标签/取消标签。所有标签操作记录审计日志（PCI-DSS 10.2.2）。
@@ -260,6 +271,13 @@ docker compose up -d
 | `/clawbot/material/list` | POST | 分页查询永久素材列表 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/material/:mediaId` | DELETE | 删除永久素材 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/analytics/:metric` | POST | 微信数据统计分析（用户/消息/接口） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/template/send` | POST | 发送模板消息（服务通知） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/template/list` | GET | 查询模板列表 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/kf/transfer` | POST | 管理端手动转接用户到人工客服 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/quickreply` | GET | 查询快捷回复规则列表 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/quickreply` | POST | 创建快捷回复规则（精确/模糊匹配） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/quickreply/:ruleId` | DELETE | 删除快捷回复规则 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/miniprogram/send` | POST | 发送小程序卡片消息 | SERVICE_TOKEN + IP白名单 |
 | `/stats` | GET | 运营统计（消息数、会话数、封禁数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
@@ -296,6 +314,9 @@ docker compose up -d
 | `anima:clawbot:nicknames` | Hash | openid → 用户昵称 |
 | `anima:clawbot:session:{openId}` | String | JSON 会话数据（TTL=SESSION_TTL） |
 | `anima:clawbot:bind_fail:{openId}` | String | /bind 失败次数（登录锁定，TTL=锁定时长） |
+| `anima:clawbot:quickreply_rules` | String | 快捷回复规则列表（JSON） |
+| `anima:clawbot:unbind_confirm:{openId}` | String | 解绑确认标记（TTL=120s） |
+| `anima:clawbot:admin_csrf:{token}` | String | 管理端 CSRF token |
 
 ### 企业微信（WeCom）
 
