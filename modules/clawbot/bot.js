@@ -1,10 +1,47 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.8
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.9
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.9 相对于 v1.8）：
+ *
+ *   #ENT-1.9-1  微信 OAuth2.0 网页授权（普通用户轻松接入）
+ *               - 新增 GET /clawbot/oauth 发起微信网页授权，
+ *                 自动跳转微信 OAuth 页面获取用户授权。
+ *               - 新增 GET /clawbot/oauth/callback 处理授权回调，
+ *                 通过 code 换取 access_token 获取用户 OpenID。
+ *               - Redis CSRF state 防护（PCI-DSS 6.5），每个
+ *                 授权请求生成唯一 state 并校验回调一致性。
+ *               - OAuth 完成后自动绑定用户身份，无需手动 /bind。
+ *               - 支持 snsapi_base（静默授权）和 snsapi_userinfo
+ *                （显式授权获取昵称头像）两种 scope。
+ *
+ *   #ENT-1.9-2  功能导航 /guide（普通用户易用性增强）
+ *               - 新增 /guide 命令，分类展示灵枢接入通道全部
+ *                 能力：AI 对话、工具集、安全管理、消息类型。
+ *               - 引导新用户快速上手，降低使用门槛。
+ *
+ *   #ENT-1.9-3  增强欢迎消息（完整功能展示）
+ *               - subscribe 欢迎消息展示全部功能亮点：
+ *                 AI 对话、网页搜索、日历、邮件、云存储、
+ *                 智能家居、语音交互、文件分析。
+ *               - 引导用户通过 /guide 了解详细功能。
+ *
+ *   #ENT-1.9-4  Nginx 反向代理集成（PCI-DSS 6.4.1 / CIS 13）
+ *               - ClawBot 流量统一经 Nginx 反向代理，享受
+ *                 ModSecurity WAF、TLS 终结、安全头、边缘限速。
+ *               - /clawbot/webhook 独立限速 300r/m（微信回调）。
+ *               - /clawbot/ 管理端点限速 30r/m。
+ *               - /clawbot/oauth 走 login 限速 5r/m（防暴力授权）。
+ *               - /wecom/webhook 企业微信复用 ClawBot 限速。
+ *
+ *   #ENT-1.9-5  OAuth 统计与审计（企业级运维）
+ *               - /stats 端点新增 oauth_initiated / oauth_completed
+ *                 指标，监控授权转化率。
+ *               - OAuth 授权事件记录审计日志（PCI-DSS 10.2.1）。
  *
  * 修改记录（v1.7 相对于 v1.6）：
  *
@@ -408,6 +445,16 @@ const WECOM_TOKEN     = process.env.WECOM_TOKEN || '';
 const WECOM_AES_KEY   = process.env.WECOM_ENCODING_AES_KEY || '';
 const WECOM_AGENT_ID  = process.env.WECOM_AGENT_ID || '';
 
+// ─── 微信 OAuth2.0 网页授权配置 ──────────────────────────────
+// OAuth 回调 URL（必须与微信公众号后台配置的"网页授权域名"一致）
+const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || '';
+// OAuth scope：snsapi_base（静默授权）或 snsapi_userinfo（显式授权获取昵称头像）
+const OAUTH_SCOPE = process.env.OAUTH_SCOPE || 'snsapi_userinfo';
+// OAuth state 有效期（秒，默认 300 即 5 分钟）
+const OAUTH_STATE_TTL = Math.max(60, Math.min(600, parseInt(process.env.OAUTH_STATE_TTL || '300', 10)));
+// OAuth CSRF state Redis 键前缀
+const REDIS_OAUTH_STATE_PREFIX = 'anima:clawbot:oauth_state:';
+
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
   process.exit(1);
@@ -460,6 +507,8 @@ const stats = {
   totalCommands: 0,
   commandsByName: {},
   totalErrors: 0,
+  oauthInitiated: 0,
+  oauthCompleted: 0,
 };
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
@@ -1857,7 +1906,47 @@ async function handleTextMessage(openId, rawText, requestId) {
       '• 发送图片/文件 — AI 分析\n' +
       '• 发送位置 — 位置相关 AI 服务\n' +
       '• 发送链接 — 链接内容分析\n\n' +
+      '/guide — 功能导航（详细功能介绍）\n' +
       '/help — 显示此帮助';
+  }
+
+  // /guide — 功能导航（详细功能介绍，帮助普通用户快速上手）
+  if (text === '/guide') {
+    stats.totalCommands++;
+    stats.commandsByName['guide'] = (stats.commandsByName['guide'] || 0) + 1;
+    return '🧭 Anima 灵枢接入通道 · 功能导航\n\n' +
+      '═══ 🤖 AI 对话 ═══\n' +
+      '直接发送文字即可与 AI 对话，支持 70+ 模型。\n' +
+      '• /model <模型名> 切换模型\n' +
+      '• /clear 清除上下文重新开始\n\n' +
+      '═══ 🔍 网页搜索 ═══\n' +
+      '发送 /search <关键词> 即可搜索全网信息。\n' +
+      '例：/search 今天天气\n\n' +
+      '═══ 📅 日历管理 ═══\n' +
+      '发送 /calendar 管理你的日程（Nextcloud CalDAV）。\n' +
+      '例：/calendar 明天下午3点开会\n\n' +
+      '═══ 📧 邮件管理 ═══\n' +
+      '发送 /email 查看、搜索或发送邮件。\n' +
+      '例：/email 查看最新邮件\n\n' +
+      '═══ 📁 云存储 ═══\n' +
+      '发送 /files 管理你的云端文件（Nextcloud WebDAV）。\n' +
+      '例：/files 查找报告\n\n' +
+      '═══ 🏠 智能家居 ═══\n' +
+      '发送 /home 控制你的智能设备（Home Assistant）。\n' +
+      '例：/home 打开客厅灯\n\n' +
+      '═══ 🎤 语音交互 ═══\n' +
+      '直接发送语音消息，AI 自动识别并回复。\n' +
+      '支持语音转文字 → AI 对话 → 语音回复。\n\n' +
+      '═══ 📎 文件分析 ═══\n' +
+      '发送图片、视频、文件，AI 自动分析内容。\n\n' +
+      '═══ 🔐 账户安全 ═══\n' +
+      '/bind <邮箱> — 绑定邮箱完成认证\n' +
+      '/unbind — 解绑并删除所有个人数据\n' +
+      '/status — 查看当前账户状态\n' +
+      '/export — 导出个人数据\n' +
+      '/balance — 查询余额\n\n' +
+      '💡 所有功能需先绑定邮箱认证后使用。\n' +
+      '发送 /help 查看命令速查表。';
   }
 
   // ── 认证检查（/bind 和 /help 不需要认证）──
@@ -2556,7 +2645,7 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
   }
   res.json({
-    version: '1.8.0',
+    version: '1.9.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -2565,6 +2654,7 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     encrypt_mode: ENCRYPT_MODE,
     wecom_enabled: WECOM_ENABLED,
     voice_enabled: VOICE_ENABLED,
+    oauth_configured: !!OAUTH_REDIRECT_URI,
     total_messages: stats.totalMessages,
     messages_by_type: stats.messagesByType,
     total_commands: stats.totalCommands,
@@ -2572,6 +2662,8 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     total_errors: stats.totalErrors,
     blocked_users: blockedCount,
     export_count: stats.exportCount || 0,
+    oauth_initiated: stats.oauthInitiated,
+    oauth_completed: stats.oauthCompleted,
     db_enabled: !!pgPool,
     bind_lockout_threshold: BIND_LOCKOUT_THRESHOLD,
     idle_session_timeout_min: IDLE_SESSION_TIMEOUT_MIN,
@@ -2809,15 +2901,23 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
               '你通过扫码关注，' +
               '首次使用请绑定邮箱完成认证：\n' +
               '/bind 你的邮箱@example.com\n\n' +
-              '绑定后即可直接发送消息与 AI 对话。\n\n' +
-              '发送 /help 查看所有可用命令。';
+              '绑定后即可使用全部功能：\n' +
+              '🤖 AI 对话（70+ 模型） | 🔍 网页搜索\n' +
+              '📅 日历管理 | 📧 邮件 | 📁 云存储\n' +
+              '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n\n' +
+              '发送 /guide 查看详细功能导航。\n' +
+              '发送 /help 查看命令列表。';
           } else {
             replyText = '🤖 欢迎使用 Anima 灵枢接入通道！\n\n' +
               '首次使用请先绑定邮箱完成认证：\n' +
               '/bind 你的邮箱@example.com\n\n' +
-              '绑定后即可直接发送消息与 AI 对话。\n' +
-              '支持文字、语音、图片、文件、位置、链接等多种消息类型。\n\n' +
-              '发送 /help 查看所有可用命令。';
+              '绑定后即可使用全部功能：\n' +
+              '🤖 AI 对话（70+ 模型） | 🔍 网页搜索\n' +
+              '📅 日历管理 | 📧 邮件 | 📁 云存储\n' +
+              '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n\n' +
+              '支持文字、语音、图片、文件、位置、链接等消息类型。\n\n' +
+              '发送 /guide 查看详细功能导航。\n' +
+              '发送 /help 查看命令列表。';
           }
         } else if (eventType === 'SCAN') {
           // 已关注用户扫码（不触发 subscribe，触发 SCAN 事件）
@@ -3430,6 +3530,172 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
   }
 });
 
+// ─── 微信 OAuth2.0 网页授权（普通用户轻松接入）──────────────────
+// 发起 OAuth 授权：重定向用户到微信授权页面
+app.get('/clawbot/oauth', async (req, res) => {
+  if (!CLAWBOT_APP_ID || !OAUTH_REDIRECT_URI) {
+    res.status(503).json({ error: 'OAuth not configured' });
+    return;
+  }
+
+  try {
+    // 生成 CSRF state（PCI-DSS 6.5 防跨站请求伪造）
+    const state = crypto.randomBytes(16).toString('hex');
+    if (redis) {
+      await redis.set(
+        `${REDIS_OAUTH_STATE_PREFIX}${state}`,
+        JSON.stringify({ created: Date.now() }),
+        'EX',
+        OAUTH_STATE_TTL
+      );
+    }
+
+    stats.oauthInitiated++;
+    logger.info('OAuth 授权发起', { state: state.substring(0, 8) });
+
+    // 构建微信 OAuth2.0 授权 URL
+    const scope = OAUTH_SCOPE === 'snsapi_base' ? 'snsapi_base' : 'snsapi_userinfo';
+    const redirectUri = encodeURIComponent(OAUTH_REDIRECT_URI);
+    const authUrl = `https://open.weixin.qq.com/connect/oauth2/authorize` +
+      `?appid=${CLAWBOT_APP_ID}` +
+      `&redirect_uri=${redirectUri}` +
+      `&response_type=code` +
+      `&scope=${scope}` +
+      `&state=${state}` +
+      `#wechat_redirect`;
+
+    res.redirect(302, authUrl);
+  } catch (err) {
+    logger.error('OAuth 授权发起失败', { err: err.message });
+    stats.totalErrors++;
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// OAuth2.0 回调：用 code 换取 access_token + openid
+app.get('/clawbot/oauth/callback', async (req, res) => {
+  const { code, state } = req.query;
+
+  if (!code || !state) {
+    res.status(400).json({ error: 'Missing code or state' });
+    return;
+  }
+
+  // 类型安全校验
+  if (typeof code !== 'string' || typeof state !== 'string') {
+    res.status(400).json({ error: 'Invalid parameters' });
+    return;
+  }
+
+  // State 格式校验（防止注入）
+  if (!/^[a-f0-9]{32}$/.test(state)) {
+    res.status(400).json({ error: 'Invalid state format' });
+    return;
+  }
+
+  try {
+    // 验证 CSRF state（PCI-DSS 6.5）
+    if (redis) {
+      const stateKey = `${REDIS_OAUTH_STATE_PREFIX}${state}`;
+      const stateData = await redis.get(stateKey);
+      if (!stateData) {
+        logger.warn('OAuth state 无效或已过期', { state: state.substring(0, 8) });
+        dbAuditLog({ openId: 'unknown', action: 'oauth_state_invalid', detail: `state=${state.substring(0, 8)}`, ip: req.ip, requestId: req.id });
+        res.status(403).json({ error: 'Invalid or expired state' });
+        return;
+      }
+      // 一次性使用，删除 state（防止重放攻击）
+      await redis.del(stateKey);
+    }
+
+    // 用 code 换取 access_token + openid
+    const tokenUrl = `https://api.weixin.qq.com/sns/oauth2/access_token` +
+      `?appid=${CLAWBOT_APP_ID}` +
+      `&secret=${CLAWBOT_APP_SECRET}` +
+      `&code=${encodeURIComponent(code)}` +
+      `&grant_type=authorization_code`;
+
+    const tokenResp = await request(tokenUrl, {
+      method: 'GET',
+      headersTimeout: 10_000,
+      bodyTimeout: 10_000,
+    });
+    const tokenData = await tokenResp.body.json();
+
+    if (tokenData.errcode) {
+      logger.error('OAuth token 交换失败', { errcode: tokenData.errcode, errmsg: tokenData.errmsg });
+      res.status(502).json({ error: 'WeChat OAuth failed', detail: tokenData.errmsg });
+      return;
+    }
+
+    const { openid, access_token: oauthAccessToken, scope: grantedScope } = tokenData;
+    if (!openid) {
+      logger.error('OAuth 未返回 openid', { tokenData: JSON.stringify(tokenData).substring(0, 200) });
+      res.status(502).json({ error: 'No openid returned' });
+      return;
+    }
+
+    logger.info('OAuth 授权成功', { openId: openid, scope: grantedScope });
+
+    // 如果 scope=snsapi_userinfo，获取用户昵称
+    let nickname = '';
+    if (grantedScope === 'snsapi_userinfo' && oauthAccessToken) {
+      try {
+        const userInfoUrl = `https://api.weixin.qq.com/sns/userinfo` +
+          `?access_token=${oauthAccessToken}` +
+          `&openid=${openid}` +
+          `&lang=zh_CN`;
+        const userInfoResp = await request(userInfoUrl, {
+          method: 'GET',
+          headersTimeout: 10_000,
+          bodyTimeout: 10_000,
+        });
+        const userInfo = await userInfoResp.body.json();
+        if (userInfo.nickname) {
+          nickname = userInfo.nickname;
+          if (redis) {
+            await redis.hset(REDIS_NICKNAMES_KEY, openid, nickname);
+          }
+        }
+      } catch (err) {
+        logger.error('OAuth 获取用户信息失败', { err: err.message, openId: openid });
+      }
+    }
+
+    // 自动设置用户已认证状态
+    await setUserAuthed(openid);
+    dbUpsertUser({ openId: openid, nickname, status: 'active' });
+    dbAuditLog({ openId: openid, action: 'oauth_bind', detail: `scope=${grantedScope}${nickname ? `,nickname=${nickname}` : ''}`, ip: req.ip, requestId: req.id });
+
+    stats.oauthCompleted++;
+
+    // 返回友好的授权成功页面
+    const displayName = nickname ? ` ${nickname}` : '';
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.status(200).send(
+      '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<title>灵枢接入通道 · 授权成功</title>' +
+      '<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:flex;' +
+      'justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f0f2f5}' +
+      '.card{background:#fff;border-radius:12px;padding:40px;text-align:center;max-width:400px;' +
+      'box-shadow:0 2px 12px rgba(0,0,0,.08)}.icon{font-size:64px;margin-bottom:16px}' +
+      'h1{font-size:20px;color:#333;margin:0 0 12px}p{color:#666;line-height:1.6;margin:8px 0}' +
+      '.hint{color:#999;font-size:13px;margin-top:20px}</style></head>' +
+      '<body><div class="card"><div class="icon">✅</div>' +
+      `<h1>授权成功${displayName}</h1>` +
+      '<p>你的微信已成功绑定 Anima 灵枢接入通道。</p>' +
+      '<p>现在可以回到微信对话，直接发送消息使用 AI 功能。</p>' +
+      '<p class="hint">如需绑定邮箱以使用计费功能，请发送 /bind 邮箱地址</p>' +
+      '</div></body></html>'
+    );
+  } catch (err) {
+    logger.error('OAuth 回调处理异常', { err: err.message });
+    stats.totalErrors++;
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -3443,7 +3709,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.8 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.9 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
@@ -3467,6 +3733,11 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`审计日志保留：${AUDIT_RETENTION_DAYS} 天（PCI-DSS 10.7）`);
   if (pgPool) {
     logger.info('PostgreSQL 审计日志/用户记录持久化已启用');
+  }
+  if (OAUTH_REDIRECT_URI) {
+    logger.info(`微信 OAuth2.0 网页授权已配置（scope=${OAUTH_SCOPE}）`);
+  } else {
+    logger.info('微信 OAuth2.0 网页授权未配置（OAUTH_REDIRECT_URI 未设置，用户通过 /bind 绑定）');
   }
 });
 
