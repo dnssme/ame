@@ -1825,7 +1825,10 @@ function buildTextReply(toUser, fromUser, text) {
 // ─── Express 服务器 ──────────────────────────────────────────
 const app = express();
 
-// 安全中间件（CIS 安全头加固）
+// 信任反向代理（Nginx / LB），确保 req.ip 获取真实客户端 IP
+app.set('trust proxy', 1);
+
+// 安全中间件（CIS 安全头加固：跨域资源策略 + 标准安全头）
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'same-origin' },
 }));
@@ -1893,13 +1896,19 @@ const adminLimiter = rateLimit({
 });
 
 // ─── 管理端点 IP 白名单中间件（CIS 网络访问限制）──────────
+function normalizeIp(ip) {
+  // 处理 IPv4-mapped IPv6 地址（如 ::ffff:192.168.1.1 → 192.168.1.1）
+  if (ip && ip.startsWith('::ffff:')) return ip.slice(7);
+  return ip || '';
+}
+
 function requireAdminIp(req, res, next) {
   if (ADMIN_IP_ALLOWLIST.length === 0) {
     // 未配置白名单时不限制（向后兼容）
     next();
     return;
   }
-  const clientIp = req.ip || '';
+  const clientIp = normalizeIp(req.ip);
   if (!ADMIN_IP_ALLOWLIST.includes(clientIp)) {
     logger.info('audit', {
       action: 'admin_ip_denied',
@@ -1985,7 +1994,8 @@ app.get('/ready', async (req, res) => {
     try {
       await redis.ping();
       checks.redis = 'ok';
-    } catch {
+    } catch (err) {
+      logger.warn('Redis 就绪检测失败', { err: err.message });
       checks.redis = 'error';
       ready = false;
     }
