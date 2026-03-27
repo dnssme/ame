@@ -9036,11 +9036,9 @@ app.post('/clawbot/plugin/sdk/callback', adminLimiter, (req, res) => {
   if (cbSig && cbTs && plugin_id) {
     const payload = `${plugin_id}|${cbTs}|${event}`;
     const expected = crypto.createHmac('sha256', CLAWBOT_APP_SECRET).update(payload).digest('hex');
-    const sigBuf = Buffer.alloc(32);
-    const expBuf = Buffer.alloc(32);
-    Buffer.from(cbSig, 'hex').copy(sigBuf);
-    Buffer.from(expected, 'hex').copy(expBuf);
-    if (!crypto.timingSafeEqual(sigBuf, expBuf)) {
+    const sigBuf = Buffer.from(cbSig, 'hex');
+    const expBuf = Buffer.from(expected, 'hex');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
       dbAuditLog({ openId: 'system:sdk', action: 'sdk_callback_auth_fail', detail: `event=${event}` });
       res.status(401).json({ success: false, msg: 'Invalid callback signature' });
       return;
