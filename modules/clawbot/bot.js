@@ -847,6 +847,12 @@ const MAX_USER_AGENT_LENGTH = 512; // UA 截断长度上限
 const HKDF_SALT = Buffer.from(process.env.HKDF_SALT || 'anima-clawbot-user-isolation-v28', 'utf8');
 const HKDF_INFO_PREFIX = Buffer.from('clawbot-user-key-', 'utf8');
 
+// 启动时警告：HKDF_SALT 未配置（PCI-DSS 3.5 要求独立部署使用唯一盐值）
+if (!process.env.HKDF_SALT) {
+  // 延迟到 logger 初始化后输出，暂记标志
+  var _hkdfSaltWarning = true; // eslint-disable-line no-var
+}
+
 /**
  * HKDF 用户级密钥派生（PCI-DSS 3.5 密钥管理）
  * 从主密钥 + 用户 ID 派生出用户独享的加密密钥
@@ -4321,7 +4327,8 @@ async function handleTextMessage(openId, rawText, requestId) {
           await saveUserConsent(openId, 'data_processing', true);
           alreadyDone++;
           actions.push('✅ 已自动同意数据处理协议');
-        } catch (_e) {
+        } catch (consentErr) {
+          logger.warn('quickstart 自动同意失败', { openId, err: consentErr.message });
           actions.push('❌ 数据协议同意失败，请发送 /consent agree');
         }
       }
@@ -4333,7 +4340,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       if (redis) {
         try {
           pluginActive = !!(await redis.sismember(REDIS_PLUGIN_ACTIVATED_KEY, openId));
-        } catch (_e) { /* continue */ }
+        } catch (checkErr) { logger.warn('quickstart 插件状态查询失败', { openId, err: checkErr.message }); }
       }
       if (pluginActive) {
         alreadyDone++;
@@ -4345,7 +4352,8 @@ async function handleTextMessage(openId, rawText, requestId) {
           stats.userActivations++;
           actions.push('✅ ClawBot 插件已自动激活');
           dbAuditLog({ openId, action: 'plugin_activate', detail: `version=${PLUGIN_VERSION},method=quickstart` });
-        } catch (_e) {
+        } catch (activateErr) {
+          logger.warn('quickstart 插件激活失败', { openId, err: activateErr.message });
           actions.push('❌ 插件激活失败，请发送 /activate');
         }
       }
@@ -8108,8 +8116,14 @@ app.post('/clawbot/kf/message', adminLimiter, requireAdminIp, requireServiceToke
       }
       payload[msgtype] = { media_id };
     } else {
-      // 其它类型直接透传 body
-      Object.assign(payload, req.body);
+      // 仅允许透传 msgtype 对应的数据字段（防止注入任意字段）
+      const allowed = ['music', 'news', 'msgmenu', 'miniprogrampage'];
+      if (allowed.includes(msgtype) && req.body[msgtype] && typeof req.body[msgtype] === 'object') {
+        payload[msgtype] = req.body[msgtype];
+      } else {
+        res.status(400).json({ error: `${msgtype} 类型缺少对应的数据字段` });
+        return;
+      }
     }
     const { body } = await request(`https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(token)}`, {
       method: 'POST',
@@ -8665,6 +8679,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`个性化菜单端点：POST/DELETE /clawbot/menu/conditional`);
   if (SESSION_ENCRYPT_KEY) {
     logger.info('HKDF 用户级密钥派生已启用（PCI-DSS 3.5）');
+    if (typeof _hkdfSaltWarning !== 'undefined' && _hkdfSaltWarning) {
+      logger.warn('⚠ HKDF_SALT 未配置，使用默认盐值。生产环境应设置唯一 HKDF_SALT（PCI-DSS 3.5）');
+    }
   }
 });
 
