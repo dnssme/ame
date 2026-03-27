@@ -259,10 +259,11 @@ if (process.env.NODE_ENV !== 'production') {
 
 // PCI-DSS 4.1: 禁止全局禁用 TLS 证书校验
 if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
-  logger.error('NODE_TLS_REJECT_UNAUTHORIZED=0 将禁用 TLS 证书校验，违反 PCI-DSS 4.1');
   if (process.env.NODE_ENV === 'production') {
+    logger.error('NODE_TLS_REJECT_UNAUTHORIZED=0 将禁用 TLS 证书校验，违反 PCI-DSS 4.1，生产环境拒绝启动');
     process.exit(1);
   }
+  logger.warn('NODE_TLS_REJECT_UNAUTHORIZED=0 已禁用 TLS 证书校验，仅允许非生产环境，请勿在生产部署中使用');
 }
 
 // ─── 运营统计 ──────────────────────────────────────────────────
