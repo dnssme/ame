@@ -1,10 +1,33 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.2
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.3
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.3 相对于 v1.2）：
+ *
+ *   #ENT-1.3-1  全功能工具模块整合
+ *               - /files 从静态信息升级为可操作命令，通过 Agent
+ *                 调用 Nextcloud WebDAV 执行文件查询/搜索操作。
+ *               - 新增 /email 命令，通过 Agent 对接邮件模块
+ *                （IMAP/SMTP），支持查看/搜索/发送邮件。
+ *               - 至此所有启用模块（web-search、calendar、
+ *                 smart-home、cloud-storage、email、voice、
+ *                 file-analysis）均已整合进灵枢接入通道。
+ *
+ *   #ENT-1.3-2  PCI-DSS / CIS 安全增量
+ *               - 启动时检测 NODE_TLS_REJECT_UNAUTHORIZED=0，
+ *                 生产环境下拒绝启动（PCI-DSS 4.1 传输加密——
+ *                 禁止全局禁用 TLS 证书校验）。
+ *               - 长耗时关键词新增邮件/云存储相关词（邮件、
+ *                 查邮件、email、文件列表、list files）。
+ *
+ *   #ENT-1.3-3  帮助文本 & 菜单更新
+ *               - /help 命令新增 /email 和 /files 操作用法。
+ *               - MENU_HANDLERS 新增 MENU_FILES、MENU_EMAIL
+ *                 快捷菜单入口。
  *
  * 修改记录（v1.2 相对于 v1.1）：
  *
@@ -105,7 +128,8 @@
  *   - /search 网页搜索（DuckDuckGo）
  *   - /calendar 日历管理（Nextcloud CalDAV）
  *   - /home 智能家居控制（Home Assistant）
- *   - /files 云存储信息（Nextcloud WebDAV）
+ *   - /files 云存储管理（Nextcloud WebDAV，支持文件查询/搜索操作）
+ *   - /email 邮件管理（IMAP/SMTP，支持查看/搜索/发送邮件）
  *   - /help 帮助信息
  *   - 模板消息发送
  *   - 长耗时任务异步回复
@@ -231,6 +255,14 @@ if (SERVICE_TOKEN && SERVICE_TOKEN.length < 32) {
 // 生产环境检查
 if (process.env.NODE_ENV !== 'production') {
   logger.warn('NODE_ENV 不是 production，建议生产部署时设置 NODE_ENV=production');
+}
+
+// PCI-DSS 4.1: 禁止全局禁用 TLS 证书校验
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+  logger.error('NODE_TLS_REJECT_UNAUTHORIZED=0 将禁用 TLS 证书校验，违反 PCI-DSS 4.1');
+  if (process.env.NODE_ENV === 'production') {
+    process.exit(1);
+  }
 }
 
 // ─── 运营统计 ──────────────────────────────────────────────────
@@ -544,7 +576,7 @@ function splitMessage(text) {
 }
 
 // ─── 长耗时任务判定 ─────────────────────────────────────────
-const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze')
+const LONG_RUNNING_KEYWORDS = (process.env.LONG_RUNNING_KEYWORDS || '搜索,搜一下,查一下,帮我搜,search,分析文件,分析一下,看看这个文件,analyze,邮件,查邮件,email,文件列表,list files')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 function isLongRunningTask(message) {
@@ -1137,6 +1169,8 @@ const MENU_HANDLERS = {
   'MENU_BALANCE': '/balance',
   'MENU_STATUS': '/status',
   'MENU_CLEAR': '/clear',
+  'MENU_FILES': '/files',
+  'MENU_EMAIL': '/email',
 };
 
 // ─── 消息处理核心 ────────────────────────────────────────────
@@ -1197,7 +1231,8 @@ async function handleTextMessage(openId, rawText) {
       '/search <关键词> — 网页搜索\n' +
       '/calendar [操作] — 日历管理\n' +
       '/home [命令] — 智能家居控制\n' +
-      '/files — 云存储信息\n\n' +
+      '/files [操作] — 云存储管理\n' +
+      '/email [操作] — 邮件管理\n\n' +
       '【消息类型】\n' +
       '• 发送文字 — AI 对话\n' +
       '• 发送语音 — 语音转文字 → AI 对话\n' +
@@ -1319,16 +1354,62 @@ async function handleTextMessage(openId, rawText) {
     return await callAgent(openId, `请帮我执行以下智能家居操作：${homeCmd}`);
   }
 
-  // /files — 云存储信息
-  if (text === '/files') {
-    return '☁️ 云存储 (Nextcloud)\n\n' +
-      '你的私有云盘支持：\n' +
-      '• 文件上传/下载/管理\n' +
-      '• 多设备同步\n' +
-      '• 文件分享（生成共享链接）\n' +
-      '• 版本管理与回收站\n\n' +
-      '请通过 Nextcloud 客户端或 Web 界面访问云盘。\n' +
-      '发送图片/文件到本对话可以进行 AI 分析。';
+  // /files [操作] — 云存储管理（通过 Agent 调用 Nextcloud WebDAV）
+  if (text === '/files' || text.startsWith('/files ') || text.startsWith('/files\u3000')) {
+    if (text === '/files') {
+      return '☁️ 云存储管理 (Nextcloud)\n\n' +
+        '用法：\n' +
+        '/files 查看我的文件\n' +
+        '/files 搜索xxx文件\n' +
+        '/files 最近上传的文件\n\n' +
+        '你的私有云盘支持：\n' +
+        '• 文件上传/下载/管理\n' +
+        '• 多设备同步\n' +
+        '• 文件分享（生成共享链接）\n' +
+        '• 版本管理与回收站\n\n' +
+        '请通过 Nextcloud 客户端或 Web 界面管理大文件。\n' +
+        '发送图片/文件到本对话可以进行 AI 分析。';
+    }
+    const filesCmd = text.slice(7).trim();
+    if (!filesCmd) {
+      return '请输入云存储操作。\n\n用法：/files 查看我的文件';
+    }
+    logger.info('用户云存储操作', { openId, cmd: filesCmd.substring(0, 50) });
+    callAgent(openId, `请帮我处理以下云存储操作：${filesCmd}`)
+      .then(async (reply) => {
+        await sendAsyncReply(openId, `☁️ 云存储结果：\n\n${reply}`);
+      })
+      .catch(async (err) => {
+        logger.error('云存储操作失败', { err: err.message, openId });
+        await sendAsyncReply(openId, '❌ 云存储操作失败，请稍后重试。');
+      });
+    return '☁️ 正在处理云存储操作，请稍候...';
+  }
+
+  // /email [操作] — 邮件管理（通过 Agent 调用邮件模块 IMAP/SMTP）
+  if (text === '/email' || text.startsWith('/email ') || text.startsWith('/email\u3000')) {
+    if (text === '/email') {
+      return '📧 邮件管理\n\n' +
+        '用法：\n' +
+        '/email 查看最新邮件\n' +
+        '/email 搜索来自xxx的邮件\n' +
+        '/email 给xxx@example.com发邮件：内容\n\n' +
+        '也可以直接用自然语言描述邮件操作。';
+    }
+    const emailCmd = text.slice(7).trim();
+    if (!emailCmd) {
+      return '请输入邮件操作内容。\n\n用法：/email 查看最新邮件';
+    }
+    logger.info('用户邮件操作', { openId, cmd: emailCmd.substring(0, 50) });
+    callAgent(openId, `请帮我处理以下邮件操作：${emailCmd}`)
+      .then(async (reply) => {
+        await sendAsyncReply(openId, `📧 邮件处理结果：\n\n${reply}`);
+      })
+      .catch(async (err) => {
+        logger.error('邮件操作失败', { err: err.message, openId });
+        await sendAsyncReply(openId, '❌ 邮件操作失败，请稍后重试。');
+      });
+    return '📧 正在处理邮件操作，请稍候...';
   }
 
   // ── 普通消息 → AI 对话 ──
@@ -2338,7 +2419,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.2 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.3 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   if (ENCRYPT_MODE) {
     logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
