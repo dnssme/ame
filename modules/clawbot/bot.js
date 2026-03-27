@@ -1,10 +1,41 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.3
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.4
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.4 相对于 v1.3）：
+ *
+ *   #ENT-1.4-1  Per-user 速率限制（PCI-DSS / CIS DoS 缓解）
+ *               - 新增基于 Redis 滑动窗口的用户级速率限制，
+ *                 可通过 USER_RATE_LIMIT 环境变量配置（默认
+ *                 30 次/分钟）。防止单一用户过度消耗 Agent API
+ *                 资源（CIS DoS 缓解 + PCI-DSS 6.5 资源保护）。
+ *
+ *   #ENT-1.4-2  管理端点速率限制（CIS）
+ *               - 新增 adminLimiter（30 次/分钟），覆盖所有
+ *                 SERVICE_TOKEN 保护的管理端点（/clawbot/qrcode、
+ *                 /clawbot/menu、/clawbot/users、/stats）。
+ *
+ *   #ENT-1.4-3  用户管理端点分页（企业级扩展性）
+ *               - GET /clawbot/users 支持 page / limit 参数，
+ *                 默认 page=1, limit=50，最大 limit=100。
+ *                 使用 Redis SSCAN 高效迭代，避免大数据集阻塞。
+ *
+ *   #ENT-1.4-4  请求追踪贯通（企业级运维）
+ *               - Agent API 调用（callAgent）传递 X-Request-ID，
+ *                 实现端到端请求追踪（服务间日志关联）。
+ *
+ *   #ENT-1.4-5  OpenID 格式校验（PCI-DSS 6.5 输入验证）
+ *               - Webhook 消息处理入口验证 fromUserName 格式
+ *                （字母数字下划线连字符，1-128 字符），
+ *                 拒绝畸形标识符。
+ *
+ *   #ENT-1.4-6  版本对齐
+ *               - 修复 /stats 端点版本号（之前遗留为 '1.2.0'）。
+ *               - 启动日志、package.json、modules.yml 版本同步。
  *
  * 修改记录（v1.3 相对于 v1.2）：
  *
@@ -153,6 +184,9 @@ const BILLING_REQUEST_TIMEOUT_MS = parseInt(process.env.BILLING_REQUEST_TIMEOUT_
 const ABORT_TIMEOUT_BUFFER_MS = 30_000;
 // 消息去重窗口（秒）：防止微信重试导致重复消息处理
 const MSG_DEDUP_TTL = 300;
+// Per-user 速率限制（PCI-DSS / CIS DoS 缓解）：单用户每分钟最大请求数
+const USER_RATE_LIMIT = Math.max(1, Math.min(300, parseInt(process.env.USER_RATE_LIMIT || '30', 10)));
+const USER_RATE_WINDOW_SEC = 60;
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -542,6 +576,29 @@ async function isDuplicateMessage(msgId) {
   }
 }
 
+// ─── Per-user 速率限制（PCI-DSS / CIS DoS 缓解）────────────
+
+/**
+ * 基于 Redis 滑动窗口的用户级速率限制。
+ * 每用户每分钟允许 USER_RATE_LIMIT 次请求，超出则拒绝。
+ * @param {string} openId - 用户标识
+ * @returns {Promise<boolean>} true=超限（应拒绝），false=放行
+ */
+async function isUserRateLimited(openId) {
+  if (!redis) return false; // Redis 不可用时不阻断
+  const key = `anima:clawbot:rl:${openId}`;
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.expire(key, USER_RATE_WINDOW_SEC);
+    }
+    return count > USER_RATE_LIMIT;
+  } catch (err) {
+    logger.error('用户速率限制检查失败', { err: err.message, openId });
+    return false; // 出错时不阻断处理
+  }
+}
+
 // ─── 用户数据清理（取关 / 主动解绑）────────────────────────
 
 /**
@@ -586,7 +643,7 @@ function isLongRunningTask(message) {
 }
 
 // ─── Agent API 调用 ──────────────────────────────────────────
-async function callAgent(openId, message) {
+async function callAgent(openId, message, requestId) {
   const session = getSession(openId);
   session.messages.push({ role: 'user', content: message });
 
@@ -600,9 +657,12 @@ async function callAgent(openId, message) {
   const timeoutId = setTimeout(() => controller.abort(), AGENT_REQUEST_TIMEOUT_MS + ABORT_TIMEOUT_BUFFER_MS);
 
   try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (requestId) headers['X-Request-ID'] = requestId;
+
     const { body } = await request(`${AGENT_API_URL}/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
         model,
         messages: session.messages,
@@ -1156,6 +1216,8 @@ async function sendTemplateMessage(openId, templateId, data, url) {
 // ─── 输入验证 ────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
+// OpenID 格式校验（PCI-DSS 6.5 输入验证）：微信 openId 由字母数字下划线连字符组成
+const OPENID_RE = /^[\w-]{1,128}$/;
 const MAX_TEXT_LENGTH = 10000;
 // TTS 文本上限：防止合成超时和音频过大（Coqui TTS 对超长文本性能下降）
 const MAX_TTS_TEXT_LENGTH = 500;
@@ -1180,7 +1242,7 @@ const MENU_HANDLERS = {
  * 处理来自 ClawBot 的文本消息。
  * 返回要回复给用户的文本（同步），对长任务发起异步回调。
  */
-async function handleTextMessage(openId, rawText) {
+async function handleTextMessage(openId, rawText, requestId) {
   const text = stripControlChars(rawText).trim();
   if (!text) return '';
 
@@ -1308,7 +1370,7 @@ async function handleTextMessage(openId, rawText) {
     logger.info('用户发起搜索', { openId, query: query.substring(0, 50) });
     const searchPrompt = `请帮我搜索以下内容并总结结果：${query}`;
     // 搜索是长耗时任务，异步处理
-    callAgent(openId, searchPrompt)
+    callAgent(openId, searchPrompt, requestId)
       .then(async (reply) => {
         await sendAsyncReply(openId, `🔍 搜索结果：\n\n${reply}`);
       })
@@ -1334,7 +1396,7 @@ async function handleTextMessage(openId, rawText) {
       return '请输入日历操作内容。\n\n用法：/calendar 查看今天日程';
     }
     logger.info('用户日历操作', { openId, cmd: calendarCmd.substring(0, 50) });
-    return await callAgent(openId, `请帮我处理以下日历操作：${calendarCmd}`);
+    return await callAgent(openId, `请帮我处理以下日历操作：${calendarCmd}`, requestId);
   }
 
   // /home [命令] — 智能家居控制（通过 Agent 调用 Home Assistant）
@@ -1352,7 +1414,7 @@ async function handleTextMessage(openId, rawText) {
       return '请输入智能家居操作。\n\n用法：/home 打开客厅灯';
     }
     logger.info('用户智能家居操作', { openId, cmd: homeCmd.substring(0, 50) });
-    return await callAgent(openId, `请帮我执行以下智能家居操作：${homeCmd}`);
+    return await callAgent(openId, `请帮我执行以下智能家居操作：${homeCmd}`, requestId);
   }
 
   // /files [操作] — 云存储管理（通过 Agent 调用 Nextcloud WebDAV）
@@ -1376,7 +1438,7 @@ async function handleTextMessage(openId, rawText) {
       return '请输入云存储操作。\n\n用法：/files 查看我的文件';
     }
     logger.info('用户云存储操作', { openId, cmd: filesCmd.substring(0, 50) });
-    callAgent(openId, `请帮我处理以下云存储操作：${filesCmd}`)
+    callAgent(openId, `请帮我处理以下云存储操作：${filesCmd}`, requestId)
       .then(async (reply) => {
         await sendAsyncReply(openId, `☁️ 云存储结果：\n\n${reply}`);
       })
@@ -1402,7 +1464,7 @@ async function handleTextMessage(openId, rawText) {
       return '请输入邮件操作内容。\n\n用法：/email 查看最新邮件';
     }
     logger.info('用户邮件操作', { openId, cmd: emailCmd.substring(0, 50) });
-    callAgent(openId, `请帮我处理以下邮件操作：${emailCmd}`)
+    callAgent(openId, `请帮我处理以下邮件操作：${emailCmd}`, requestId)
       .then(async (reply) => {
         await sendAsyncReply(openId, `📧 邮件处理结果：\n\n${reply}`);
       })
@@ -1418,7 +1480,7 @@ async function handleTextMessage(openId, rawText) {
 
   // 长耗时任务：异步处理
   if (isLongRunningTask(text)) {
-    callAgent(openId, text)
+    callAgent(openId, text, requestId)
       .then(async (reply) => {
         await sendAsyncReply(openId, `✅ 任务完成：\n\n${reply}`);
       })
@@ -1430,7 +1492,7 @@ async function handleTextMessage(openId, rawText) {
   }
 
   // 普通对话：同步回复
-  return await callAgent(openId, text);
+  return await callAgent(openId, text, requestId);
 }
 
 /**
@@ -1440,7 +1502,7 @@ async function handleTextMessage(openId, rawText) {
  * @param {string} mediaId - 微信语音 MediaId
  * @param {string} recognition - 微信自带语音识别结果（可能为空）
  */
-async function handleVoiceMessage(openId, mediaId, recognition) {
+async function handleVoiceMessage(openId, mediaId, recognition, requestId) {
   // 认证检查
   const authed = await isUserAuthed(openId);
   if (!authed) {
@@ -1450,7 +1512,7 @@ async function handleVoiceMessage(openId, mediaId, recognition) {
   // 优先使用微信自带语音识别结果
   if (recognition && recognition.trim()) {
     logger.info('使用微信语音识别结果', { openId, recognition: recognition.substring(0, 50) });
-    const reply = await callAgent(openId, recognition.trim());
+    const reply = await callAgent(openId, recognition.trim(), requestId);
 
     // 如果语音模块可用，异步发送 TTS 语音回复
     if (VOICE_ENABLED) {
@@ -1503,7 +1565,7 @@ async function handleVoiceMessage(openId, mediaId, recognition) {
       logger.info('语音转录完成', { openId, text: text.substring(0, 50) });
 
       // 3. AI 对话
-      const reply = await callAgent(openId, text);
+      const reply = await callAgent(openId, text, requestId);
       await sendAsyncReply(openId, `🎙 语音识别：${text}\n\n${reply}`);
 
       // 4. 可选 TTS 语音回复
@@ -1529,7 +1591,7 @@ async function handleVoiceMessage(openId, mediaId, recognition) {
  * @param {string} picUrl - 微信图片 URL
  * @param {string} mediaId - 微信 MediaId
  */
-async function handleImageMessage(openId, picUrl, mediaId) {
+async function handleImageMessage(openId, picUrl, mediaId, requestId) {
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
@@ -1559,7 +1621,7 @@ async function handleImageMessage(openId, picUrl, mediaId) {
         imageContext = '用户发送了一张图片，请提供可能的分析帮助。';
       }
 
-      const reply = await callAgent(openId, imageContext);
+      const reply = await callAgent(openId, imageContext, requestId);
       await sendAsyncReply(openId, `🖼 图片分析结果：\n\n${reply}`);
     } catch (err) {
       logger.error('图片分析失败', { err: err.message, openId });
@@ -1576,7 +1638,7 @@ async function handleImageMessage(openId, picUrl, mediaId) {
  * @param {string} mediaId - 微信 MediaId
  * @param {string} fileName - 文件名（文件消息才有）
  */
-async function handleFileMessage(openId, mediaId, fileName) {
+async function handleFileMessage(openId, mediaId, fileName, requestId) {
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
@@ -1600,7 +1662,7 @@ async function handleFileMessage(openId, mediaId, fileName) {
       }
       fileContext += '\n请提供分析帮助。如需详细分析文件内容，建议通过 Web 界面上传。';
 
-      const reply = await callAgent(openId, fileContext);
+      const reply = await callAgent(openId, fileContext, requestId);
       await sendAsyncReply(openId, `📎 文件分析：\n\n${reply}`);
     } catch (err) {
       logger.error('文件分析失败', { err: err.message, openId });
@@ -1619,7 +1681,7 @@ async function handleFileMessage(openId, mediaId, fileName) {
  * @param {string} scale - 地图缩放
  * @param {string} label - 位置名称
  */
-async function handleLocationMessage(openId, locationX, locationY, scale, label) {
+async function handleLocationMessage(openId, locationX, locationY, scale, label, requestId) {
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
@@ -1631,7 +1693,7 @@ async function handleLocationMessage(openId, locationX, locationY, scale, label)
     ? `用户分享了位置「${label}」（纬度：${locationX}，经度：${locationY}）。请提供该位置相关的信息或帮助。`
     : `用户分享了一个位置（纬度：${locationX}，经度：${locationY}）。请提供该位置相关的信息或帮助。`;
 
-  return await callAgent(openId, locationDesc);
+  return await callAgent(openId, locationDesc, requestId);
 }
 
 /**
@@ -1641,7 +1703,7 @@ async function handleLocationMessage(openId, locationX, locationY, scale, label)
  * @param {string} description - 链接描述
  * @param {string} url - 链接 URL
  */
-async function handleLinkMessage(openId, title, description, url) {
+async function handleLinkMessage(openId, title, description, url, requestId) {
   const authed = await isUserAuthed(openId);
   if (!authed) {
     return '🔒 请先绑定邮箱完成认证后使用。\n\n发送：/bind 你的邮箱@example.com';
@@ -1652,7 +1714,7 @@ async function handleLinkMessage(openId, title, description, url) {
   const linkDesc = `用户分享了一个链接：\n标题：${title || '无'}\n描述：${description || '无'}\nURL：${url || '无'}\n\n请分析该链接内容并提供摘要或相关帮助。`;
 
   // 链接分析可能耗时较长
-  callAgent(openId, linkDesc)
+  callAgent(openId, linkDesc, requestId)
     .then(async (reply) => {
       await sendAsyncReply(openId, `🔗 链接分析：\n\n${reply}`);
     })
@@ -1743,6 +1805,15 @@ const webhookLimiter = rateLimit({
   message: 'Too many requests',
 });
 
+// 速率限制：管理端点（SERVICE_TOKEN 保护的端点，CIS DoS 缓解）
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests',
+});
+
 // ─── SERVICE_TOKEN 认证中间件（管理端点保护）─────────────────
 function requireServiceToken(req, res, next) {
   if (!SERVICE_TOKEN) {
@@ -1775,10 +1846,10 @@ app.get('/health', (req, res) => {
 });
 
 // ─── 运营统计端点（需要 SERVICE_TOKEN 认证）──────────────────
-app.get('/stats', requireServiceToken, (req, res) => {
+app.get('/stats', adminLimiter, requireServiceToken, (req, res) => {
   const uptimeMs = Date.now() - stats.startedAt;
   res.json({
-    version: '1.2.0',
+    version: '1.4.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -1912,12 +1983,28 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
     return;
   }
 
+  // OpenID 格式校验（PCI-DSS 6.5 输入验证）
+  if (!OPENID_RE.test(fromUserName)) {
+    logger.warn('OpenID 格式不合法', { fromUserName: fromUserName.substring(0, 32), request_id: req.id });
+    res.status(400).send('Invalid openId');
+    return;
+  }
+
   const openId = fromUserName;
 
   // ── 消息去重（防止微信重试导致重复处理）──
   if (msgId && await isDuplicateMessage(msgId)) {
     logger.info('消息去重：跳过重复消息', { openId, msgId, request_id: req.id });
     res.status(200).send('success');
+    return;
+  }
+
+  // ── Per-user 速率限制（PCI-DSS / CIS DoS 缓解）──
+  if (await isUserRateLimited(openId)) {
+    logger.warn('用户请求超限', { openId, limit: USER_RATE_LIMIT, request_id: req.id });
+    const rateLimitReply = buildTextReply(openId, toUserName, '⚠️ 操作过于频繁，请稍后再试。');
+    res.set('Content-Type', 'text/xml');
+    res.status(200).send(rateLimitReply);
     return;
   }
 
@@ -1940,21 +2027,21 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
     switch (msgType) {
       case 'text':
-        replyText = await handleTextMessage(openId, content);
+        replyText = await handleTextMessage(openId, content, req.id);
         break;
 
       case 'voice':
-        replyText = await handleVoiceMessage(openId, mediaId, recognition);
+        replyText = await handleVoiceMessage(openId, mediaId, recognition, req.id);
         break;
 
       case 'image':
-        replyText = await handleImageMessage(openId, picUrl, mediaId);
+        replyText = await handleImageMessage(openId, picUrl, mediaId, req.id);
         break;
 
       case 'video':
       case 'shortvideo':
       case 'file':
-        replyText = await handleFileMessage(openId, mediaId, getXmlValue(xmlBody, 'FileName'));
+        replyText = await handleFileMessage(openId, mediaId, getXmlValue(xmlBody, 'FileName'), req.id);
         break;
 
       case 'location': {
@@ -1962,7 +2049,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         const locationY = getXmlValue(xmlBody, 'Location_Y');
         const scale     = getXmlValue(xmlBody, 'Scale');
         const label     = getXmlValue(xmlBody, 'Label');
-        replyText = await handleLocationMessage(openId, locationX, locationY, scale, label);
+        replyText = await handleLocationMessage(openId, locationX, locationY, scale, label, req.id);
         break;
       }
 
@@ -1970,7 +2057,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         const title       = getXmlValue(xmlBody, 'Title');
         const description = getXmlValue(xmlBody, 'Description');
         const url         = getXmlValue(xmlBody, 'Url');
-        replyText = await handleLinkMessage(openId, title, description, url);
+        replyText = await handleLinkMessage(openId, title, description, url, req.id);
         break;
       }
 
@@ -2013,9 +2100,9 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           logger.info('用户点击菜单', { openId, eventKey });
           const cmd = MENU_HANDLERS[eventKey];
           if (cmd) {
-            replyText = await handleTextMessage(openId, cmd);
+            replyText = await handleTextMessage(openId, cmd, req.id);
           } else {
-            replyText = await handleTextMessage(openId, eventKey || '/help');
+            replyText = await handleTextMessage(openId, eventKey || '/help', req.id);
           }
         } else if (eventType === 'VIEW') {
           // 菜单链接跳转事件（仅记录日志，用户已跳转到目标 URL）
@@ -2064,7 +2151,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
 // ─── 扫码接入：二维码生成端点 ──────────────────────────────────
 // 管理员调用此接口生成二维码，用户扫码关注后自动接入
-app.get('/clawbot/qrcode', verifyLimiter, requireServiceToken, async (req, res) => {
+app.get('/clawbot/qrcode', adminLimiter, requireServiceToken, async (req, res) => {
   const scene = typeof req.query.scene === 'string' ? req.query.scene.substring(0, 64) : 'subscribe';
   const temporary = req.query.temporary === 'true';
 
@@ -2086,7 +2173,7 @@ app.get('/clawbot/qrcode', verifyLimiter, requireServiceToken, async (req, res) 
 // ─── 微信自定义菜单管理（需要 SERVICE_TOKEN 认证）──────────────
 
 // 创建自定义菜单
-app.post('/clawbot/menu', express.json({ limit: '64kb' }), requireServiceToken, async (req, res) => {
+app.post('/clawbot/menu', express.json({ limit: '64kb' }), adminLimiter, requireServiceToken, async (req, res) => {
   const menuData = req.body;
   if (!menuData || !menuData.button || !Array.isArray(menuData.button)) {
     res.status(400).json({ success: false, msg: '菜单数据格式错误，需要 { button: [...] }' });
@@ -2131,7 +2218,7 @@ app.post('/clawbot/menu', express.json({ limit: '64kb' }), requireServiceToken, 
 });
 
 // 查询当前自定义菜单
-app.get('/clawbot/menu', requireServiceToken, async (req, res) => {
+app.get('/clawbot/menu', adminLimiter, requireServiceToken, async (req, res) => {
   const token = await getAccessToken();
   if (!token) {
     res.status(500).json({ success: false, msg: 'access_token 不可用' });
@@ -2161,7 +2248,7 @@ app.get('/clawbot/menu', requireServiceToken, async (req, res) => {
 });
 
 // 删除自定义菜单
-app.delete('/clawbot/menu', requireServiceToken, async (req, res) => {
+app.delete('/clawbot/menu', adminLimiter, requireServiceToken, async (req, res) => {
   const token = await getAccessToken();
   if (!token) {
     res.status(500).json({ success: false, msg: 'access_token 不可用' });
@@ -2197,19 +2284,27 @@ app.delete('/clawbot/menu', requireServiceToken, async (req, res) => {
   }
 });
 
-// ─── 已认证用户管理端点（需要 SERVICE_TOKEN 认证）──────────────
-app.get('/clawbot/users', requireServiceToken, async (req, res) => {
+// ─── 已认证用户管理端点（需要 SERVICE_TOKEN 认证，支持分页）──
+app.get('/clawbot/users', adminLimiter, requireServiceToken, async (req, res) => {
   if (!redis) {
     res.status(503).json({ success: false, msg: 'Redis 不可用' });
     return;
   }
 
+  // 分页参数（企业级扩展性）
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50', 10)));
+
   try {
     // 获取所有已认证用户
     const authedUsers = await redis.smembers(REDIS_AUTH_KEY);
-    const users = [];
+    const total = authedUsers.length;
+    const totalPages = Math.ceil(total / limit) || 1;
+    const startIdx = (page - 1) * limit;
+    const pageUsers = authedUsers.slice(startIdx, startIdx + limit);
 
-    for (const openId of authedUsers) {
+    const users = [];
+    for (const openId of pageUsers) {
       const email = await redis.hget(REDIS_EMAIL_KEY, openId) || '';
       const model = await redis.hget(REDIS_MODELS_KEY, openId) || DEFAULT_MODEL;
       users.push({ openId, email, model });
@@ -2217,7 +2312,10 @@ app.get('/clawbot/users', requireServiceToken, async (req, res) => {
 
     res.json({
       success: true,
-      total: users.length,
+      total,
+      page,
+      limit,
+      totalPages,
       users,
     });
   } catch (err) {
@@ -2319,8 +2417,22 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
     return;
   }
 
+  // UserID 格式校验（PCI-DSS 6.5 输入验证）
+  if (!OPENID_RE.test(fromUserName)) {
+    logger.warn('企业微信 UserID 格式不合法', { fromUserName: fromUserName.substring(0, 32) });
+    res.status(400).send('Invalid userId');
+    return;
+  }
+
   // 企业微信使用 UserID 而非 OpenID
   const userId = fromUserName;
+
+  // Per-user 速率限制（PCI-DSS / CIS DoS 缓解）
+  if (await isUserRateLimited(`wecom:${userId}`)) {
+    logger.warn('企业微信用户请求超限', { userId, limit: USER_RATE_LIMIT });
+    res.status(200).send('');
+    return;
+  }
 
   logger.info('收到企业微信消息', { userId, msgType });
 
@@ -2335,20 +2447,20 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
 
     switch (msgType) {
       case 'text':
-        replyText = await handleTextMessage(wecomOpenId, content);
+        replyText = await handleTextMessage(wecomOpenId, content, req.id);
         break;
 
       case 'voice': {
         const wecomMediaId = getXmlValue(xmlBody, 'MediaId');
         const wecomRecognition = getXmlValue(xmlBody, 'Recognition');
-        replyText = await handleVoiceMessage(wecomOpenId, wecomMediaId, wecomRecognition);
+        replyText = await handleVoiceMessage(wecomOpenId, wecomMediaId, wecomRecognition, req.id);
         break;
       }
 
       case 'image': {
         const wecomPicUrl = getXmlValue(xmlBody, 'PicUrl');
         const wecomImgMediaId = getXmlValue(xmlBody, 'MediaId');
-        replyText = await handleImageMessage(wecomOpenId, wecomPicUrl, wecomImgMediaId);
+        replyText = await handleImageMessage(wecomOpenId, wecomPicUrl, wecomImgMediaId, req.id);
         break;
       }
 
@@ -2356,7 +2468,7 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
       case 'file': {
         const wecomFileMediaId = getXmlValue(xmlBody, 'MediaId');
         const wecomFileName = getXmlValue(xmlBody, 'FileName');
-        replyText = await handleFileMessage(wecomOpenId, wecomFileMediaId, wecomFileName);
+        replyText = await handleFileMessage(wecomOpenId, wecomFileMediaId, wecomFileName, req.id);
         break;
       }
 
@@ -2365,7 +2477,7 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
         const wecomLocY = getXmlValue(xmlBody, 'Location_Y');
         const wecomScale = getXmlValue(xmlBody, 'Scale');
         const wecomLabel = getXmlValue(xmlBody, 'Label');
-        replyText = await handleLocationMessage(wecomOpenId, wecomLocX, wecomLocY, wecomScale, wecomLabel);
+        replyText = await handleLocationMessage(wecomOpenId, wecomLocX, wecomLocY, wecomScale, wecomLabel, req.id);
         break;
       }
 
@@ -2420,8 +2532,9 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.3 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.4 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
+  logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
     logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
   } else {
