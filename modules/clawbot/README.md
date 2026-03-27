@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件接入模块
+# 微信 ClawBot 插件接入模块 v1.1
 
 ## 概述
 
@@ -28,6 +28,8 @@
 - 视频/文件 → 文件分析
 - 位置消息 → 位置相关 AI 服务
 - 链接消息 → 链接内容分析
+- 菜单事件 → CLICK / VIEW 处理
+- 模板消息发送（结构化通知）
 - 消息分段发送（适配微信 2000 字符上限）
 - 长耗时任务异步回复（通过客服消息接口）
 
@@ -41,12 +43,16 @@
 - 微信签名验证（token + timestamp + nonce SHA1，timing-safe）
 - **强制登录认证**：用户必须绑定邮箱后才可使用 AI 功能
 - **用户强隔离**：独立 Redis 键空间、独立会话、独立计费
+- 管理端点 SERVICE_TOKEN Bearer 认证保护
 - 速率限制（验证端点 10/min，消息端点 300/min）
+- X-Request-ID 请求追踪（日志关联）
+- 访问日志中间件（PCI-DSS 10.2）
 - 输入验证与控制字符过滤
 
 ### 整合功能（基础命令）
 - /bind <邮箱> — 绑定计费邮箱（必须，首次使用前完成认证）
 - /balance — 查询账户余额
+- /status — 查看账户状态（认证、邮箱、模型、会话信息）
 - /model <模型名> — 切换 AI 模型
 - /clear — 清除对话上下文
 - /help — 查看帮助
@@ -137,14 +143,15 @@ docker compose up -d
 
 ## API 端点
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/health` | GET | 健康检查 |
-| `/clawbot/webhook` | GET | 微信 URL 验证 |
-| `/clawbot/webhook` | POST | 微信消息接收 |
-| `/clawbot/qrcode` | GET | 生成接入二维码 |
-| `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） |
-| `/wecom/webhook` | POST | 企业微信消息接收（需启用） |
+| 端点 | 方法 | 说明 | 认证 |
+|------|------|------|------|
+| `/health` | GET | 健康检查 | ❌ |
+| `/clawbot/webhook` | GET | 微信 URL 验证 | 微信签名 |
+| `/clawbot/webhook` | POST | 微信消息接收 | 微信签名 |
+| `/clawbot/qrcode` | GET | 生成接入二维码 | SERVICE_TOKEN |
+| `/stats` | GET | 运营统计（消息数、会话数等） | SERVICE_TOKEN |
+| `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
+| `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
 
 ## 支持的消息类型
 
@@ -156,6 +163,8 @@ docker compose up -d
 | 视频/文件 | AI 文件分析 | ✅ |
 | 位置 | 位置相关 AI 服务 | ✅ |
 | 链接 | 链接内容分析 | ✅ |
+| 菜单点击 (CLICK) | 触发对应命令 | ✅ |
+| 菜单链接 (VIEW) | 记录日志 | ❌ |
 | 扫码关注 | 欢迎消息 + 场景识别 | ❌ |
 | 已关注扫码 | 扫码确认消息 | ❌ |
 | 取关事件 | 记录日志 | ❌ |

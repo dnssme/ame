@@ -1,9 +1,40 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件接入模块
+ * Anima 灵枢 · 微信 ClawBot 插件接入模块 v1.1
+ * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.1 相对于 v1.0）：
+ *
+ *   #ENT-1.1-1  企业级运维加固
+ *               - 新增 X-Request-ID（crypto.randomUUID）请求追踪，
+ *                 所有日志包含 request_id，方便问题排查。
+ *               - 新增访问日志中间件，记录 method/path/status/
+ *                 duration_ms/ip/request_id（PCI-DSS 10.2）。
+ *               - 新增 server.maxConnections=1024（CIS DoS 缓解）。
+ *               - GRACEFUL_SHUTDOWN_TIMEOUT 可配置（5-60s）。
+ *               - 启动时检查 NODE_ENV（生产环境警告）。
+ *
+ *   #ENT-1.1-2  管理端点安全加固
+ *               - /clawbot/qrcode 和 /stats 端点新增 SERVICE_TOKEN
+ *                 Bearer 认证，防止未授权访问。
+ *               - SERVICE_TOKEN 最少 32 字符（PCI-DSS 8.2.3）。
+ *
+ *   #ENT-1.1-3  ClawBot 功能完善
+ *               - 新增微信菜单事件处理（CLICK / VIEW）。
+ *               - 新增模板消息发送能力（sendTemplateMessage）。
+ *               - 新增 /status 命令，查看用户认证状态、绑定信息、
+ *                 当前模型等账户信息。
+ *
+ *   #ENT-1.1-4  运营监控
+ *               - 新增 GET /stats 端点，返回运行时长、消息统计、
+ *                 活跃会话、Redis 状态等运营指标。
+ *
+ *   #ENT-1.1-5  企业微信功能扩展
+ *               - WeCom 通道新增语音/图片/视频/文件消息处理，
+ *                 与微信公众号功能对齐。
  *
  * 接入方式（官方微信）：
  *   - 微信公众号扫码关注接入（用户扫描二维码 → 关注 → 自动绑定）
@@ -26,14 +57,17 @@
  *   - 视频/文件 → 文件分析
  *   - 位置消息 → 位置相关 AI 服务
  *   - 链接消息 → 链接内容分析
+ *   - 菜单事件 → CLICK/VIEW 处理
  *   - /model 切换模型
  *   - /balance 查询余额
+ *   - /status 查看账户状态
  *   - /clear 清除对话上下文
  *   - /search 网页搜索（DuckDuckGo）
  *   - /calendar 日历管理（Nextcloud CalDAV）
  *   - /home 智能家居控制（Home Assistant）
  *   - /files 云存储信息（Nextcloud WebDAV）
  *   - /help 帮助信息
+ *   - 模板消息发送
  *   - 长耗时任务异步回复
  *   - 消息分段发送（适配微信消息长度限制）
  */
@@ -87,6 +121,12 @@ const TTS_URL        = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 const PORT           = parseInt(process.env.PORT || '3004', 10);
 
 // ─── 企业微信（WeCom）配置（默认关闭，仅添加接口不使用）────────
+// ─── 企业运维配置 ──────────────────────────────────────────
+const SERVICE_TOKEN = process.env.SERVICE_TOKEN || '';
+const GRACEFUL_SHUTDOWN_TIMEOUT = Math.min(60, Math.max(5,
+  parseInt(process.env.GRACEFUL_SHUTDOWN_TIMEOUT || '10', 10)));
+
+// ─── 企业微信（WeCom）配置（默认关闭，仅添加接口不使用）────────
 const WECOM_ENABLED   = process.env.WECOM_ENABLED === 'true';
 const WECOM_CORPID    = process.env.WECOM_CORPID || '';
 const WECOM_SECRET    = process.env.WECOM_SECRET || '';
@@ -117,6 +157,27 @@ if (WECOM_ENABLED) {
 } else {
   logger.info('企业微信（WeCom）接口已添加但未启用（WECOM_ENABLED=false）');
 }
+
+// SERVICE_TOKEN 长度检查（PCI-DSS 8.2.3）
+if (SERVICE_TOKEN && SERVICE_TOKEN.length < 32) {
+  logger.error('SERVICE_TOKEN 长度不足 32 字符（PCI-DSS 8.2.3）');
+  process.exit(1);
+}
+
+// 生产环境检查
+if (process.env.NODE_ENV !== 'production') {
+  logger.warn('NODE_ENV 不是 production，建议生产部署时设置 NODE_ENV=production');
+}
+
+// ─── 运营统计 ──────────────────────────────────────────────────
+const stats = {
+  startedAt: Date.now(),
+  totalMessages: 0,
+  messagesByType: { text: 0, voice: 0, image: 0, video: 0, file: 0, location: 0, link: 0, event: 0 },
+  totalCommands: 0,
+  commandsByName: {},
+  totalErrors: 0,
+};
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
 const redis = REDIS_URL
@@ -794,6 +855,57 @@ async function sendAsyncVoiceReply(openId, voiceMediaId) {
   }
 }
 
+/**
+ * 发送微信模板消息（用于结构化通知）。
+ * @param {string} openId - 用户 OpenID
+ * @param {string} templateId - 模板消息 ID
+ * @param {Object} data - 模板数据 { key: { value, color } }
+ * @param {string} [url] - 点击消息跳转 URL
+ * @returns {Promise<boolean>} 是否发送成功
+ */
+async function sendTemplateMessage(openId, templateId, data, url) {
+  const token = await getAccessToken();
+  if (!token) {
+    logger.error('无法发送模板消息：access_token 不可用', { openId });
+    return false;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const payload = {
+      touser: openId,
+      template_id: templateId,
+      data,
+    };
+    if (url) payload.url = url;
+
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/template/send?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode && result.errcode !== 0) {
+      logger.error('模板消息发送失败', { errcode: result.errcode, errmsg: result.errmsg, openId });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('模板消息发送异常', { err: err.message, openId });
+    return false;
+  }
+}
+
 // ─── 输入验证 ────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MODEL_NAME_RE = /^[a-zA-Z0-9._:\/-]+$/;
@@ -804,6 +916,14 @@ const MAX_TTS_TEXT_LENGTH = 500;
 function stripControlChars(str) {
   return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }
+
+// ─── 菜单事件映射（微信公众号自定义菜单 CLICK 事件）──────────
+const MENU_HANDLERS = {
+  'MENU_HELP': '/help',
+  'MENU_BALANCE': '/balance',
+  'MENU_STATUS': '/status',
+  'MENU_CLEAR': '/clear',
+};
 
 // ─── 消息处理核心 ────────────────────────────────────────────
 
@@ -820,6 +940,13 @@ async function handleTextMessage(openId, rawText) {
   }
 
   // ── 命令处理 ──
+
+  // 命令统计
+  if (text.startsWith('/')) {
+    const cmdName = text.split(/[\s\u3000]/)[0];
+    stats.totalCommands++;
+    stats.commandsByName[cmdName] = (stats.commandsByName[cmdName] || 0) + 1;
+  }
 
   // /bind <email> — 绑定邮箱（登录认证）
   if (text.startsWith('/bind ') || text.startsWith('/bind\u3000')) {
@@ -839,6 +966,7 @@ async function handleTextMessage(openId, rawText) {
       '【基础】\n' +
       '/bind <邮箱> — 绑定邮箱（首次使用必须绑定）\n' +
       '/balance — 查询账户余额\n' +
+      '/status — 查看账户状态\n' +
       '/model <模型名> — 切换 AI 模型\n' +
       '/clear — 清除对话上下文\n\n' +
       '【工具】\n' +
@@ -894,6 +1022,21 @@ async function handleTextMessage(openId, rawText) {
     sessions.delete(openId);
     logger.info('用户清除对话上下文', { openId });
     return '🗑 对话上下文已清除。';
+  }
+
+  // /status — 查看账户状态
+  if (text === '/status') {
+    const email = await getUserEmail(openId);
+    const model = (await getUserModel(openId)) || DEFAULT_MODEL;
+    const session = sessions.get(openId);
+    const sessionMsgCount = session ? session.messages.length : 0;
+    return '📊 账户状态\n\n' +
+      `✅ 认证：已通过\n` +
+      `📧 邮箱：${email || '未绑定'}\n` +
+      `🤖 模型：${model}\n` +
+      `💬 当前会话消息数：${sessionMsgCount}\n` +
+      `🔗 通道：ClawBot 微信公众号\n\n` +
+      '发送 /help 查看所有命令。';
   }
 
   // /search <query> — 网页搜索（通过 Agent 调用 DuckDuckGo）
@@ -1250,6 +1393,32 @@ app.use(helmet());
 app.disable('x-powered-by');
 app.disable('etag');
 
+// ─── 请求追踪（X-Request-ID）──────────────────────────────
+app.use((req, res, next) => {
+  req.id = crypto.randomUUID();
+  res.setHeader('X-Request-ID', req.id);
+  next();
+});
+
+// ─── 访问日志（PCI-DSS 10.2）──────────────────────────────
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (req.path !== '/health') {
+      logger.info('access', {
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        duration_ms: duration,
+        ip: req.ip,
+        request_id: req.id,
+      });
+    }
+  });
+  next();
+});
+
 // 速率限制：微信 ClawBot URL 验证（低频调用）
 const verifyLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -1268,6 +1437,26 @@ const webhookLimiter = rateLimit({
   message: 'Too many requests',
 });
 
+// ─── SERVICE_TOKEN 认证中间件（管理端点保护）─────────────────
+function requireServiceToken(req, res, next) {
+  if (!SERVICE_TOKEN) {
+    // 未配置 SERVICE_TOKEN 时，管理端点不可用
+    res.status(403).json({ error: 'SERVICE_TOKEN not configured' });
+    return;
+  }
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  // 使用 HMAC 归一化为等长摘要，避免长度差异导致的时序泄漏
+  const hmacKey = Buffer.from('clawbot-auth', 'utf8');
+  const expected = crypto.createHmac('sha256', hmacKey).update(SERVICE_TOKEN).digest();
+  const provided = crypto.createHmac('sha256', hmacKey).update(token).digest();
+  if (!crypto.timingSafeEqual(expected, provided)) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  next();
+}
+
 // 微信回调需要原始 XML body
 app.use('/clawbot/webhook', express.text({ type: ['text/xml', 'application/xml'], limit: '256kb' }));
 app.use(express.json({ limit: '256kb' }));
@@ -1277,6 +1466,24 @@ app.get('/health', (req, res) => {
   const redisOk = redis ? redis.status === 'ready' : true;
   const status = redisOk ? 'ok' : 'degraded';
   res.status(redisOk ? 200 : 503).json({ status });
+});
+
+// ─── 运营统计端点（需要 SERVICE_TOKEN 认证）──────────────────
+app.get('/stats', requireServiceToken, (req, res) => {
+  const uptimeMs = Date.now() - stats.startedAt;
+  res.json({
+    uptime_seconds: Math.floor(uptimeMs / 1000),
+    active_sessions: sessions.size,
+    max_sessions: MAX_SESSIONS,
+    redis_status: redis ? redis.status : 'not_configured',
+    wecom_enabled: WECOM_ENABLED,
+    voice_enabled: VOICE_ENABLED,
+    total_messages: stats.totalMessages,
+    messages_by_type: stats.messagesByType,
+    total_commands: stats.totalCommands,
+    commands_by_name: stats.commandsByName,
+    total_errors: stats.totalErrors,
+  });
 });
 
 // ─── 微信 ClawBot Webhook 验证（GET）────────────────────────
@@ -1366,11 +1573,18 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
   const openId = fromUserName;
 
+  // 运营统计
+  stats.totalMessages++;
+  if (stats.messagesByType[msgType] !== undefined) {
+    stats.messagesByType[msgType]++;
+  }
+
   logger.info('收到 ClawBot 消息', {
     openId,
     msgType,
     msgId,
     content: content ? content.substring(0, 50) : '',
+    request_id: req.id,
   });
 
   try {
@@ -1444,6 +1658,18 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
             '发送 /help 查看可用命令。';
         } else if (eventType === 'unsubscribe') {
           logger.info('用户取消关注', { openId });
+        } else if (eventType === 'CLICK') {
+          // 菜单点击事件
+          logger.info('用户点击菜单', { openId, eventKey });
+          const cmd = MENU_HANDLERS[eventKey];
+          if (cmd) {
+            replyText = await handleTextMessage(openId, cmd);
+          } else {
+            replyText = await handleTextMessage(openId, eventKey || '/help');
+          }
+        } else if (eventType === 'VIEW') {
+          // 菜单链接跳转事件（仅记录日志，用户已跳转到目标 URL）
+          logger.info('用户点击菜单链接', { openId, url: eventKey });
         }
         break;
       }
@@ -1462,7 +1688,8 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
       res.status(200).send('success');
     }
   } catch (err) {
-    logger.error('消息处理异常', { err: err.message, openId, msgType });
+    stats.totalErrors++;
+    logger.error('消息处理异常', { err: err.message, openId, msgType, request_id: req.id });
     const errorReply = buildTextReply(openId, toUserName, '处理消息时出错，请稍后再试。');
     res.set('Content-Type', 'text/xml');
     res.status(200).send(errorReply);
@@ -1471,7 +1698,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
 // ─── 扫码接入：二维码生成端点 ──────────────────────────────────
 // 管理员调用此接口生成二维码，用户扫码关注后自动接入
-app.get('/clawbot/qrcode', verifyLimiter, async (req, res) => {
+app.get('/clawbot/qrcode', verifyLimiter, requireServiceToken, async (req, res) => {
   const scene = typeof req.query.scene === 'string' ? req.query.scene.substring(0, 64) : 'subscribe';
   const temporary = req.query.temporary === 'true';
 
@@ -1601,8 +1828,40 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
       case 'text':
         replyText = await handleTextMessage(wecomOpenId, content);
         break;
+
+      case 'voice': {
+        const wecomMediaId = getXmlValue(xmlBody, 'MediaId');
+        const wecomRecognition = getXmlValue(xmlBody, 'Recognition');
+        replyText = await handleVoiceMessage(wecomOpenId, wecomMediaId, wecomRecognition);
+        break;
+      }
+
+      case 'image': {
+        const wecomPicUrl = getXmlValue(xmlBody, 'PicUrl');
+        const wecomImgMediaId = getXmlValue(xmlBody, 'MediaId');
+        replyText = await handleImageMessage(wecomOpenId, wecomPicUrl, wecomImgMediaId);
+        break;
+      }
+
+      case 'video':
+      case 'file': {
+        const wecomFileMediaId = getXmlValue(xmlBody, 'MediaId');
+        const wecomFileName = getXmlValue(xmlBody, 'FileName');
+        replyText = await handleFileMessage(wecomOpenId, wecomFileMediaId, wecomFileName);
+        break;
+      }
+
+      case 'location': {
+        const wecomLocX = getXmlValue(xmlBody, 'Location_X');
+        const wecomLocY = getXmlValue(xmlBody, 'Location_Y');
+        const wecomScale = getXmlValue(xmlBody, 'Scale');
+        const wecomLabel = getXmlValue(xmlBody, 'Label');
+        replyText = await handleLocationMessage(wecomOpenId, wecomLocX, wecomLocY, wecomScale, wecomLabel);
+        break;
+      }
+
       default:
-        replyText = '企业微信通道当前支持文字消息。如需更多功能，请通过微信公众号使用。';
+        replyText = '暂不支持此类型消息，请发送文字、语音、图片或文件消息。';
         break;
     }
 
@@ -1652,10 +1911,15 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`ClawBot 接入服务已启动 :${PORT}`);
+  logger.info(`ClawBot 接入服务 v1.1 已启动，端口 ${PORT}`);
   logger.info('官方微信接入（扫码/App互通）就绪，等待回调...');
   if (WECOM_ENABLED) {
     logger.info('企业微信（WeCom）接口已就绪 /wecom/webhook');
+  }
+  if (SERVICE_TOKEN) {
+    logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
+  } else {
+    logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /stats）不可用');
   }
 });
 
@@ -1663,22 +1927,31 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 server.maxHeadersCount = 50;
 server.requestTimeout = 30_000;
 server.maxRequestsPerSocket = 256;
+server.maxConnections = 1024;
 
 // ─── 优雅退出 ────────────────────────────────────────────────
+const SHUTDOWN_TIMEOUT_MS = GRACEFUL_SHUTDOWN_TIMEOUT * 1000;
+
 const shutdown = (signal) => {
-  logger.info(`收到 ${signal}，正在关闭...`);
+  logger.info(`收到 ${signal}，正在关闭（超时 ${GRACEFUL_SHUTDOWN_TIMEOUT}s）...`);
   clearInterval(sessionCleanupTimer);
 
   server.close(() => {
     if (redis) redis.disconnect();
+    logger.info('服务器已正常关闭');
     process.exit(0);
   });
+
+  // 优雅关闭超时后强制终止未完成连接
+  setTimeout(() => {
+    server.closeAllConnections();
+  }, SHUTDOWN_TIMEOUT_MS / 2);
 
   // 强制退出兜底
   setTimeout(() => {
     if (redis) redis.disconnect();
     process.exit(1);
-  }, 10_000);
+  }, SHUTDOWN_TIMEOUT_MS);
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
