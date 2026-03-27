@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS clawbot_user_consent (
     id              BIGSERIAL PRIMARY KEY,
     open_id         VARCHAR(128) NOT NULL,
     channel         VARCHAR(16) NOT NULL DEFAULT 'wechat',
-    consent_type    VARCHAR(64) NOT NULL,
+    consent_type    VARCHAR(32) NOT NULL,
     consent_version VARCHAR(32) NOT NULL DEFAULT '1.0',
     granted         BOOLEAN NOT NULL DEFAULT FALSE,
     granted_at      TIMESTAMPTZ,

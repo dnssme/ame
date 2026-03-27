@@ -689,8 +689,6 @@ const CONSENT_TYPES = ['data_processing', 'privacy_policy', 'terms_of_service'];
 const REDIS_CONSENT_PREFIX = 'anima:clawbot:consent:'; // Hash: openid → JSON consent state
 // ─── v2.4 用户设置 Redis 键前缀 ──────────────────────────────
 const REDIS_SETTINGS_PREFIX = 'anima:clawbot:settings:'; // Hash: openid → JSON settings
-// 插件验证挑战密钥（使用 CLAWBOT_APP_SECRET 派生）
-const PLUGIN_VERIFY_HMAC_KEY = 'clawbot-plugin-verify';
 
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
@@ -1258,11 +1256,12 @@ async function clearUserData(openId) {
 // 确保 Redis 操作只访问当前通道的键空间，防止跨通道数据泄露
 
 /**
- * 校验 Redis 键属于 ClawBot 命名空间。
+ * 校验 Redis 键属于 ClawBot 命名空间（ENT-2.4-5 数据隔离增强）。
+ * 用于运维审计和跨通道访问防护检测。
  * @param {string} key - Redis 键
  * @returns {boolean} 合法返回 true
  */
-function validateRedisKeyNamespace(key) {
+function isAllowedRedisKeyPrefix(key) {
   return key.startsWith('anima:clawbot:') || key.startsWith('anima:wecom:');
 }
 
@@ -5735,11 +5734,9 @@ app.post('/clawbot/plugin/verify', adminLimiter, (req, res) => {
     return;
   }
 
-  // HMAC-SHA256 签名响应：使用 APP_SECRET 派生密钥
-  const hmacKey = crypto.createHmac('sha256', PLUGIN_VERIFY_HMAC_KEY)
-    .update(CLAWBOT_APP_SECRET).digest();
+  // HMAC-SHA256 签名响应：使用 APP_SECRET 作为密钥签名挑战内容
   const signPayload = `${challenge}|${verifyTs || ''}|${verifyNonce || ''}`;
-  const signature = crypto.createHmac('sha256', hmacKey)
+  const signature = crypto.createHmac('sha256', CLAWBOT_APP_SECRET)
     .update(signPayload).digest('hex');
 
   logger.info('插件验证挑战响应', { challenge: challenge.substring(0, 16) });
@@ -5793,19 +5790,21 @@ app.get('/clawbot/plugin/health', adminLimiter, requireAdminIp, requireServiceTo
     checks.postgresql = { status: 'not_configured' };
   }
 
-  // Agent API 健康检查（轻量级 HEAD 请求）
+  // Agent API 健康检查（连接性验证）
   const agentStart = Date.now();
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5_000);
-    await request(`${AGENT_API_URL}/health`, {
+    const { statusCode } = await request(`${AGENT_API_URL}/health`, {
       method: 'GET',
       bodyTimeout: 5_000,
       headersTimeout: 5_000,
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
-    checks.agent_api = { status: 'healthy', latency_ms: Date.now() - agentStart, url: AGENT_API_URL };
+    // 任何 HTTP 响应（包括 404）都表示 Agent API 可达
+    const agentHealthy = statusCode < 500;
+    checks.agent_api = { status: agentHealthy ? 'healthy' : 'degraded', latency_ms: Date.now() - agentStart, url: AGENT_API_URL, http_status: statusCode };
   } catch (err) {
     checks.agent_api = { status: 'unhealthy', error: err.message, latency_ms: Date.now() - agentStart, url: AGENT_API_URL };
   }
