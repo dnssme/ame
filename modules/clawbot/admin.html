@@ -419,7 +419,7 @@ async function api(method, path, body){
     opts.body=JSON.stringify(body);
   }
   const r = await fetch(API_BASE+path, opts);
-  if(r.status===401){doLogout();throw new Error('会话已过期')}
+  if(r.status===401){doLogout();return Promise.reject(new Error('会话已过期'))}
   const data = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(data.error||`请求失败 (${r.status})`);
   return data;

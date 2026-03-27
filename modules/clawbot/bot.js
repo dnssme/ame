@@ -793,6 +793,7 @@ const REDIS_ADMIN_SESSION_PREFIX = 'anima:clawbot:admin_session:'; // admin_sess
 const ADMIN_SESSION_TTL = Math.max(300, Math.min(3600, parseInt(process.env.ADMIN_SESSION_TTL || '900', 10))); // PCI-DSS 8.2.8 ≤15min idle
 const ADMIN_SESSION_MAX_AGE = Math.max(1800, Math.min(86400, parseInt(process.env.ADMIN_SESSION_MAX_AGE || '3600', 10))); // hard expiry 1h
 const ADMIN_SESSION_BYTES = 32; // 64 hex chars
+const MAX_USER_AGENT_LENGTH = 512; // UA 截断长度上限
 
 // ─── v2.5 多租户配置 ──────────────────────────────────────────
 const REDIS_TENANT_PREFIX = 'anima:clawbot:tenant:'; // tenant:<id>:*
@@ -2134,7 +2135,7 @@ async function createAdminSession(ip, userAgent) {
       await pgPool.query(
         `INSERT INTO clawbot_admin_sessions (session_id, csrf_token, ip_address, user_agent, expires_at)
          VALUES ($1, $2, $3, $4, $5)`,
-        [sessionId, csrfToken, ip, (userAgent || '').substring(0, 512), expiresAt]
+        [sessionId, csrfToken, ip, (userAgent || '').substring(0, MAX_USER_AGENT_LENGTH), expiresAt]
       );
     } catch (err) {
       logger.error('创建管理会话 DB 写入失败', { err: err.message });
@@ -2163,7 +2164,10 @@ async function verifyAdminSession(sessionId, csrfToken) {
         return false;
       }
       const data = JSON.parse(raw);
-      if (data.csrf_token !== csrfToken) return false;
+      // 时间安全 CSRF 比较（防止时序攻击）
+      const expectedCsrf = Buffer.from(data.csrf_token || '', 'utf8');
+      const providedCsrf = Buffer.from(csrfToken, 'utf8');
+      if (expectedCsrf.length !== providedCsrf.length || !crypto.timingSafeEqual(expectedCsrf, providedCsrf)) return false;
       // 刷新活跃时间（滑动窗口 PCI-DSS 8.2.8）
       data.last_active_at = Date.now();
       await redis.set(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`, JSON.stringify(data), 'EX', ADMIN_SESSION_TTL);
@@ -2208,7 +2212,7 @@ async function revokeAdminSession(sessionId) {
   if (!sessionId) return;
   if (!/^[a-f0-9]{64}$/.test(sessionId)) return;
   if (redis) {
-    try { await redis.del(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`); } catch (_e) { /* ignore */ }
+    try { await redis.del(`${REDIS_ADMIN_SESSION_PREFIX}${sessionId}`); } catch (err) { logger.warn('Redis admin session revoke failed', { err: err.message }); }
   }
   if (pgPool) {
     try {
@@ -4683,41 +4687,66 @@ function requireAdminIp(req, res, next) {
 }
 
 // ─── SERVICE_TOKEN 认证中间件（管理端点保护）─────────────────
-function requireServiceToken(req, res, next) {
+// v2.7: 同时支持 Bearer SERVICE_TOKEN 和 Web 管理后台会话认证
+async function requireServiceToken(req, res, next) {
   if (!SERVICE_TOKEN) {
     // 未配置 SERVICE_TOKEN 时，管理端点不可用
     res.status(403).json({ error: 'SERVICE_TOKEN not configured' });
     return;
   }
+
+  // 方式一：Bearer SERVICE_TOKEN 认证（API 调用）
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  // 使用 HMAC 归一化为等长摘要，避免长度差异导致的时序泄漏
-  const hmacKey = Buffer.from('clawbot-auth', 'utf8');
-  const expected = crypto.createHmac('sha256', hmacKey).update(SERVICE_TOKEN).digest();
-  const provided = crypto.createHmac('sha256', hmacKey).update(token).digest();
-  if (!crypto.timingSafeEqual(expected, provided)) {
-    // PCI-DSS 10.2.4: 审计无效逻辑访问尝试
-    logger.info('audit', {
-      action: 'admin_auth_fail',
-      ip: req.ip,
-      endpoint: req.path,
-      method: req.method,
-      request_id: req.id,
-    });
-    dbAuditLog({ openId: 'admin', action: 'admin_auth_fail', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
+  if (token) {
+    // 使用 HMAC 归一化为等长摘要，避免长度差异导致的时序泄漏
+    const hmacKey = Buffer.from('clawbot-auth', 'utf8');
+    const expected = crypto.createHmac('sha256', hmacKey).update(SERVICE_TOKEN).digest();
+    const provided = crypto.createHmac('sha256', hmacKey).update(token).digest();
+    if (crypto.timingSafeEqual(expected, provided)) {
+      // PCI-DSS 10.2.2: 审计特权用户操作
+      logger.info('audit', {
+        action: 'admin_access',
+        ip: req.ip,
+        endpoint: req.path,
+        method: req.method,
+        request_id: req.id,
+      });
+      dbAuditLog({ openId: 'admin', action: 'admin_access', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
+      next();
+      return;
+    }
   }
-  // PCI-DSS 10.2.2: 审计特权用户操作
+
+  // 方式二：Web 管理后台会话认证（X-Admin-Session + X-CSRF-Token）
+  const sessionId = req.headers['x-admin-session'] || '';
+  const csrfToken = req.headers['x-csrf-token'] || '';
+  if (sessionId && csrfToken) {
+    const valid = await verifyAdminSession(sessionId, csrfToken);
+    if (valid) {
+      logger.info('audit', {
+        action: 'admin_web_access',
+        ip: req.ip,
+        endpoint: req.path,
+        method: req.method,
+        request_id: req.id,
+      });
+      dbAuditLog({ openId: 'admin', action: 'admin_web_access', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
+      next();
+      return;
+    }
+  }
+
+  // PCI-DSS 10.2.4: 审计无效逻辑访问尝试
   logger.info('audit', {
-    action: 'admin_access',
+    action: 'admin_auth_fail',
     ip: req.ip,
     endpoint: req.path,
     method: req.method,
     request_id: req.id,
   });
-  dbAuditLog({ openId: 'admin', action: 'admin_access', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
-  next();
+  dbAuditLog({ openId: 'admin', action: 'admin_auth_fail', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
+  res.status(401).json({ error: 'Unauthorized' });
 }
 
 // 微信回调需要原始 XML body
