@@ -635,6 +635,8 @@ if (SESSION_ENCRYPT_KEY_RAW) {
   const keyBuf = Buffer.from(SESSION_ENCRYPT_KEY_RAW, 'hex');
   if (keyBuf.length === 32) {
     SESSION_ENCRYPT_KEY = keyBuf;
+  } else {
+    console.error(`[FATAL] SESSION_ENCRYPT_KEY 长度无效（期望 32 字节 / 64 hex，实际 ${keyBuf.length} 字节），会话加密已禁用`);
   }
 }
 // 插件生命周期 Redis 键前缀
@@ -3336,7 +3338,7 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
   }
   res.json({
-    version: '2.3.0',
+    version: PLUGIN_VERSION,
     channel: '灵枢接入通道',
     plugin_version: PLUGIN_VERSION,
     uptime_seconds: Math.floor(uptimeMs / 1000),
@@ -3710,7 +3712,9 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           logger.info('ClawBot 插件激活事件', { openId, eventKey, requestId: req.id });
           dbAuditLog({ openId, action: 'plugin_activate', detail: `key=${eventKey || 'direct'}`, requestId: req.id });
           if (redis) {
-            redis.sadd(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch(() => {});
+            redis.sadd(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch((e) => {
+              logger.warn('Redis plugin activate sadd 失败', { err: e.message, openId });
+            });
           }
           if (pgPool) {
             pgPool.query(
@@ -3731,7 +3735,9 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           logger.info('ClawBot 插件停用事件', { openId, eventKey, requestId: req.id });
           dbAuditLog({ openId, action: 'plugin_deactivate', detail: `key=${eventKey || 'user'}`, requestId: req.id });
           if (redis) {
-            redis.srem(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch(() => {});
+            redis.srem(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch((e) => {
+              logger.warn('Redis plugin deactivate srem 失败', { err: e.message, openId });
+            });
           }
           if (pgPool) {
             pgPool.query(
