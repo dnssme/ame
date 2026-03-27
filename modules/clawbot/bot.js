@@ -971,13 +971,13 @@ function verifyCryptographicBoundary(openId, dataOwnerId) {
   const requestorKey = deriveUserKey(openId);
   const ownerKey = deriveUserKey(dataOwnerId);
   if (!requestorKey || !ownerKey) return false;
-  // 密钥不同则为不同用户的数据分区
+  // 密钥不同则为不同用户的数据分区 — 拒绝跨用户访问
   const match = Buffer.compare(Buffer.from(requestorKey), Buffer.from(ownerKey)) === 0;
-  if (match) {
+  if (!match) {
     logger.warn('audit', { action: 'boundary_violation_attempt', requestor: openId, target: dataOwnerId });
     dbAuditLog({ openId, action: 'boundary_violation_attempt', detail: `Target: ${dataOwnerId}` });
   }
-  return !match ? false : true;
+  return match;
 }
 
 /**
