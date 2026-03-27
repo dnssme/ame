@@ -636,7 +636,7 @@ if (SESSION_ENCRYPT_KEY_RAW) {
   if (keyBuf.length === 32) {
     SESSION_ENCRYPT_KEY = keyBuf;
   } else {
-    console.error(`[FATAL] SESSION_ENCRYPT_KEY 长度无效（期望 32 字节 / 64 hex，实际 ${keyBuf.length} 字节），会话加密已禁用`);
+    logger.error(`SESSION_ENCRYPT_KEY 长度无效（期望 32 字节 / 64 hex，实际 ${keyBuf.length} 字节），会话加密已禁用`);
   }
 }
 // 插件生命周期 Redis 键前缀
@@ -983,8 +983,8 @@ function encryptSessionData(plainJson) {
 
 function decryptSessionData(stored) {
   if (!SESSION_ENCRYPT_KEY) return stored;
-  // 未加密的旧数据以 '{' 开头
-  if (stored.startsWith('{') || stored.startsWith('[')) return stored;
+  // 未加密的旧数据以 '{' 或 '[' 开头（有效 JSON），先尝试 JSON 解析
+  try { JSON.parse(stored); return stored; } catch (_e) { /* 非 JSON，继续解密 */ }
   try {
     const raw = Buffer.from(stored, 'base64');
     if (raw.length < 28) return stored; // iv(12) + tag(16) 最小长度
@@ -3340,7 +3340,6 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
   res.json({
     version: PLUGIN_VERSION,
     channel: '灵枢接入通道',
-    plugin_version: PLUGIN_VERSION,
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
     max_sessions: MAX_SESSIONS,
