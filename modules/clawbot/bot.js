@@ -2533,6 +2533,15 @@ const adminLimiter = rateLimit({
   message: 'Too many requests',
 });
 
+// 速率限制：OAuth 授权端点（防暴力授权，与 nginx login zone 对齐 5r/m）
+const oauthLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests',
+});
+
 // ─── 管理端点 IP 白名单中间件（CIS 网络访问限制）──────────
 function normalizeIp(ip) {
   // 处理 IPv4-mapped IPv6 地址（如 ::ffff:192.168.1.1 → 192.168.1.1）
@@ -3540,7 +3549,7 @@ app.post('/wecom/webhook', webhookLimiter, async (req, res) => {
 
 // ─── 微信 OAuth2.0 网页授权（普通用户轻松接入）──────────────────
 // 发起 OAuth 授权：重定向用户到微信授权页面
-app.get('/clawbot/oauth', async (req, res) => {
+app.get('/clawbot/oauth', oauthLimiter, async (req, res) => {
   if (!CLAWBOT_APP_ID || !OAUTH_REDIRECT_URI) {
     res.status(503).json({ error: 'OAuth not configured' });
     return;
@@ -3581,7 +3590,7 @@ app.get('/clawbot/oauth', async (req, res) => {
 });
 
 // OAuth2.0 回调：用 code 换取 access_token + openid
-app.get('/clawbot/oauth/callback', async (req, res) => {
+app.get('/clawbot/oauth/callback', oauthLimiter, async (req, res) => {
   const { code, state } = req.query;
 
   if (!code || !state) {
