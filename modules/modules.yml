@@ -56,8 +56,10 @@ channels:
 
   clawbot:
     enabled: true
-    version: "2.6.0"
-    description: "微信 ClawBot 灵枢接入通道 (v2.6)
+    version: "2.7.0"
+    description: "微信 ClawBot 灵枢接入通道 (v2.7)
+      - Web 管理后台（唯一管理入口 /clawbot/admin）
+      - 管理后台会话管理（Redis + PostgreSQL 双写/CSRF/IP 绑定）
       - 灵枢通道网关（通道注册/发现/能力矩阵/心跳监控）
       - 接入向导 /setup（分步引导普通用户完成全流程）
       - Webhook 事件中继（第三方订阅/HMAC-SHA256 签名/投递追踪）

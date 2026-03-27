@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>灵枢 · ClawBot 管理后台</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0f172a;--sidebar:#1e293b;--card:#1e293b;--border:#334155;--text:#e2e8f0;--text-muted:#94a3b8;--primary:#3b82f6;--primary-hover:#2563eb;--success:#22c55e;--warning:#f59e0b;--danger:#ef4444;--info:#06b6d4;--radius:8px;--shadow:0 1px 3px rgba(0,0,0,.3)}
+html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+a{color:var(--primary);text-decoration:none}
+button{cursor:pointer;border:none;font:inherit}
+input,select,textarea{font:inherit;color:var(--text);background:#0f172a;border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;width:100%}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(59,130,246,.3)}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border)}
+th{background:#0f172a;font-weight:600;color:var(--text-muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+tr:hover{background:rgba(59,130,246,.05)}
+
+/* Login */
+#login-page{display:flex;align-items:center;justify-content:center;min-height:100vh;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%)}
+.login-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:40px;width:100%;max-width:400px;box-shadow:var(--shadow)}
+.login-box h1{font-size:24px;text-align:center;margin-bottom:8px}
+.login-box .subtitle{text-align:center;color:var(--text-muted);margin-bottom:24px;font-size:13px}
+.login-box label{display:block;font-size:13px;color:var(--text-muted);margin-bottom:4px}
+.login-box .field{margin-bottom:16px}
+.login-box .error{color:var(--danger);font-size:13px;margin-bottom:12px;display:none}
+
+/* Layout */
+#app{display:none;height:100vh;overflow:hidden}
+.layout{display:flex;height:100%}
+.sidebar{width:240px;background:var(--sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.sidebar-header{padding:16px 20px;border-bottom:1px solid var(--border)}
+.sidebar-header h2{font-size:16px;font-weight:700}
+.sidebar-header .ver{font-size:11px;color:var(--text-muted)}
+.nav-group{padding:8px 0}
+.nav-group-title{padding:8px 20px;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600}
+.nav-item{display:flex;align-items:center;padding:8px 20px;color:var(--text-muted);cursor:pointer;transition:all .15s;font-size:13px;gap:8px}
+.nav-item:hover{background:rgba(59,130,246,.08);color:var(--text)}
+.nav-item.active{color:var(--primary);background:rgba(59,130,246,.12);border-right:2px solid var(--primary)}
+.nav-item .icon{width:18px;text-align:center;font-size:15px}
+.sidebar-footer{margin-top:auto;padding:12px 20px;border-top:1px solid var(--border)}
+
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:56px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;gap:16px;flex-shrink:0;background:var(--sidebar)}
+.topbar .page-title{font-size:16px;font-weight:600;flex:1}
+.topbar .status{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)}
+.topbar .dot{width:8px;height:8px;border-radius:50%;background:var(--success)}
+.topbar .dot.offline{background:var(--danger)}
+
+.content{flex:1;overflow-y:auto;padding:24px}
+.page{display:none}
+.page.active{display:block}
+
+/* Components */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--radius);font-size:13px;font-weight:500;transition:all .15s}
+.btn-primary{background:var(--primary);color:#fff}.btn-primary:hover{background:var(--primary-hover)}
+.btn-danger{background:var(--danger);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}.btn-outline:hover{border-color:var(--primary);color:var(--primary)}
+.btn-sm{padding:4px 10px;font-size:12px}
+
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.card-title{font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text-muted)}
+
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px}
+.stat-card .label{font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em}
+.stat-card .value{font-size:28px;font-weight:700;margin-top:4px}
+.stat-card .sub{font-size:12px;color:var(--text-muted);margin-top:2px}
+
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-success{background:rgba(34,197,94,.15);color:var(--success)}
+.badge-warning{background:rgba(245,158,11,.15);color:var(--warning)}
+.badge-danger{background:rgba(239,68,68,.15);color:var(--danger)}
+.badge-info{background:rgba(6,182,212,.15);color:var(--info)}
+
+.toolbar{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.show{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;width:90%;max-width:500px;max-height:80vh;overflow-y:auto}
+.modal h3{font-size:16px;margin-bottom:16px}
+.modal .field{margin-bottom:12px}
+.modal .field label{display:block;font-size:13px;color:var(--text-muted);margin-bottom:4px}
+.modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:16px}
+.tab{padding:8px 16px;cursor:pointer;color:var(--text-muted);font-size:13px;border-bottom:2px solid transparent;transition:all .15s}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--primary);border-bottom-color:var(--primary)}
+
+.empty{text-align:center;padding:40px;color:var(--text-muted)}
+.loading{text-align:center;padding:40px;color:var(--text-muted)}
+.alert{padding:12px 16px;border-radius:var(--radius);margin-bottom:16px;font-size:13px}
+.alert-success{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:var(--success)}
+.alert-danger{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--danger)}
+.alert-info{background:rgba(6,182,212,.1);border:1px solid rgba(6,182,212,.3);color:var(--info)}
+
+.json-view{background:#0f172a;border:1px solid var(--border);border-radius:var(--radius);padding:16px;font-family:'Fira Code',monospace;font-size:12px;white-space:pre-wrap;max-height:400px;overflow-y:auto;line-height:1.6}
+
+@media(max-width:768px){
+  .sidebar{width:60px}.sidebar .nav-item span,.sidebar-header h2,.sidebar-header .ver,.nav-group-title,.sidebar-footer span{display:none}
+  .sidebar-header{padding:12px}.nav-item{justify-content:center;padding:10px}
+  .stats-grid{grid-template-columns:1fr 1fr}
+}
+</style>
+</head>
+<body>
+<!-- Login Page -->
+<div id="login-page">
+  <div class="login-box">
+    <h1>🔮 灵枢管理后台</h1>
+    <p class="subtitle">Anima · ClawBot 统一管理平台</p>
+    <div id="login-error" class="error"></div>
+    <div class="field">
+      <label for="login-token">管理密钥 (SERVICE_TOKEN)</label>
+      <input type="password" id="login-token" placeholder="请输入管理密钥" autocomplete="off">
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center;padding:10px" onclick="doLogin()">登 录</button>
+    <p style="text-align:center;margin-top:16px;font-size:12px;color:var(--text-muted)">PCI-DSS 8.2.3 · CIS v8 · 企业安全认证</p>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+<div class="layout">
+  <!-- Sidebar -->
+  <nav class="sidebar">
+    <div class="sidebar-header">
+      <h2>🔮 灵枢管理</h2>
+      <div class="ver">ClawBot v2.7</div>
+    </div>
+    <div class="nav-group">
+      <div class="nav-group-title">概览</div>
+      <div class="nav-item active" data-page="dashboard"><span class="icon">📊</span><span>运营仪表盘</span></div>
+      <div class="nav-item" data-page="health"><span class="icon">💚</span><span>系统健康</span></div>
+    </div>
+    <div class="nav-group">
+      <div class="nav-group-title">用户与消息</div>
+      <div class="nav-item" data-page="users"><span class="icon">👥</span><span>用户管理</span></div>
+      <div class="nav-item" data-page="broadcast"><span class="icon">📢</span><span>群发消息</span></div>
+      <div class="nav-item" data-page="templates"><span class="icon">📋</span><span>模板消息</span></div>
+      <div class="nav-item" data-page="quickreply"><span class="icon">⚡</span><span>快捷回复</span></div>
+    </div>
+    <div class="nav-group">
+      <div class="nav-group-title">公众号</div>
+      <div class="nav-item" data-page="menu"><span class="icon">☰</span><span>自定义菜单</span></div>
+      <div class="nav-item" data-page="qrcode"><span class="icon">📱</span><span>二维码</span></div>
+      <div class="nav-item" data-page="material"><span class="icon">🗂️</span><span>素材管理</span></div>
+      <div class="nav-item" data-page="tags"><span class="icon">🏷️</span><span>标签管理</span></div>
+    </div>
+    <div class="nav-group">
+      <div class="nav-group-title">企业运营</div>
+      <div class="nav-item" data-page="tenants"><span class="icon">🏢</span><span>租户管理</span></div>
+      <div class="nav-item" data-page="gateway"><span class="icon">🔗</span><span>通道网关</span></div>
+      <div class="nav-item" data-page="relay"><span class="icon">📡</span><span>事件中继</span></div>
+      <div class="nav-item" data-page="federation"><span class="icon">🔄</span><span>会话联邦</span></div>
+    </div>
+    <div class="nav-group">
+      <div class="nav-group-title">安全与合规</div>
+      <div class="nav-item" data-page="compliance"><span class="icon">🛡️</span><span>合规报告</span></div>
+      <div class="nav-item" data-page="audit"><span class="icon">📝</span><span>审计日志</span></div>
+      <div class="nav-item" data-page="plugin"><span class="icon">🔌</span><span>插件状态</span></div>
+    </div>
+    <div class="sidebar-footer">
+      <button class="btn btn-outline btn-sm" style="width:100%;justify-content:center" onclick="doLogout()">
+        <span>🚪</span><span>退出登录</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="topbar">
+      <div class="page-title" id="page-title">运营仪表盘</div>
+      <div class="status">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">连接中...</span>
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="refreshCurrentPage()">🔄 刷新</button>
+    </div>
+    <div class="content">
+      <!-- Dashboard -->
+      <div class="page active" id="page-dashboard">
+        <div class="stats-grid" id="dashboard-stats"></div>
+        <div class="card"><div class="card-title">消息类型分布</div><div id="msg-types"></div></div>
+        <div class="card"><div class="card-title">命令使用统计</div><div id="cmd-stats"></div></div>
+      </div>
+
+      <!-- Health -->
+      <div class="page" id="page-health">
+        <div id="health-content" class="loading">加载中...</div>
+      </div>
+
+      <!-- Users -->
+      <div class="page" id="page-users">
+        <div class="toolbar">
+          <input type="text" id="user-search" placeholder="搜索用户 OpenID / 昵称..." style="max-width:300px" oninput="filterUsers()">
+          <button class="btn btn-outline btn-sm" onclick="loadUsers()">🔄 刷新</button>
+        </div>
+        <div id="users-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Broadcast -->
+      <div class="page" id="page-broadcast">
+        <div class="card">
+          <div class="card-title">发送群发消息</div>
+          <div class="field"><label>消息内容</label><textarea id="broadcast-content" rows="4" placeholder="输入群发文本消息..."></textarea></div>
+          <div class="field"><label>目标标签 ID（可选，逗号分隔）</label><input type="text" id="broadcast-tags" placeholder="留空发送给所有用户"></div>
+          <button class="btn btn-primary" onclick="sendBroadcast()">📢 发送群发</button>
+        </div>
+      </div>
+
+      <!-- Templates -->
+      <div class="page" id="page-templates">
+        <div class="card">
+          <div class="card-title">发送模板消息</div>
+          <div class="field"><label>用户 OpenID</label><input type="text" id="tpl-openid" placeholder="目标用户 OpenID"></div>
+          <div class="field"><label>模板 ID</label><input type="text" id="tpl-id" placeholder="微信模板 ID"></div>
+          <div class="field"><label>模板数据 (JSON)</label><textarea id="tpl-data" rows="4" placeholder='{"first":{"value":"通知"},"keyword1":{"value":"内容"}}'></textarea></div>
+          <div class="field"><label>跳转 URL（可选）</label><input type="text" id="tpl-url" placeholder="https://..."></div>
+          <button class="btn btn-primary" onclick="sendTemplate()">📋 发送模板</button>
+        </div>
+        <div class="card">
+          <div class="card-title">模板列表</div>
+          <div id="template-list" class="loading">加载中...</div>
+        </div>
+      </div>
+
+      <!-- Quick Reply -->
+      <div class="page" id="page-quickreply">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showAddQuickReply()">+ 添加规则</button>
+          <button class="btn btn-outline btn-sm" onclick="loadQuickReplies()">🔄 刷新</button>
+        </div>
+        <div id="quickreply-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Menu -->
+      <div class="page" id="page-menu">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showMenuEditor()">✏️ 编辑菜单</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteMenu()">🗑️ 删除菜单</button>
+          <button class="btn btn-outline btn-sm" onclick="loadMenu()">🔄 刷新</button>
+        </div>
+        <div class="card"><div class="card-title">当前菜单配置</div><div id="menu-json" class="json-view">加载中...</div></div>
+      </div>
+
+      <!-- QR Code -->
+      <div class="page" id="page-qrcode">
+        <div class="card">
+          <div class="card-title">生成二维码</div>
+          <div class="field"><label>场景值</label><input type="text" id="qr-scene" placeholder="scene_value"></div>
+          <div class="field"><label>类型</label><select id="qr-type"><option value="temp">临时二维码</option><option value="perm">永久二维码</option></select></div>
+          <button class="btn btn-primary" onclick="generateQrcode()">📱 生成</button>
+        </div>
+        <div id="qrcode-result"></div>
+      </div>
+
+      <!-- Material -->
+      <div class="page" id="page-material">
+        <div class="toolbar">
+          <select id="mat-type" style="max-width:150px"><option value="news">图文</option><option value="image">图片</option><option value="voice">语音</option><option value="video">视频</option></select>
+          <button class="btn btn-primary btn-sm" onclick="loadMaterials()">🔍 查询</button>
+        </div>
+        <div class="card"><div class="card-title">素材统计</div><div id="material-count">加载中...</div></div>
+        <div id="material-list"></div>
+      </div>
+
+      <!-- Tags -->
+      <div class="page" id="page-tags">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showAddTag()">+ 创建标签</button>
+          <button class="btn btn-outline btn-sm" onclick="loadTags()">🔄 刷新</button>
+        </div>
+        <div id="tags-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Tenants -->
+      <div class="page" id="page-tenants">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showAddTenant()">+ 创建租户</button>
+          <button class="btn btn-outline btn-sm" onclick="loadTenants()">🔄 刷新</button>
+        </div>
+        <div id="tenants-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Gateway -->
+      <div class="page" id="page-gateway">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showAddChannel()">+ 注册通道</button>
+          <button class="btn btn-outline btn-sm" onclick="loadGateway()">🔄 刷新</button>
+        </div>
+        <div class="card"><div class="card-title">通道能力矩阵</div><div id="gateway-features" class="loading">加载中...</div></div>
+        <div id="gateway-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Relay -->
+      <div class="page" id="page-relay">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showAddSubscription()">+ 创建订阅</button>
+          <button class="btn btn-outline btn-sm" onclick="loadRelay()">🔄 刷新</button>
+        </div>
+        <div id="relay-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Federation -->
+      <div class="page" id="page-federation">
+        <div class="toolbar">
+          <button class="btn btn-primary btn-sm" onclick="showAddLink()">+ 创建关联</button>
+          <button class="btn btn-outline btn-sm" onclick="loadFederation()">🔄 刷新</button>
+        </div>
+        <div id="federation-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Compliance -->
+      <div class="page" id="page-compliance">
+        <div class="tabs">
+          <div class="tab active" onclick="showComplianceTab('report')">合规报告</div>
+          <div class="tab" onclick="showComplianceTab('realtime')">实时检测</div>
+          <div class="tab" onclick="showComplianceTab('history')">历史快照</div>
+        </div>
+        <div id="compliance-content" class="loading">加载中...</div>
+      </div>
+
+      <!-- Audit -->
+      <div class="page" id="page-audit">
+        <div class="toolbar">
+          <input type="text" id="audit-action" placeholder="过滤操作类型..." style="max-width:200px">
+          <input type="text" id="audit-openid" placeholder="过滤 OpenID..." style="max-width:200px">
+          <input type="number" id="audit-limit" value="50" min="1" max="200" style="max-width:100px" title="条数">
+          <button class="btn btn-primary btn-sm" onclick="loadAudit()">🔍 查询</button>
+        </div>
+        <div id="audit-table" class="loading">加载中...</div>
+      </div>
+
+      <!-- Plugin -->
+      <div class="page" id="page-plugin">
+        <div class="tabs">
+          <div class="tab active" onclick="showPluginTab('status')">插件状态</div>
+          <div class="tab" onclick="showPluginTab('manifest')">插件清单</div>
+          <div class="tab" onclick="showPluginTab('health')">健康检查</div>
+        </div>
+        <div id="plugin-content" class="loading">加载中...</div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal" id="modal-body"></div>
+</div>
+
+<script>
+/* ── State ── */
+let sessionToken = '';
+let csrfToken = '';
+let currentPage = 'dashboard';
+let statsData = null;
+let usersData = [];
+
+const API_BASE = '';
+const pageTitles = {
+  dashboard:'运营仪表盘',health:'系统健康',users:'用户管理',broadcast:'群发消息',
+  templates:'模板消息',quickreply:'快捷回复',menu:'自定义菜单',qrcode:'二维码',
+  material:'素材管理',tags:'标签管理',tenants:'租户管理',gateway:'通道网关',
+  relay:'事件中继',federation:'会话联邦',compliance:'合规报告',audit:'审计日志',plugin:'插件状态'
+};
+
+/* ── Auth ── */
+async function doLogin(){
+  const token = document.getElementById('login-token').value.trim();
+  if(!token){showLoginError('请输入管理密钥');return}
+  try{
+    const r = await fetch(API_BASE+'/clawbot/admin/api/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token})
+    });
+    const d = await r.json();
+    if(!r.ok){showLoginError(d.error||'登录失败');return}
+    sessionToken = d.session_id;
+    csrfToken = d.csrf_token;
+    document.getElementById('login-page').style.display='none';
+    document.getElementById('app').style.display='block';
+    loadDashboard();
+    startHealthPoll();
+  }catch(e){showLoginError('网络错误: '+e.message)}
+}
+
+function showLoginError(msg){
+  const el=document.getElementById('login-error');
+  el.textContent=msg;el.style.display='block';
+}
+
+async function doLogout(){
+  try{await api('POST','/clawbot/admin/api/logout')}catch(e){/* ignore */}
+  sessionToken='';csrfToken='';
+  document.getElementById('app').style.display='none';
+  document.getElementById('login-page').style.display='flex';
+  document.getElementById('login-token').value='';
+  document.getElementById('login-error').style.display='none';
+}
+
+/* ── API Helper ── */
+async function api(method, path, body){
+  const opts = {
+    method,
+    headers:{
+      'X-Admin-Session': sessionToken,
+      'X-CSRF-Token': csrfToken
+    }
+  };
+  if(body){
+    opts.headers['Content-Type']='application/json';
+    opts.body=JSON.stringify(body);
+  }
+  const r = await fetch(API_BASE+path, opts);
+  if(r.status===401){doLogout();return Promise.reject(new Error('会话已过期'))}
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.error||`请求失败 (${r.status})`);
+  return data;
+}
+
+/* ── Navigation ── */
+document.querySelectorAll('.nav-item').forEach(el=>{
+  el.addEventListener('click',()=>{
+    const page = el.dataset.page;
+    if(!page) return;
+    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+    el.classList.add('active');
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    const pageEl = document.getElementById('page-'+page);
+    if(pageEl) pageEl.classList.add('active');
+    document.getElementById('page-title').textContent = pageTitles[page]||page;
+    currentPage = page;
+    loadPage(page);
+  });
+});
+
+document.getElementById('login-token').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
+
+function refreshCurrentPage(){loadPage(currentPage)}
+
+function loadPage(page){
+  const loaders = {
+    dashboard:loadDashboard,health:loadHealth,users:loadUsers,templates:loadTemplates,
+    quickreply:loadQuickReplies,menu:loadMenu,material:loadMaterialCount,tags:loadTags,
+    tenants:loadTenants,gateway:loadGateway,relay:loadRelay,federation:loadFederation,
+    compliance:()=>showComplianceTab('report'),audit:loadAudit,plugin:()=>showPluginTab('status')
+  };
+  if(loaders[page]) loaders[page]();
+}
+
+/* ── Dashboard ── */
+async function loadDashboard(){
+  try{
+    const d = await api('GET','/stats');
+    statsData = d;
+    const grid = document.getElementById('dashboard-stats');
+    const upH = Math.floor(d.uptime_seconds/3600);
+    const upM = Math.floor((d.uptime_seconds%3600)/60);
+    grid.innerHTML = `
+      <div class="stat-card"><div class="label">运行时间</div><div class="value">${upH}h ${upM}m</div></div>
+      <div class="stat-card"><div class="label">活跃会话</div><div class="value">${d.active_sessions}</div><div class="sub">上限 ${d.max_sessions}</div></div>
+      <div class="stat-card"><div class="label">总消息数</div><div class="value">${fmtNum(d.total_messages)}</div></div>
+      <div class="stat-card"><div class="label">总命令数</div><div class="value">${fmtNum(d.total_commands)}</div></div>
+      <div class="stat-card"><div class="label">总错误数</div><div class="value">${d.total_errors}</div></div>
+      <div class="stat-card"><div class="label">OAuth 完成</div><div class="value">${d.oauth_completed}</div><div class="sub">发起 ${d.oauth_initiated}</div></div>
+      <div class="stat-card"><div class="label">模板发送</div><div class="value">${d.templates_sent}</div></div>
+      <div class="stat-card"><div class="label">快捷回复</div><div class="value">${d.quick_reply_hits}</div></div>
+      <div class="stat-card"><div class="label">租户数</div><div class="value">${d.tenant_created}</div></div>
+      <div class="stat-card"><div class="label">通道数</div><div class="value">${d.channel_registered}</div></div>
+      <div class="stat-card"><div class="label">Webhook 投递</div><div class="value">${d.webhook_deliveries}</div><div class="sub">失败 ${d.webhook_delivery_failures}</div></div>
+      <div class="stat-card"><div class="label">合规扫描</div><div class="value">${d.compliance_scans}</div></div>
+    `;
+    // Message types
+    const mt = d.messages_by_type||{};
+    document.getElementById('msg-types').innerHTML = '<table><tr>'+
+      Object.entries(mt).map(([k,v])=>`<td style="text-align:center"><div style="font-size:24px;font-weight:700">${v}</div><div style="color:var(--text-muted);font-size:12px">${k}</div></td>`).join('')+
+      '</tr></table>';
+    // Commands
+    const cmds = d.commands_by_name||{};
+    const cmdEntries = Object.entries(cmds).sort((a,b)=>b[1]-a[1]);
+    document.getElementById('cmd-stats').innerHTML = cmdEntries.length?
+      '<table><thead><tr><th>命令</th><th>调用次数</th></tr></thead><tbody>'+
+      cmdEntries.map(([k,v])=>`<tr><td><code>/${k}</code></td><td>${v}</td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无命令调用数据</div>';
+  }catch(e){document.getElementById('dashboard-stats').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+
+/* ── Health ── */
+let healthTimer=null;
+function startHealthPoll(){
+  checkHealth();
+  if(healthTimer)clearInterval(healthTimer);
+  healthTimer=setInterval(checkHealth,30000);
+}
+async function checkHealth(){
+  try{
+    const r=await fetch(API_BASE+'/health');
+    const d=await r.json();
+    const dot=document.getElementById('status-dot');
+    const txt=document.getElementById('status-text');
+    if(d.status==='ok'){dot.className='dot';txt.textContent='系统正常'}
+    else{dot.className='dot offline';txt.textContent='异常'}
+  }catch(e){
+    document.getElementById('status-dot').className='dot offline';
+    document.getElementById('status-text').textContent='离线';
+  }
+}
+async function loadHealth(){
+  try{
+    const [h,s]=await Promise.all([fetch(API_BASE+'/health').then(r=>r.json()),api('GET','/stats')]);
+    document.getElementById('health-content').innerHTML=`
+      <div class="stats-grid">
+        <div class="stat-card"><div class="label">服务状态</div><div class="value"><span class="badge ${h.status==='ok'?'badge-success':'badge-danger'}">${h.status}</span></div></div>
+        <div class="stat-card"><div class="label">版本</div><div class="value" style="font-size:18px">${esc(s.version)}</div></div>
+        <div class="stat-card"><div class="label">Redis</div><div class="value"><span class="badge ${s.redis_status==='connected'?'badge-success':'badge-danger'}">${s.redis_status}</span></div></div>
+        <div class="stat-card"><div class="label">加密模式</div><div class="value" style="font-size:14px">${esc(s.encrypt_mode)}</div></div>
+        <div class="stat-card"><div class="label">OAuth</div><div class="value"><span class="badge ${s.oauth_configured?'badge-success':'badge-warning'}">${s.oauth_configured?'已配置':'未配置'}</span></div></div>
+        <div class="stat-card"><div class="label">数据库</div><div class="value"><span class="badge ${s.db_enabled?'badge-success':'badge-warning'}">${s.db_enabled?'已连接':'未连接'}</span></div></div>
+        <div class="stat-card"><div class="label">会话加密</div><div class="value"><span class="badge ${s.session_encryption?'badge-success':'badge-warning'}">${s.session_encryption?'AES-256-GCM':'未启用'}</span></div></div>
+        <div class="stat-card"><div class="label">企业微信</div><div class="value"><span class="badge ${s.wecom_enabled?'badge-success':'badge-info'}">${s.wecom_enabled?'已启用':'未启用'}</span></div></div>
+      </div>
+      <div class="card"><div class="card-title">配置参数</div><table>
+        <tr><td>绑定锁定阈值</td><td>${s.bind_lockout_threshold} 次</td></tr>
+        <tr><td>空闲会话超时</td><td>${s.idle_session_timeout_min} 分钟</td></tr>
+        <tr><td>审计保留天数</td><td>${s.audit_retention_days} 天</td></tr>
+      </table></div>`;
+  }catch(e){document.getElementById('health-content').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+
+/* ── Users ── */
+async function loadUsers(){
+  try{
+    const d=await api('GET','/clawbot/users');
+    usersData=d.users||[];
+    renderUsers(usersData);
+  }catch(e){document.getElementById('users-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function filterUsers(){
+  const q=document.getElementById('user-search').value.toLowerCase();
+  const filtered=usersData.filter(u=>(u.open_id||'').toLowerCase().includes(q)||(u.nickname||'').toLowerCase().includes(q));
+  renderUsers(filtered);
+}
+function renderUsers(users){
+  if(!users.length){document.getElementById('users-table').innerHTML='<div class="empty">暂无用户数据</div>';return}
+  document.getElementById('users-table').innerHTML=`<table><thead><tr>
+    <th>OpenID</th><th>昵称</th><th>邮箱</th><th>OAuth</th><th>创建时间</th><th>操作</th>
+  </tr></thead><tbody>${users.map(u=>`<tr>
+    <td><code style="font-size:11px">${esc((u.open_id||'').substring(0,16))}...</code></td>
+    <td>${esc(u.nickname||'-')}</td>
+    <td>${esc(u.email||'-')}</td>
+    <td><span class="badge badge-info">${esc(u.oauth_scope||'legacy')}</span></td>
+    <td>${fmtDate(u.created_at)}</td>
+    <td><button class="btn btn-danger btn-sm" onclick="blockUser('${esc(u.open_id)}')">封禁</button></td>
+  </tr>`).join('')}</tbody></table>`;
+}
+async function blockUser(openId){
+  if(!confirm('确定封禁此用户？'))return;
+  try{await api('POST',`/clawbot/users/${encodeURIComponent(openId)}/block`);loadUsers()}
+  catch(e){alert(e.message)}
+}
+
+/* ── Templates ── */
+async function loadTemplates(){
+  try{
+    const d=await api('GET','/clawbot/template/list');
+    const list=d.template_list||[];
+    document.getElementById('template-list').innerHTML=list.length?
+      '<table><thead><tr><th>模板 ID</th><th>标题</th><th>主行业</th></tr></thead><tbody>'+
+      list.map(t=>`<tr><td><code style="font-size:11px">${esc(t.template_id)}</code></td><td>${esc(t.title||'-')}</td><td>${esc(t.primary_industry||'-')}</td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无模板</div>';
+  }catch(e){document.getElementById('template-list').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+async function sendTemplate(){
+  const openId=document.getElementById('tpl-openid').value.trim();
+  const templateId=document.getElementById('tpl-id').value.trim();
+  const dataStr=document.getElementById('tpl-data').value.trim();
+  const url=document.getElementById('tpl-url').value.trim();
+  if(!openId||!templateId){alert('请填写用户 OpenID 和模板 ID');return}
+  let data={};try{if(dataStr)data=JSON.parse(dataStr)}catch(e){alert('模板数据 JSON 格式错误');return}
+  try{
+    await api('POST','/clawbot/template/send',{touser:openId,template_id:templateId,data,url:url||undefined});
+    alert('模板消息已发送');
+  }catch(e){alert(e.message)}
+}
+
+/* ── Quick Reply ── */
+async function loadQuickReplies(){
+  try{
+    const d=await api('GET','/clawbot/quickreply');
+    const rules=d.rules||[];
+    document.getElementById('quickreply-table').innerHTML=rules.length?
+      '<table><thead><tr><th>ID</th><th>关键词</th><th>匹配模式</th><th>回复</th><th>操作</th></tr></thead><tbody>'+
+      rules.map(r=>`<tr><td>${esc(r.id)}</td><td><code>${esc(r.keyword)}</code></td><td><span class="badge badge-info">${esc(r.match||'exact')}</span></td>
+        <td>${esc((r.reply||'').substring(0,50))}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteQuickReply('${esc(r.id)}')">删除</button></td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无快捷回复规则</div>';
+  }catch(e){document.getElementById('quickreply-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function showAddQuickReply(){
+  showModal(`<h3>添加快捷回复规则</h3>
+    <div class="field"><label>关键词</label><input type="text" id="qr-keyword"></div>
+    <div class="field"><label>匹配模式</label><select id="qr-match"><option value="exact">精确匹配</option><option value="contains">包含匹配</option><option value="regex">正则匹配</option></select></div>
+    <div class="field"><label>回复内容</label><textarea id="qr-reply" rows="3"></textarea></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="addQuickReply()">添加</button></div>`);
+}
+async function addQuickReply(){
+  const keyword=document.getElementById('qr-keyword').value.trim();
+  const match=document.getElementById('qr-match').value;
+  const reply=document.getElementById('qr-reply').value.trim();
+  if(!keyword||!reply){alert('请填写关键词和回复');return}
+  try{await api('POST','/clawbot/quickreply',{keyword,match,reply});closeModal();loadQuickReplies()}catch(e){alert(e.message)}
+}
+async function deleteQuickReply(id){
+  if(!confirm('确定删除此规则？'))return;
+  try{await api('DELETE',`/clawbot/quickreply/${encodeURIComponent(id)}`);loadQuickReplies()}catch(e){alert(e.message)}
+}
+
+/* ── Menu ── */
+async function loadMenu(){
+  try{const d=await api('GET','/clawbot/menu');document.getElementById('menu-json').textContent=JSON.stringify(d,null,2)}
+  catch(e){document.getElementById('menu-json').textContent=e.message}
+}
+function showMenuEditor(){
+  showModal(`<h3>编辑自定义菜单</h3>
+    <div class="field"><label>菜单 JSON 配置</label><textarea id="menu-edit" rows="12" style="font-family:monospace;font-size:12px">${esc(document.getElementById('menu-json').textContent)}</textarea></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="saveMenu()">保存</button></div>`);
+}
+async function saveMenu(){
+  let data;try{data=JSON.parse(document.getElementById('menu-edit').value)}catch(e){alert('JSON 格式错误');return}
+  try{await api('POST','/clawbot/menu',data);closeModal();loadMenu()}catch(e){alert(e.message)}
+}
+async function deleteMenu(){
+  if(!confirm('确定删除自定义菜单？'))return;
+  try{await api('DELETE','/clawbot/menu');loadMenu()}catch(e){alert(e.message)}
+}
+
+/* ── QR Code ── */
+async function generateQrcode(){
+  const scene=document.getElementById('qr-scene').value.trim();
+  if(!scene){alert('请输入场景值');return}
+  try{
+    const d=await api('GET',`/clawbot/qrcode?scene=${encodeURIComponent(scene)}&type=${document.getElementById('qr-type').value}`);
+    document.getElementById('qrcode-result').innerHTML=`<div class="card"><div class="card-title">生成结果</div>
+      ${d.url?`<p>二维码链接: <a href="${esc(d.url)}" target="_blank">${esc(d.url)}</a></p>`:''}
+      <div class="json-view">${esc(JSON.stringify(d,null,2))}</div></div>`;
+  }catch(e){document.getElementById('qrcode-result').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+
+/* ── Material ── */
+async function loadMaterialCount(){
+  try{
+    const d=await api('GET','/clawbot/material/count');
+    document.getElementById('material-count').innerHTML=`<table><tr>
+      <td style="text-align:center"><div style="font-size:24px;font-weight:700">${d.voice_count||0}</div><div style="color:var(--text-muted)">语音</div></td>
+      <td style="text-align:center"><div style="font-size:24px;font-weight:700">${d.video_count||0}</div><div style="color:var(--text-muted)">视频</div></td>
+      <td style="text-align:center"><div style="font-size:24px;font-weight:700">${d.image_count||0}</div><div style="color:var(--text-muted)">图片</div></td>
+      <td style="text-align:center"><div style="font-size:24px;font-weight:700">${d.news_count||0}</div><div style="color:var(--text-muted)">图文</div></td>
+    </tr></table>`;
+  }catch(e){document.getElementById('material-count').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+async function loadMaterials(){
+  const type=document.getElementById('mat-type').value;
+  try{
+    const d=await api('POST','/clawbot/material/list',{type,offset:0,count:20});
+    const items=d.item||[];
+    document.getElementById('material-list').innerHTML=items.length?
+      `<div class="card"><table><thead><tr><th>Media ID</th><th>名称</th><th>更新时间</th><th>操作</th></tr></thead><tbody>${
+        items.map(i=>`<tr><td><code style="font-size:11px">${esc((i.media_id||'').substring(0,20))}</code></td>
+          <td>${esc(i.name||'-')}</td><td>${fmtDate(i.update_time?i.update_time*1000:0)}</td>
+          <td><button class="btn btn-danger btn-sm" onclick="deleteMaterial('${esc(i.media_id)}')">删除</button></td></tr>`).join('')
+      }</tbody></table></div>`:'<div class="empty">暂无素材</div>';
+  }catch(e){document.getElementById('material-list').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+async function deleteMaterial(mediaId){
+  if(!confirm('确定删除此素材？'))return;
+  try{await api('DELETE',`/clawbot/material/${encodeURIComponent(mediaId)}`);loadMaterials()}catch(e){alert(e.message)}
+}
+
+/* ── Tags ── */
+async function loadTags(){
+  try{
+    const d=await api('GET','/clawbot/tags');
+    const tags=d.tags||[];
+    document.getElementById('tags-table').innerHTML=tags.length?
+      '<table><thead><tr><th>ID</th><th>名称</th><th>用户数</th><th>操作</th></tr></thead><tbody>'+
+      tags.map(t=>`<tr><td>${t.id}</td><td>${esc(t.name)}</td><td>${t.count||0}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteTag(${t.id})">删除</button></td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无标签</div>';
+  }catch(e){document.getElementById('tags-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function showAddTag(){
+  showModal(`<h3>创建标签</h3>
+    <div class="field"><label>标签名称</label><input type="text" id="tag-name" maxlength="30"></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="addTag()">创建</button></div>`);
+}
+async function addTag(){
+  const name=document.getElementById('tag-name').value.trim();
+  if(!name){alert('请输入标签名称');return}
+  try{await api('POST','/clawbot/tags',{name});closeModal();loadTags()}catch(e){alert(e.message)}
+}
+async function deleteTag(id){if(!confirm('确定删除此标签？'))return;try{await api('DELETE',`/clawbot/tags/${id}`);loadTags()}catch(e){alert(e.message)}}
+
+/* ── Broadcast ── */
+async function sendBroadcast(){
+  const content=document.getElementById('broadcast-content').value.trim();
+  if(!content){alert('请输入消息内容');return}
+  const tagsStr=document.getElementById('broadcast-tags').value.trim();
+  const body={content};
+  if(tagsStr){body.tag_ids=tagsStr.split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n))}
+  try{const d=await api('POST','/clawbot/broadcast',body);alert('群发已提交，消息 ID: '+(d.msg_id||'N/A'))}catch(e){alert(e.message)}
+}
+
+/* ── Tenants ── */
+async function loadTenants(){
+  try{
+    const d=await api('GET','/clawbot/tenants');
+    const list=d.tenants||[];
+    document.getElementById('tenants-table').innerHTML=list.length?
+      '<table><thead><tr><th>ID</th><th>名称</th><th>计划</th><th>状态</th><th>速率限制</th><th>操作</th></tr></thead><tbody>'+
+      list.map(t=>`<tr><td><code style="font-size:11px">${esc(t.tenant_id||'').substring(0,12)}</code></td><td>${esc(t.name||'-')}</td>
+        <td><span class="badge badge-info">${esc(t.plan||'free')}</span></td>
+        <td><span class="badge ${t.status==='active'?'badge-success':'badge-danger'}">${esc(t.status)}</span></td>
+        <td>${t.rate_limit||'-'}/min</td>
+        <td>
+          <button class="btn btn-outline btn-sm" onclick="showTenantKeys('${esc(t.tenant_id)}')">密钥</button>
+          <button class="btn btn-danger btn-sm" onclick="suspendTenant('${esc(t.tenant_id)}')">停用</button>
+        </td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无租户</div>';
+  }catch(e){document.getElementById('tenants-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function showAddTenant(){
+  showModal(`<h3>创建租户</h3>
+    <div class="field"><label>租户名称</label><input type="text" id="tenant-name"></div>
+    <div class="field"><label>计划</label><select id="tenant-plan"><option value="free">免费</option><option value="basic">基础</option><option value="pro">专业</option><option value="enterprise">企业</option></select></div>
+    <div class="field"><label>速率限制 (请求/分钟)</label><input type="number" id="tenant-rate" value="60" min="1"></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="addTenant()">创建</button></div>`);
+}
+async function addTenant(){
+  const name=document.getElementById('tenant-name').value.trim();
+  const plan=document.getElementById('tenant-plan').value;
+  const rate=parseInt(document.getElementById('tenant-rate').value,10);
+  if(!name){alert('请输入租户名称');return}
+  try{await api('POST','/clawbot/tenants',{name,plan,rate_limit:rate});closeModal();loadTenants()}catch(e){alert(e.message)}
+}
+async function suspendTenant(id){
+  if(!confirm('确定停用此租户？'))return;
+  try{await api('PATCH',`/clawbot/tenants/${encodeURIComponent(id)}/status`,{status:'suspended'});loadTenants()}catch(e){alert(e.message)}
+}
+async function showTenantKeys(tenantId){
+  try{
+    const d=await api('GET',`/clawbot/tenants/${encodeURIComponent(tenantId)}/keys`);
+    const keys=d.keys||[];
+    showModal(`<h3>API 密钥管理</h3><p style="color:var(--text-muted);font-size:12px;margin-bottom:12px">租户: ${esc(tenantId)}</p>
+      ${keys.length?'<table><thead><tr><th>ID</th><th>作用域</th><th>过期</th></tr></thead><tbody>'+
+        keys.map(k=>`<tr><td>${k.id}</td><td>${esc(JSON.stringify(k.scopes))}</td><td>${fmtDate(k.expires_at)}</td></tr>`).join('')+'</tbody></table>':
+        '<div class="empty">暂无 API 密钥</div>'}
+      <div class="actions" style="margin-top:16px">
+        <button class="btn btn-primary btn-sm" onclick="createTenantKey('${esc(tenantId)}')">+ 创建密钥</button>
+        <button class="btn btn-outline btn-sm" onclick="closeModal()">关闭</button>
+      </div>`);
+  }catch(e){alert(e.message)}
+}
+async function createTenantKey(tenantId){
+  try{
+    const d=await api('POST',`/clawbot/tenants/${encodeURIComponent(tenantId)}/keys`,{scopes:['read','write']});
+    alert('密钥已创建（仅显示一次）:\n'+JSON.stringify(d.key||d,null,2));
+    showTenantKeys(tenantId);
+  }catch(e){alert(e.message)}
+}
+
+/* ── Gateway ── */
+async function loadGateway(){
+  try{
+    const [channels,features]=await Promise.all([api('GET','/clawbot/gateway/channels'),api('GET','/clawbot/gateway/features')]);
+    const list=channels.channels||[];
+    document.getElementById('gateway-features').innerHTML=`<div class="json-view">${esc(JSON.stringify(features,null,2))}</div>`;
+    document.getElementById('gateway-table').innerHTML=list.length?
+      '<table><thead><tr><th>ID</th><th>名称</th><th>类型</th><th>状态</th><th>操作</th></tr></thead><tbody>'+
+      list.map(c=>`<tr><td><code style="font-size:11px">${esc((c.channel_id||'').substring(0,12))}</code></td><td>${esc(c.name||'-')}</td>
+        <td><span class="badge badge-info">${esc(c.type)}</span></td>
+        <td><span class="badge ${c.status==='active'?'badge-success':'badge-danger'}">${esc(c.status)}</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="removeChannel('${esc(c.channel_id)}')">移除</button></td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无注册通道</div>';
+  }catch(e){document.getElementById('gateway-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function showAddChannel(){
+  showModal(`<h3>注册通道</h3>
+    <div class="field"><label>通道名称</label><input type="text" id="ch-name"></div>
+    <div class="field"><label>类型</label><select id="ch-type"><option value="wechat">微信公众号</option><option value="wecom">企业微信</option><option value="miniprogram">小程序</option><option value="webapp">Web 应用</option><option value="api">API</option><option value="custom">自定义</option></select></div>
+    <div class="field"><label>回调 URL</label><input type="text" id="ch-callback" placeholder="https://..."></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="addChannel()">注册</button></div>`);
+}
+async function addChannel(){
+  const name=document.getElementById('ch-name').value.trim();
+  const type=document.getElementById('ch-type').value;
+  const callbackUrl=document.getElementById('ch-callback').value.trim();
+  if(!name){alert('请输入通道名称');return}
+  try{await api('POST','/clawbot/gateway/channels',{name,type,callback_url:callbackUrl||undefined});closeModal();loadGateway()}catch(e){alert(e.message)}
+}
+async function removeChannel(id){if(!confirm('确定移除此通道？'))return;try{await api('DELETE',`/clawbot/gateway/channels/${encodeURIComponent(id)}`);loadGateway()}catch(e){alert(e.message)}}
+
+/* ── Relay ── */
+async function loadRelay(){
+  try{
+    const d=await api('GET','/clawbot/relay/subscriptions');
+    const list=d.subscriptions||[];
+    document.getElementById('relay-table').innerHTML=list.length?
+      '<table><thead><tr><th>ID</th><th>事件</th><th>URL</th><th>状态</th><th>操作</th></tr></thead><tbody>'+
+      list.map(s=>`<tr><td>${s.id}</td><td><code>${esc(s.event_type||'*')}</code></td>
+        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(s.url||'-')}</td>
+        <td><span class="badge ${s.active!==false?'badge-success':'badge-danger'}">${s.active!==false?'活跃':'停用'}</span></td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteSubscription(${s.id})">删除</button></td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无事件订阅</div>';
+  }catch(e){document.getElementById('relay-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function showAddSubscription(){
+  showModal(`<h3>创建事件订阅</h3>
+    <div class="field"><label>事件类型</label><input type="text" id="sub-event" placeholder="message / event / * (所有)"></div>
+    <div class="field"><label>Webhook URL (HTTPS)</label><input type="text" id="sub-url" placeholder="https://..."></div>
+    <div class="field"><label>签名密钥</label><input type="text" id="sub-secret" placeholder="HMAC-SHA256 签名密钥"></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="addSubscription()">创建</button></div>`);
+}
+async function addSubscription(){
+  const event_type=document.getElementById('sub-event').value.trim();
+  const url=document.getElementById('sub-url').value.trim();
+  const secret=document.getElementById('sub-secret').value.trim();
+  if(!url){alert('请输入 Webhook URL');return}
+  try{await api('POST','/clawbot/relay/subscriptions',{event_type:event_type||'*',url,secret:secret||undefined});closeModal();loadRelay()}catch(e){alert(e.message)}
+}
+async function deleteSubscription(id){if(!confirm('确定删除此订阅？'))return;try{await api('DELETE',`/clawbot/relay/subscriptions/${id}`);loadRelay()}catch(e){alert(e.message)}}
+
+/* ── Federation ── */
+async function loadFederation(){
+  try{
+    const d=await api('GET','/clawbot/federation/links');
+    const list=d.links||[];
+    document.getElementById('federation-table').innerHTML=list.length?
+      '<table><thead><tr><th>ID</th><th>微信 OpenID</th><th>企微 UserID</th><th>创建时间</th><th>操作</th></tr></thead><tbody>'+
+      list.map(l=>`<tr><td>${l.id}</td><td><code style="font-size:11px">${esc((l.wechat_open_id||'').substring(0,16))}</code></td>
+        <td><code style="font-size:11px">${esc((l.wecom_user_id||'').substring(0,16))}</code></td>
+        <td>${fmtDate(l.created_at)}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteLink(${l.id})">解除</button></td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无会话关联</div>';
+  }catch(e){document.getElementById('federation-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+function showAddLink(){
+  showModal(`<h3>创建会话关联</h3>
+    <div class="field"><label>微信 OpenID</label><input type="text" id="link-wechat"></div>
+    <div class="field"><label>企业微信 UserID</label><input type="text" id="link-wecom"></div>
+    <div class="actions"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="addLink()">关联</button></div>`);
+}
+async function addLink(){
+  const wechat_open_id=document.getElementById('link-wechat').value.trim();
+  const wecom_user_id=document.getElementById('link-wecom').value.trim();
+  if(!wechat_open_id||!wecom_user_id){alert('请填写双方 ID');return}
+  try{await api('POST','/clawbot/federation/links',{wechat_open_id,wecom_user_id});closeModal();loadFederation()}catch(e){alert(e.message)}
+}
+async function deleteLink(id){if(!confirm('确定解除此关联？'))return;try{await api('DELETE',`/clawbot/federation/links/${id}`);loadFederation()}catch(e){alert(e.message)}}
+
+/* ── Compliance ── */
+async function showComplianceTab(tab){
+  document.querySelectorAll('#page-compliance .tab').forEach((t,i)=>{t.classList.toggle('active',['report','realtime','history'][i]===tab)});
+  const el=document.getElementById('compliance-content');
+  el.innerHTML='<div class="loading">加载中...</div>';
+  try{
+    if(tab==='report'){
+      const d=await api('GET','/clawbot/compliance/report');
+      el.innerHTML=`<div class="json-view">${esc(JSON.stringify(d,null,2))}</div>`;
+    }else if(tab==='realtime'){
+      const d=await api('GET','/clawbot/compliance/realtime');
+      el.innerHTML=`<div class="json-view">${esc(JSON.stringify(d,null,2))}</div>`;
+    }else{
+      const d=await api('GET','/clawbot/compliance/history');
+      const list=d.snapshots||[];
+      el.innerHTML=list.length?
+        '<table><thead><tr><th>ID</th><th>时间</th><th>类型</th><th>状态</th></tr></thead><tbody>'+
+        list.map(s=>`<tr><td>${s.id}</td><td>${fmtDate(s.created_at)}</td><td>${esc(s.scan_type||'-')}</td>
+          <td><span class="badge ${s.overall_status==='pass'?'badge-success':'badge-warning'}">${esc(s.overall_status)}</span></td></tr>`).join('')+
+        '</tbody></table>':'<div class="empty">暂无历史记录</div>';
+    }
+  }catch(e){el.innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+
+/* ── Audit ── */
+async function loadAudit(){
+  const action=document.getElementById('audit-action').value.trim();
+  const openId=document.getElementById('audit-openid').value.trim();
+  const limit=document.getElementById('audit-limit').value||50;
+  let qs=`?limit=${limit}`;
+  if(action)qs+=`&action=${encodeURIComponent(action)}`;
+  if(openId)qs+=`&open_id=${encodeURIComponent(openId)}`;
+  try{
+    const d=await api('GET','/clawbot/audit'+qs);
+    const logs=d.logs||[];
+    document.getElementById('audit-table').innerHTML=logs.length?
+      '<table><thead><tr><th>时间</th><th>OpenID</th><th>操作</th><th>详情</th><th>IP</th></tr></thead><tbody>'+
+      logs.map(l=>`<tr><td style="white-space:nowrap">${fmtDate(l.created_at)}</td>
+        <td><code style="font-size:11px">${esc((l.open_id||'').substring(0,12))}</code></td>
+        <td><span class="badge badge-info">${esc(l.action)}</span></td>
+        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${esc((l.detail||'').substring(0,80))}</td>
+        <td>${esc(l.ip||'-')}</td></tr>`).join('')+
+      '</tbody></table>':'<div class="empty">暂无审计日志</div>';
+  }catch(e){document.getElementById('audit-table').innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+
+/* ── Plugin ── */
+async function showPluginTab(tab){
+  document.querySelectorAll('#page-plugin .tab').forEach((t,i)=>{t.classList.toggle('active',['status','manifest','health'][i]===tab)});
+  const el=document.getElementById('plugin-content');
+  el.innerHTML='<div class="loading">加载中...</div>';
+  try{
+    if(tab==='status'){const d=await api('GET','/clawbot/plugin/status');el.innerHTML=`<div class="json-view">${esc(JSON.stringify(d,null,2))}</div>`}
+    else if(tab==='manifest'){const r=await fetch(API_BASE+'/clawbot/plugin/manifest');const d=await r.json();el.innerHTML=`<div class="json-view">${esc(JSON.stringify(d,null,2))}</div>`}
+    else{const d=await api('GET','/clawbot/plugin/health');el.innerHTML=`<div class="json-view">${esc(JSON.stringify(d,null,2))}</div>`}
+  }catch(e){el.innerHTML=`<div class="alert alert-danger">${esc(e.message)}</div>`}
+}
+
+/* ── Modal ── */
+function showModal(html){document.getElementById('modal-body').innerHTML=html;document.getElementById('modal').classList.add('show')}
+function closeModal(){document.getElementById('modal').classList.remove('show')}
+document.getElementById('modal').addEventListener('click',e=>{if(e.target===document.getElementById('modal'))closeModal()});
+
+/* ── Utils ── */
+function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
+function fmtNum(n){return(n||0).toLocaleString()}
+function fmtDate(d){if(!d)return'-';const dt=new Date(d);if(isNaN(dt.getTime()))return'-';return dt.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}
+</script>
+</body>
+</html>
