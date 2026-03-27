@@ -790,6 +790,33 @@ const RELAY_DELIVERY_TIMEOUT_MS = Math.max(3000, Math.min(30000, parseInt(proces
 const RELAY_MAX_RETRIES = Math.max(0, Math.min(5, parseInt(process.env.RELAY_MAX_RETRIES || '3', 10)));
 // 会话联邦 Redis 键前缀
 const REDIS_FEDERATION_PREFIX = 'anima:clawbot:federation:'; // federation:<linkId>:*
+// 通道网关缓存 TTL（秒）
+const GATEWAY_CACHE_TTL_SEC = 86400;
+
+/**
+ * 校验 Webhook 目标 URL 安全性（PCI-DSS 4.2.1 + SSRF 防护）。
+ * 拒绝非 HTTPS、私有地址、localhost、内部域名。
+ * @param {string} url - 目标 URL
+ * @returns {{ valid: boolean, reason?: string }}
+ */
+function validateWebhookUrl(url) {
+  if (!url || typeof url !== 'string') return { valid: false, reason: 'URL is required' };
+  if (!url.startsWith('https://')) return { valid: false, reason: 'Must be HTTPS (PCI-DSS 4.2.1)' };
+  if (url.length > 2048) return { valid: false, reason: 'URL too long' };
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' ||
+        host.startsWith('10.') || host.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2[0-9]|3[01])\./.test(host) ||
+        host.endsWith('.local') || host.endsWith('.internal')) {
+      return { valid: false, reason: 'Private/internal addresses not allowed (SSRF prevention)' };
+    }
+    return { valid: true };
+  } catch (_e) {
+    return { valid: false, reason: 'Invalid URL format' };
+  }
+}
 
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
@@ -1912,9 +1939,19 @@ async function dbLogWebhookDelivery({ subscriptionId, eventType, statusCode, res
  * @returns {Promise<boolean>}
  */
 async function deliverWebhookEvent(subscriptionId, targetUrl, eventType, payload) {
+  if (!SERVICE_TOKEN) {
+    logger.error('Webhook 投递失败：SERVICE_TOKEN 未配置，无法签名');
+    return false;
+  }
+  // SSRF 防护
+  const urlCheck = validateWebhookUrl(targetUrl);
+  if (!urlCheck.valid) {
+    logger.warn('Webhook 投递拒绝', { reason: urlCheck.reason, targetUrl: targetUrl.substring(0, 100) });
+    return false;
+  }
   const start = Date.now();
   const body = JSON.stringify({ event: eventType, timestamp: new Date().toISOString(), data: payload });
-  const signature = crypto.createHmac('sha256', SERVICE_TOKEN || 'anima-clawbot').update(body).digest('hex');
+  const signature = crypto.createHmac('sha256', SERVICE_TOKEN).update(body).digest('hex');
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), RELAY_DELIVERY_TIMEOUT_MS);
   try {
@@ -3894,13 +3931,14 @@ async function handleTextMessage(openId, rawText, requestId) {
   if (text === '/setup') {
     stats.totalCommands++;
     stats.commandsByName['setup'] = (stats.commandsByName['setup'] || 0) + 1;
-    const email = await getUserEmail(openId);
+    // 并行查询用户状态，减少响应延迟
+    const [email, pluginActiveRaw] = await Promise.all([
+      getUserEmail(openId),
+      redis ? redis.sismember(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch(() => 0) : Promise.resolve(0),
+    ]);
     const isAuth = !!email;
     const consentOk = isAuth ? await hasUserConsent(openId) : false;
-    let pluginActive = false;
-    if (redis) {
-      try { pluginActive = !!(await redis.sismember(REDIS_PLUGIN_ACTIVATED_KEY, openId)); } catch (_e) { /* ignore */ }
-    }
+    const pluginActive = !!pluginActiveRaw;
     // 计算当前步骤
     let step = 1;
     if (isAuth) step = 2;
@@ -7183,7 +7221,7 @@ app.post('/clawbot/gateway/channels', express.json({ limit: '64kb' }), adminLimi
   }
   // 设置 Redis 缓存
   if (redis) {
-    redis.set(`${REDIS_GATEWAY_PREFIX}${channel_id}`, JSON.stringify(channel), 'EX', 86400).catch(() => {});
+    redis.set(`${REDIS_GATEWAY_PREFIX}${channel_id}`, JSON.stringify(channel), 'EX', GATEWAY_CACHE_TTL_SEC).catch(() => {});
   }
   dbAuditLog({ openId: 'system', action: 'channel_register', detail: `channel_id=${channel_id},type=${channel_type || 'wechat'}`, requestId: req.id });
   logger.info('通道已注册', { channelId: channel_id, channelType: channel_type });
@@ -7224,8 +7262,8 @@ app.delete('/clawbot/gateway/channels/:channelId', adminLimiter, requireAdminIp,
   res.json({ success: true, msg: 'Channel removed' });
 });
 
-// 通道心跳（通道自身上报活跃状态）
-app.post('/clawbot/gateway/channels/:channelId/heartbeat', adminLimiter, async (req, res) => {
+// 通道心跳（通道自身上报活跃状态，需 SERVICE_TOKEN 认证）
+app.post('/clawbot/gateway/channels/:channelId/heartbeat', adminLimiter, requireServiceToken, async (req, res) => {
   const { channelId } = req.params;
   if (!CHANNEL_ID_RE.test(channelId)) {
     res.status(400).json({ success: false, msg: 'Invalid channel_id format' });
@@ -7299,8 +7337,9 @@ app.post('/clawbot/relay/subscriptions', express.json({ limit: '64kb' }), adminL
     res.status(400).json({ success: false, msg: 'target_url must be a valid HTTPS URL (PCI-DSS 4.2.1)' });
     return;
   }
-  if (target_url.length > 2048) {
-    res.status(400).json({ success: false, msg: 'target_url too long' });
+  const urlValidation = validateWebhookUrl(target_url);
+  if (!urlValidation.valid) {
+    res.status(400).json({ success: false, msg: urlValidation.reason });
     return;
   }
   const sub = await dbCreateWebhookSubscription({ tenantId: tenant_id, targetUrl: target_url, events, secret });
@@ -7336,8 +7375,9 @@ app.post('/clawbot/relay/test', express.json({ limit: '64kb' }), adminLimiter, r
     res.status(400).json({ success: false, msg: 'target_url must be a valid HTTPS URL' });
     return;
   }
-  if (target_url.length > 2048) {
-    res.status(400).json({ success: false, msg: 'target_url too long' });
+  const urlValidation = validateWebhookUrl(target_url);
+  if (!urlValidation.valid) {
+    res.status(400).json({ success: false, msg: urlValidation.reason });
     return;
   }
   const success = await deliverWebhookEvent('test', target_url, 'test', { message: 'ClawBot webhook relay test', timestamp: new Date().toISOString() });
