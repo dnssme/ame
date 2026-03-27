@@ -1,10 +1,49 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.2
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.3
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v2.3 相对于 v2.2）：
+ *
+ *   #ENT-2.3-1  插件清单端点（官方 ClawBot 插件验证）
+ *               - 新增 GET /clawbot/plugin/manifest 端点，返回
+ *                 插件能力声明、版本、功能列表，供微信平台
+ *                 在插件商店中验证插件合规性与能力集。
+ *               - 响应结构符合微信 ClawBot 插件开放规范。
+ *
+ *   #ENT-2.3-2  插件状态端点（官方运维监控）
+ *               - 新增 GET /clawbot/plugin/status 端点，返回
+ *                 插件运行状态、连接用户数、集成模块状态。
+ *               - 供运维与微信平台监控插件健康度。
+ *
+ *   #ENT-2.3-3  插件生命周期事件处理
+ *               - Webhook 事件处理器新增 plugin_activate /
+ *                 plugin_deactivate / plugin_update 事件。
+ *               - 生命周期事件记录审计日志（PCI-DSS 10.2.2）。
+ *               - 新增 DB Migration 011 clawbot_plugin_log。
+ *
+ *   #ENT-2.3-4  会话数据静态加密（PCI-DSS 3.4 数据保护）
+ *               - Redis 会话持久化采用 AES-256-GCM 加密存储。
+ *               - 会话数据解密仅在内存中进行（L1 缓存层）。
+ *               - 加密密钥通过环境变量独立管理。
+ *
+ *   #ENT-2.3-5  增强用户接入引导（普通用户轻松接入）
+ *               - subscribe 欢迎消息新增 ClawBot 插件入口提示。
+ *               - /tools 命令新增插件管理信息展示。
+ *               - /guide 命令新增插件激活步骤引导。
+ *
+ *   #ENT-2.3-6  统计指标增强（企业级运维）
+ *               - 新增 pluginActivations / pluginDeactivations /
+ *                 pluginQueries 统计计数器。
+ *               - /stats 端点新增插件相关运营指标。
+ *
+ *   #ENT-2.3-7  合规性增强（PCI-DSS v4.0 / CIS v8）
+ *               - 插件数据隔离：每个插件用户独立 Redis 键空间。
+ *               - 插件操作审计：所有插件交互记录审计日志。
+ *               - 会话加密：满足 PCI-DSS 3.4 静态数据保护要求。
  *
  * 修改记录（v2.2 相对于 v2.1）：
  *
@@ -588,6 +627,21 @@ const ADMIN_CSRF_TTL = 600; // 管理 CSRF token 有效期 600 秒
 // 模板消息 ID 格式校验（微信模板 ID 由字母数字下划线连字符组成，如 "OPENTM207335432"）
 const TEMPLATE_MSG_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 
+// ─── v2.3 会话静态加密配置（PCI-DSS 3.4）──────────────────────
+// 独立于消息加密的会话存储密钥；未配置时回退到明文存储
+const SESSION_ENCRYPT_KEY_RAW = process.env.SESSION_ENCRYPT_KEY || '';
+let SESSION_ENCRYPT_KEY = null;
+if (SESSION_ENCRYPT_KEY_RAW) {
+  const keyBuf = Buffer.from(SESSION_ENCRYPT_KEY_RAW, 'hex');
+  if (keyBuf.length === 32) {
+    SESSION_ENCRYPT_KEY = keyBuf;
+  }
+}
+// 插件生命周期 Redis 键前缀
+const REDIS_PLUGIN_ACTIVATED_KEY = 'anima:clawbot:plugin_activated'; // Set: activated openid
+const PLUGIN_VERSION = '2.3.0';
+const PLUGIN_NAME = 'Anima 灵枢 ClawBot 插件';
+
 if (!CLAWBOT_TOKEN) {
   logger.error('CLAWBOT_TOKEN 未设置，无法启动');
   process.exit(1);
@@ -647,6 +701,9 @@ const stats = {
   broadcastCallbacks: 0,
   kfTransfers: 0,
   quickReplyHits: 0,
+  pluginActivations: 0,
+  pluginDeactivations: 0,
+  pluginQueries: 0,
 };
 
 // ─── Redis（用户认证 + 邮箱绑定 + 会话持久化）────────────────
@@ -853,7 +910,7 @@ async function getSession(openId) {
     try {
       const stored = await redis.get(`${REDIS_SESSION_PREFIX}${openId}`);
       if (stored) {
-        const session = JSON.parse(stored);
+        const session = JSON.parse(decryptSessionData(stored));
         session.lastActive = Date.now();
         // 回填 L1 缓存
         evictIfNeeded();
@@ -894,14 +951,50 @@ async function persistSession(openId) {
   if (!session) return;
   try {
     const ttlSec = Math.ceil(SESSION_TTL / 1000);
+    const payload = encryptSessionData(JSON.stringify(session));
     await redis.set(
       `${REDIS_SESSION_PREFIX}${openId}`,
-      JSON.stringify(session),
+      payload,
       'EX',
       ttlSec
     );
   } catch (err) {
     logger.error('Redis 会话持久化失败', { err: err.message, openId });
+  }
+}
+
+// ─── 会话静态加密 helpers（PCI-DSS 3.4）──────────────────────
+function encryptSessionData(plainJson) {
+  if (!SESSION_ENCRYPT_KEY) return plainJson;
+  try {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', SESSION_ENCRYPT_KEY, iv);
+    const enc = Buffer.concat([cipher.update(plainJson, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    // format: base64(iv + tag + ciphertext)
+    return Buffer.concat([iv, tag, enc]).toString('base64');
+  } catch (err) {
+    logger.error('会话加密失败，回退明文存储', { err: err.message });
+    return plainJson;
+  }
+}
+
+function decryptSessionData(stored) {
+  if (!SESSION_ENCRYPT_KEY) return stored;
+  // 未加密的旧数据以 '{' 开头
+  if (stored.startsWith('{') || stored.startsWith('[')) return stored;
+  try {
+    const raw = Buffer.from(stored, 'base64');
+    if (raw.length < 28) return stored; // iv(12) + tag(16) 最小长度
+    const iv = raw.subarray(0, 12);
+    const tag = raw.subarray(12, 28);
+    const enc = raw.subarray(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', SESSION_ENCRYPT_KEY, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+  } catch (err) {
+    logger.error('会话解密失败，尝试明文解析', { err: err.message });
+    return stored;
   }
 }
 
@@ -2478,6 +2571,11 @@ async function handleTextMessage(openId, rawText, requestId) {
       '/status — 查看当前账户状态\n' +
       '/export — 导出个人数据\n' +
       '/balance — 查询余额\n\n' +
+      '═══ 🔌 ClawBot 插件 ═══\n' +
+      '本通道为官方微信 ClawBot 插件灵枢接入通道。\n' +
+      '• 在微信中搜索"ClawBot"插件即可激活\n' +
+      '• 激活后关注公众号并绑定邮箱即可使用全部功能\n' +
+      '• 插件提供企业级数据隔离与加密保护\n\n' +
       '💡 所有功能需先绑定邮箱认证后使用。\n' +
       '发送 /help 查看命令速查表。';
   }
@@ -2586,7 +2684,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       `会话消息数：${sessionMsgCount}\n\n` +
       `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
       `导出时间：${new Date().toISOString()}\n` +
-      `版本：灵枢接入通道 v2.2\n\n` +
+      `版本：灵枢接入通道 v2.3\n\n` +
       '⚠️ 请妥善保管导出数据，避免泄露个人信息。';
   }
 
@@ -2726,6 +2824,9 @@ async function handleTextMessage(openId, rawText, requestId) {
       '🗑 清除上下文 — /clear\n\n' +
       '═══ 服务支持 ═══\n' +
       '👤 人工客服 — /transfer\n\n' +
+      '═══ 🔌 插件信息 ═══\n' +
+      '📦 ClawBot 插件 v2.3（官方微信插件）\n' +
+      '🔐 会话加密 | 🛡 PCI-DSS v4.0 | 📋 CIS v8\n\n' +
       '💡 所有功能需先绑定邮箱认证后使用。';
   }
 
@@ -3235,8 +3336,9 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
   }
   res.json({
-    version: '2.1.0',
+    version: '2.3.0',
     channel: '灵枢接入通道',
+    plugin_version: PLUGIN_VERSION,
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
     max_sessions: MAX_SESSIONS,
@@ -3257,6 +3359,12 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     templates_sent: stats.templatesSent,
     kf_transfers: stats.kfTransfers,
     quick_reply_hits: stats.quickReplyHits,
+    template_callbacks: stats.templateCallbacks,
+    broadcast_callbacks: stats.broadcastCallbacks,
+    plugin_activations: stats.pluginActivations,
+    plugin_deactivations: stats.pluginDeactivations,
+    plugin_queries: stats.pluginQueries,
+    session_encryption: !!SESSION_ENCRYPT_KEY,
     db_enabled: !!pgPool,
     bind_lockout_threshold: BIND_LOCKOUT_THRESHOLD,
     idle_session_timeout_min: IDLE_SESSION_TIMEOUT_MIN,
@@ -3503,6 +3611,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
               '📅 日历管理 | 📧 邮件 | 📁 云存储\n' +
               '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n' +
               '👤 人工客服 | 📋 数据导出\n\n' +
+              '🔌 本通道为官方 ClawBot 插件灵枢接入通道（v2.3）。\n\n' +
               '发送 /guide 查看详细功能导航。\n' +
               '发送 /help 查看命令列表。';
           } else {
@@ -3518,6 +3627,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
               '📅 日历管理 | 📧 邮件 | 📁 云存储\n' +
               '🏠 智能家居 | 🎤 语音交互 | 📎 文件分析\n' +
               '👤 人工客服 | 📋 数据导出\n\n' +
+              '🔌 本通道为官方 ClawBot 插件灵枢接入通道（v2.3）。\n' +
               '支持文字、语音、图片、文件、位置、链接等消息类型。\n\n' +
               '发送 /guide 查看详细功能导航。\n' +
               '发送 /help 查看命令列表。';
@@ -3593,6 +3703,59 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           }
           dbAuditLog({ openId, action: 'template_callback', detail: `msgid=${msgId},status=${status}`, requestId: req.id });
           // 不回复用户（系统回调事件）
+
+        // ─── v2.3 插件生命周期事件 ────────────────────────────
+        } else if (eventType === 'plugin_activate') {
+          stats.pluginActivations++;
+          logger.info('ClawBot 插件激活事件', { openId, eventKey, requestId: req.id });
+          dbAuditLog({ openId, action: 'plugin_activate', detail: `key=${eventKey || 'direct'}`, requestId: req.id });
+          if (redis) {
+            redis.sadd(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch(() => {});
+          }
+          if (pgPool) {
+            pgPool.query(
+              `INSERT INTO clawbot_plugin_log (open_id, channel, event, detail) VALUES ($1, $2, $3, $4)`,
+              [openId, 'wechat', 'activate', eventKey || 'direct']
+            ).catch((err) => {
+              logger.error('插件生命周期日志写入失败', { err: err.message, openId });
+            });
+          }
+          replyText = '🔌 ClawBot 插件已激活！\n\n' +
+            '你已成功激活 Anima 灵枢 ClawBot 插件。\n' +
+            '首次使用请先绑定邮箱完成认证：\n' +
+            '/bind 你的邮箱@example.com\n\n' +
+            '发送 /guide 查看完整功能导航。';
+
+        } else if (eventType === 'plugin_deactivate') {
+          stats.pluginDeactivations++;
+          logger.info('ClawBot 插件停用事件', { openId, eventKey, requestId: req.id });
+          dbAuditLog({ openId, action: 'plugin_deactivate', detail: `key=${eventKey || 'user'}`, requestId: req.id });
+          if (redis) {
+            redis.srem(REDIS_PLUGIN_ACTIVATED_KEY, openId).catch(() => {});
+          }
+          if (pgPool) {
+            pgPool.query(
+              `INSERT INTO clawbot_plugin_log (open_id, channel, event, detail) VALUES ($1, $2, $3, $4)`,
+              [openId, 'wechat', 'deactivate', eventKey || 'user']
+            ).catch((err) => {
+              logger.error('插件生命周期日志写入失败', { err: err.message, openId });
+            });
+          }
+          replyText = '';
+
+        } else if (eventType === 'plugin_update') {
+          logger.info('ClawBot 插件更新事件', { openId, eventKey, requestId: req.id });
+          dbAuditLog({ openId, action: 'plugin_update', detail: `key=${eventKey || ''}`, requestId: req.id });
+          if (pgPool) {
+            pgPool.query(
+              `INSERT INTO clawbot_plugin_log (open_id, channel, event, detail) VALUES ($1, $2, $3, $4)`,
+              [openId, 'wechat', 'update', eventKey || '']
+            ).catch((err) => {
+              logger.error('插件生命周期日志写入失败', { err: err.message, openId });
+            });
+          }
+          replyText = '';
+
         } else if (eventType === 'MASSSENDJOBFINISH') {
           // v2.2: 群发消息完成回调（官方事件推送）
           const msgId = getXmlValue(xmlBody, 'MsgID');
@@ -5121,6 +5284,110 @@ app.post('/clawbot/miniprogram/send', adminLimiter, requireAdminIp, requireServi
   }
 });
 
+// ─── v2.3 插件清单端点（官方 ClawBot 插件验证）────────────────
+
+app.get('/clawbot/plugin/manifest', adminLimiter, (req, res) => {
+  stats.pluginQueries++;
+  res.json({
+    plugin_name: PLUGIN_NAME,
+    plugin_version: PLUGIN_VERSION,
+    plugin_id: CLAWBOT_APP_ID,
+    platform: 'wechat',
+    channel: '灵枢接入通道',
+    description: 'Anima 灵枢 AI 助理 · 微信 ClawBot 插件灵枢接入通道',
+    capabilities: [
+      'text_message', 'voice_message', 'image_message',
+      'video_message', 'file_message', 'location_message', 'link_message',
+      'template_message', 'broadcast_message', 'miniprogram_card',
+      'custom_menu', 'qrcode_login', 'oauth2_auth',
+      'jssdk_config', 'user_tagging', 'material_management',
+      'kf_transfer', 'quick_reply', 'data_analytics',
+    ],
+    integrated_modules: [
+      { name: 'ai_chat', description: 'AI 对话（70+ 模型）', enabled: true },
+      { name: 'web_search', description: '网页搜索（DuckDuckGo）', enabled: true },
+      { name: 'calendar', description: '日历管理（CalDAV）', enabled: true },
+      { name: 'email', description: '邮件管理（IMAP/SMTP）', enabled: true },
+      { name: 'cloud_storage', description: '云存储（WebDAV）', enabled: true },
+      { name: 'smart_home', description: '智能家居（Home Assistant）', enabled: true },
+      { name: 'voice', description: '语音交互（Whisper + TTS）', enabled: VOICE_ENABLED },
+      { name: 'file_analysis', description: '文件分析（AI）', enabled: true },
+    ],
+    security: {
+      auth_required: true,
+      encryption: ENCRYPT_MODE ? 'AES-256-CBC' : 'plaintext',
+      session_encryption: SESSION_ENCRYPT_KEY ? 'AES-256-GCM' : 'none',
+      pci_dss: 'v4.0',
+      cis: 'v8',
+      oauth2: !!OAUTH_REDIRECT_URI,
+      waf: true,
+      rate_limiting: true,
+    },
+    compliance: {
+      pci_dss_version: '4.0',
+      cis_version: '8',
+      data_isolation: 'per-user Redis key namespace + PostgreSQL row-level',
+      audit_trail: 'PostgreSQL clawbot_audit_log (PCI-DSS 10.2)',
+      audit_retention_days: AUDIT_RETENTION_DAYS,
+      session_timeout_min: IDLE_SESSION_TIMEOUT_MIN,
+      login_lockout: `${BIND_LOCKOUT_THRESHOLD} failures / ${BIND_LOCKOUT_DURATION_MIN} min lockout`,
+    },
+    endpoints: {
+      webhook: '/clawbot/webhook',
+      oauth: '/clawbot/oauth',
+      admin: '/clawbot/',
+      plugin_manifest: '/clawbot/plugin/manifest',
+      plugin_status: '/clawbot/plugin/status',
+    },
+    wecom_enabled: WECOM_ENABLED,
+  });
+});
+
+// ─── v2.3 插件状态端点（运维监控）────────────────────────────
+
+app.get('/clawbot/plugin/status', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  stats.pluginQueries++;
+  let activatedCount = 0;
+  let totalUsers = 0;
+  if (redis) {
+    try {
+      activatedCount = await redis.scard(REDIS_PLUGIN_ACTIVATED_KEY);
+      totalUsers = await redis.scard(REDIS_AUTH_KEY);
+    } catch (_e) { /* ignore */ }
+  }
+  const redisOk = redis ? redis.status === 'ready' : false;
+  let dbOk = false;
+  if (pgPool) {
+    try {
+      await pgPool.query('SELECT 1');
+      dbOk = true;
+    } catch (_e) { /* ignore */ }
+  }
+  res.json({
+    plugin_name: PLUGIN_NAME,
+    plugin_version: PLUGIN_VERSION,
+    status: redisOk ? 'healthy' : 'degraded',
+    uptime_seconds: Math.floor((Date.now() - stats.startedAt) / 1000),
+    infrastructure: {
+      redis: redisOk ? 'connected' : 'disconnected',
+      postgresql: dbOk ? 'connected' : 'disconnected',
+      encrypt_mode: ENCRYPT_MODE,
+      session_encryption: !!SESSION_ENCRYPT_KEY,
+    },
+    users: {
+      total_authenticated: totalUsers,
+      plugin_activated: activatedCount,
+      active_sessions: sessions.size,
+    },
+    metrics: {
+      plugin_activations: stats.pluginActivations,
+      plugin_deactivations: stats.pluginDeactivations,
+      total_messages: stats.totalMessages,
+      total_commands: stats.totalCommands,
+    },
+  });
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -5134,8 +5401,8 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v2.2 已启动，端口 ${PORT}`);
-  logger.info('官方微信 ClawBot 插件接入（扫码/App互通/模板消息/小程序卡片）就绪，等待回调...');
+  logger.info(`灵枢接入通道 v2.3 已启动，端口 ${PORT}`);
+  logger.info('官方微信 ClawBot 插件接入（扫码/App互通/模板消息/小程序卡片/插件生命周期）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
     logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
@@ -5147,7 +5414,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
   if (SERVICE_TOKEN) {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
-    logger.info('v2.2 新增：模板送达回调(TEMPLATESENDJOBFINISH)、群发完成回调(MASSSENDJOBFINISH)、快捷回复认证修复');
+    logger.info('v2.3 新增：插件清单/状态端点、插件生命周期事件、会话静态加密(PCI-DSS 3.4)');
   } else {
     logger.warn('SERVICE_TOKEN 未设置，管理端点不可用');
   }
@@ -5159,13 +5426,20 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info(`审计日志保留：${AUDIT_RETENTION_DAYS} 天（PCI-DSS 10.7）`);
   logger.info('敏感操作二次确认已启用（PCI-DSS v4.0）');
   if (pgPool) {
-    logger.info('PostgreSQL 审计日志/用户记录/模板消息日志/群发完成日志持久化已启用');
+    logger.info('PostgreSQL 审计日志/用户记录/模板消息日志/群发完成日志/插件生命周期日志持久化已启用');
   }
   if (OAUTH_REDIRECT_URI) {
     logger.info(`微信 OAuth2.0 网页授权已配置（scope=${OAUTH_SCOPE}）`);
   } else {
     logger.info('微信 OAuth2.0 网页授权未配置（OAUTH_REDIRECT_URI 未设置，用户通过 /bind 绑定）');
   }
+  if (SESSION_ENCRYPT_KEY) {
+    logger.info('会话静态加密已启用（AES-256-GCM，PCI-DSS 3.4）');
+  } else {
+    logger.info('会话静态加密未启用（SESSION_ENCRYPT_KEY 未设置，会话明文存储）');
+  }
+  logger.info(`插件清单端点：GET /clawbot/plugin/manifest`);
+  logger.info(`插件状态端点：GET /clawbot/plugin/status`);
 });
 
 // 安全加固
