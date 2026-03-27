@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.9
+# 微信 ClawBot 插件灵枢接入通道 v2.0
 
 ## 概述
 
@@ -12,14 +12,24 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v1.9 新特性
+## v2.0 新特性
 
-- **微信 OAuth2.0 网页授权**：新增 `/clawbot/oauth` 和 `/clawbot/oauth/callback` 端点，用户可通过微信网页授权一键绑定身份，无需手动 `/bind` 邮箱（普通用户轻松接入）。支持 `snsapi_base`（静默授权）和 `snsapi_userinfo`（显式授权获取昵称头像）两种 scope。Redis CSRF state 防护（PCI-DSS 6.5）。
-- **功能导航 /guide**：新增 `/guide` 命令，分类展示灵枢接入通道全部能力（AI 对话、工具集、安全管理、消息类型），引导新用户快速上手，降低使用门槛。
-- **增强欢迎消息**：subscribe 欢迎消息展示全部功能亮点，引导用户通过 `/guide` 了解详细功能。
-- **Nginx 反向代理集成**：ClawBot 流量统一经 Nginx 反向代理，享受 ModSecurity WAF、TLS 终结、安全头、边缘限速（PCI-DSS 6.4.1 / CIS 13）。Webhook 限速 300r/m，管理端点限速 30r/m，OAuth 走 login 限速 5r/m。
-- **OAuth 统计与审计**：`/stats` 端点新增 `oauth_initiated` / `oauth_completed` 指标，OAuth 授权事件记录审计日志（PCI-DSS 10.2.1）。
-- **数据库迁移 008**：`clawbot_users` 新增 `oauth_scope` 列，记录用户授权方式（email / snsapi_base / snsapi_userinfo）。
+- **JS-SDK 签名配置端点**：新增 `GET /clawbot/jssdk/config` 端点，生成微信 JS-SDK wx.config 所需的签名参数（appId、timestamp、nonceStr、signature），网页端可调用微信扫一扫、位置、图片预览、分享等全部 JS-SDK 能力。jsapi_ticket 自动缓存续期。
+- **用户标签管理**：新增 `GET/POST/DELETE /clawbot/tags` 及 `POST/DELETE /clawbot/tags/:tagId/users` 端点，支持创建/删除标签、批量打标签/取消标签。所有标签操作记录审计日志（PCI-DSS 10.2.2）。
+- **群发/广播消息**：新增 `POST /clawbot/broadcast` 群发文本消息，支持按标签群发（tag_id）或全量群发（is_to_all）。新增 `GET /clawbot/broadcast/:msgId` 查询群发状态。群发操作审计记录。
+- **永久素材管理**：新增 `GET /clawbot/material/count` 查询素材总数、`POST /clawbot/material/list` 分页查询素材列表、`DELETE /clawbot/material/:mediaId` 删除永久素材。支持 image/voice/video/news 四种类型。
+- **数据统计分析代理**：新增 `POST /clawbot/analytics/:metric` 代理微信数据统计接口，支持 user_summary（用户增减）、user_cumulate（累计用户）、article_summary（图文统计）、upstream_msg（消息统计）、interface_summary（接口统计）五种指标，按日期范围查询（最大 7 天）。
+- **OAuth scope 持久化修复**：OAuth 授权完成后将 `oauth_scope` 写入 `clawbot_users` 表的 `oauth_scope` 列，完整对接 Migration 008。
+- **版本号修复**：`/export` 数据导出版本号从 v1.8 更正为 v2.0。
+
+## v1.9 新特性（历史版本）
+
+- **微信 OAuth2.0 网页授权**：`/clawbot/oauth` 和 `/clawbot/oauth/callback` 端点，用户通过微信网页授权一键绑定身份。支持 `snsapi_base` 和 `snsapi_userinfo` 两种 scope。Redis CSRF state 防护（PCI-DSS 6.5）
+- **功能导航 /guide**：分类展示灵枢接入通道全部能力，引导新用户快速上手
+- **增强欢迎消息**：subscribe 欢迎消息展示全部功能亮点
+- **Nginx 反向代理集成**：ModSecurity WAF、TLS 终结、安全头、边缘限速（PCI-DSS 6.4.1 / CIS 13）
+- **OAuth 统计与审计**：`/stats` 端点新增 `oauth_initiated` / `oauth_completed` 指标
+- **数据库迁移 008**：`clawbot_users` 新增 `oauth_scope` 列
 
 ## v1.8 新特性（历史版本）
 
@@ -228,6 +238,8 @@ docker compose up -d
 | `/ready` | GET | 就绪探针（Readiness，含 Redis 连通性检查） | ❌ |
 | `/clawbot/webhook` | GET | 微信 URL 验证 | 微信签名 |
 | `/clawbot/webhook` | POST | 微信消息接收（支持加密/明文） | 微信签名 |
+| `/clawbot/oauth` | GET | 微信 OAuth2.0 授权发起 | ❌ |
+| `/clawbot/oauth/callback` | GET | 微信 OAuth2.0 授权回调 | ❌ |
 | `/clawbot/qrcode` | GET | 生成接入二维码 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/menu` | POST | 创建公众号自定义菜单 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/menu` | GET | 查询当前菜单配置 | SERVICE_TOKEN + IP白名单 |
@@ -236,6 +248,18 @@ docker compose up -d
 | `/clawbot/users/:openId/block` | POST | 封禁用户 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/users/:openId/block` | DELETE | 解封用户 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/audit` | GET | 查询审计日志（按 openId/action/时间范围，分页） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/jssdk/config` | GET | 生成 JS-SDK wx.config 签名参数 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/tags` | GET | 列出所有用户标签 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/tags` | POST | 创建用户标签 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/tags/:tagId` | DELETE | 删除用户标签 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/tags/:tagId/users` | POST | 批量为用户打标签 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/tags/:tagId/users` | DELETE | 批量取消用户标签 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/broadcast` | POST | 群发文本消息（按标签或全量） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/broadcast/:msgId` | GET | 查询群发消息状态 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/material/count` | GET | 查询永久素材总数 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/material/list` | POST | 分页查询永久素材列表 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/material/:mediaId` | DELETE | 删除永久素材 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/analytics/:metric` | POST | 微信数据统计分析（用户/消息/接口） | SERVICE_TOKEN + IP白名单 |
 | `/stats` | GET | 运营统计（消息数、会话数、封禁数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
