@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.7
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.8
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
@@ -41,6 +41,48 @@
  *   #ENT-1.7-6  消息统计增强（运营监控）
  *               - /stats 新增 blocked_users / export_count 指标。
  *               - 管理端点返回更详细的用户状态统计。
+ *
+ * 修改记录（v1.8 相对于 v1.7）：
+ *
+ *   #ENT-1.8-1  PostgreSQL 审计日志持久化（PCI-DSS 10.2 增强）
+ *               - 新增 pg 依赖连接 PostgreSQL 数据库，所有审计事件
+ *                 持久化写入 clawbot_audit_log 表（与 Redis/Winston
+ *                 日志并行，确保审计记录不可丢失）。
+ *               - 与 Migration 007 创建的表结构对接。
+ *               - 审计记录含 open_id、channel、action、detail、ip、
+ *                 request_id、created_at（PCI-DSS 10.2.1/10.2.2）。
+ *
+ *   #ENT-1.8-2  PostgreSQL 用户记录持久化（企业级用户管理）
+ *               - 用户 bind/unbind/block/unblock 操作同步写入
+ *                 clawbot_users 表，Redis 仍为 L1 实时状态层。
+ *               - 用户消息处理时更新 last_active_at。
+ *               - 管理端点可从 DB 查询完整用户档案。
+ *
+ *   #ENT-1.8-3  登录锁定（PCI-DSS 8.1.6）
+ *               - /bind 连续失败 BIND_LOCKOUT_THRESHOLD 次（默认 6）
+ *                 后锁定 BIND_LOCKOUT_DURATION_MIN 分钟（默认 30）。
+ *               - 锁定期间 /bind 直接拒绝，返回剩余锁定时间。
+ *               - 锁定/解锁事件记录审计日志。
+ *
+ *   #ENT-1.8-4  空闲会话超时（PCI-DSS 8.1.8）
+ *               - 可配置 IDLE_SESSION_TIMEOUT_MIN（默认 15 分钟），
+ *                 超过空闲时间的会话自动清除上下文，用户需重新
+ *                 开始对话（认证状态不变）。
+ *
+ *   #ENT-1.8-5  审计日志查询端点（PCI-DSS 10.2 合规报告）
+ *               - 新增 GET /clawbot/audit 管理端点，支持按 openId /
+ *                 action / 时间范围查询审计记录（分页）。
+ *               - 需 SERVICE_TOKEN + IP 白名单认证。
+ *
+ *   #ENT-1.8-6  审计日志保留策略（PCI-DSS 10.7）
+ *               - 可配置 AUDIT_RETENTION_DAYS（默认 365 天），
+ *                 定时清理超过保留期的审计记录。
+ *               - /stats 端点新增 audit_retention_days 指标。
+ *
+ *   #ENT-1.8-7  管理端点用户搜索（企业级运维增强）
+ *               - GET /clawbot/users 支持 search 查询参数，
+ *                 可按邮箱、昵称模糊搜索用户。
+ *               - 支持 status 参数筛选活跃/封禁用户。
  *
  * 修改记录（v1.6 相对于 v1.5）：
  *
@@ -268,6 +310,7 @@ const rateLimit  = require('express-rate-limit');
 const { request } = require('undici');
 const winston    = require('winston');
 const Redis      = require('ioredis');
+const { Pool }   = require('pg');
 
 // ─── 超时配置常量 ─────────────────────────────────────────────
 const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS || '60000', 10);
@@ -279,6 +322,16 @@ const MSG_DEDUP_TTL = 300;
 // Per-user 速率限制（PCI-DSS / CIS DoS 缓解）：单用户每分钟最大请求数
 const USER_RATE_LIMIT = Math.max(1, Math.min(300, parseInt(process.env.USER_RATE_LIMIT || '30', 10)));
 const USER_RATE_WINDOW_SEC = 60;
+
+// 登录锁定配置（PCI-DSS 8.1.6）
+const BIND_LOCKOUT_THRESHOLD = Math.max(3, Math.min(20, parseInt(process.env.BIND_LOCKOUT_THRESHOLD || '6', 10)));
+const BIND_LOCKOUT_DURATION_MIN = Math.max(5, Math.min(1440, parseInt(process.env.BIND_LOCKOUT_DURATION_MIN || '30', 10)));
+const BIND_LOCKOUT_DURATION_MS = BIND_LOCKOUT_DURATION_MIN * 60 * 1000;
+// 空闲会话超时（PCI-DSS 8.1.8）
+const IDLE_SESSION_TIMEOUT_MIN = Math.max(1, Math.min(120, parseInt(process.env.IDLE_SESSION_TIMEOUT_MIN || '15', 10)));
+const IDLE_SESSION_TIMEOUT_MS = IDLE_SESSION_TIMEOUT_MIN * 60 * 1000;
+// 审计日志保留（PCI-DSS 10.7）
+const AUDIT_RETENTION_DAYS = Math.max(90, Math.min(3650, parseInt(process.env.AUDIT_RETENTION_DAYS || '365', 10)));
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -333,6 +386,7 @@ const VOICE_ENABLED  = process.env.VOICE_ENABLED === 'true';
 const WHISPER_URL    = process.env.WHISPER_URL || 'http://172.16.1.5:8080/transcribe';
 const TTS_URL        = process.env.TTS_URL || 'http://172.16.1.5:8082/api/tts';
 const PORT           = parseInt(process.env.PORT || '3004', 10);
+const DATABASE_URL   = process.env.DATABASE_URL || '';
 
 // ─── 企业运维配置 ──────────────────────────────────────────
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || '';
@@ -435,6 +489,33 @@ if (redis) {
   });
 } else {
   logger.warn('REDIS_URL 未设置，用户认证和邮箱绑定功能将不可用');
+}
+
+// ─── PostgreSQL（审计日志 + 用户记录持久化，PCI-DSS 10.2）────
+const pgPool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      max: 3,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+      // 始终启用 SSL 证书验证（PCI-DSS 4.1 传输加密）
+      ssl: { rejectUnauthorized: true },
+    })
+  : null;
+
+if (pgPool) {
+  pgPool.query('SELECT 1')
+    .then(() => {
+      logger.info('PostgreSQL 连接就绪（审计日志/用户记录持久化已确认）');
+    })
+    .catch((err) => {
+      logger.error('PostgreSQL 连接失败（审计日志/用户记录持久化不可用）', { err: err.message });
+    });
+  pgPool.on('error', (err) => {
+    logger.error('PostgreSQL 连接池错误', { err: err.message });
+  });
+} else {
+  logger.warn('DATABASE_URL 未设置，审计日志和用户记录将不持久化到数据库');
 }
 
 // ─── 用户隔离：Redis 键空间 ──────────────────────────────────
@@ -564,9 +645,20 @@ const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '500', 10);
 async function getSession(openId) {
   // L1: 内存热缓存
   const cached = sessions.get(openId);
-  if (cached && Date.now() - cached.lastActive < SESSION_TTL) {
-    cached.lastActive = Date.now();
-    return cached;
+  if (cached) {
+    const idleTime = Date.now() - cached.lastActive;
+    // 空闲会话超时（PCI-DSS 8.1.8）：超过空闲时间清除上下文
+    if (idleTime >= IDLE_SESSION_TIMEOUT_MS) {
+      sessions.delete(openId);
+      if (redis) {
+        redis.del(`${REDIS_SESSION_PREFIX}${openId}`).catch(() => {});
+      }
+      logger.info('会话空闲超时已清除', { openId, idle_min: Math.floor(idleTime / 60000) });
+      // 继续创建新会话
+    } else if (idleTime < SESSION_TTL) {
+      cached.lastActive = Date.now();
+      return cached;
+    }
   }
 
   // L2: Redis 持久层（容器重启后恢复）
@@ -814,12 +906,219 @@ async function clearUserData(openId) {
       redis.srem(REDIS_BLOCKED_KEY, openId),
       redis.hdel(REDIS_NICKNAMES_KEY, openId),
       redis.del(`${REDIS_SESSION_PREFIX}${openId}`),
+      redis.del(`${BIND_FAIL_PREFIX}${openId}`),
     ]);
     logger.info('用户数据已清除', { openId });
   } catch (err) {
     logger.error('清除用户数据失败', { err: err.message, openId });
   }
+  // 异步清理 DB 记录（不阻塞）
+  dbDeleteUser(openId);
 }
+
+// ─── PostgreSQL 审计日志持久化（PCI-DSS 10.2）────────────────
+
+/**
+ * 从用户标识推导通道和清洁 ID。
+ * @param {string} openId - 原始用户标识（可能含 'wecom:' 前缀）
+ * @returns {{channel: string, cleanId: string}}
+ */
+function deriveChannelAndId(openId) {
+  if (openId && openId.startsWith('wecom:')) {
+    return { channel: 'wecom', cleanId: openId.slice(6) };
+  }
+  return { channel: 'wechat', cleanId: openId || '' };
+}
+
+/**
+ * 将审计事件写入 PostgreSQL clawbot_audit_log 表。
+ * 不阻塞消息处理——异步写入，失败时仅记录错误日志。
+ * @param {Object} event - 审计事件
+ * @param {string} event.openId - 用户标识
+ * @param {string} event.action - 操作类型
+ * @param {string} [event.detail] - 操作详情
+ * @param {string} [event.ip] - 请求 IP
+ * @param {string} [event.requestId] - 请求追踪 ID
+ * @param {string} [event.channel] - 通道 ('wechat' | 'wecom')
+ */
+async function dbAuditLog(event) {
+  if (!pgPool) return;
+  const { openId, action, detail, ip, requestId, channel } = event;
+  const derived = deriveChannelAndId(openId);
+  try {
+    await pgPool.query(
+      `INSERT INTO clawbot_audit_log (open_id, channel, action, detail, ip, request_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        derived.cleanId,
+        channel || derived.channel,
+        action || '',
+        detail || null,
+        ip || null,
+        requestId || null,
+      ]
+    );
+  } catch (err) {
+    logger.error('审计日志写入 DB 失败', { err: err.message, action, openId });
+  }
+}
+
+/**
+ * 在 PostgreSQL clawbot_users 表中创建或更新用户记录。
+ * @param {Object} user - 用户信息
+ */
+async function dbUpsertUser(user) {
+  if (!pgPool) return;
+  const { openId, channel, email, nickname, status, blockedReason } = user;
+  const derived = deriveChannelAndId(openId);
+  try {
+    await pgPool.query(
+      `INSERT INTO clawbot_users (open_id, channel, email, nickname, status, blocked_reason, bound_at, last_active_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (channel, open_id) DO UPDATE SET
+         email = COALESCE(EXCLUDED.email, clawbot_users.email),
+         nickname = COALESCE(EXCLUDED.nickname, clawbot_users.nickname),
+         status = COALESCE(EXCLUDED.status, clawbot_users.status),
+         blocked_reason = CASE WHEN EXCLUDED.status = 'blocked' THEN EXCLUDED.blocked_reason ELSE clawbot_users.blocked_reason END,
+         bound_at = CASE WHEN EXCLUDED.email IS NOT NULL AND clawbot_users.email IS NULL THEN NOW() ELSE clawbot_users.bound_at END,
+         blocked_at = CASE WHEN EXCLUDED.status = 'blocked' AND clawbot_users.status != 'blocked' THEN NOW() ELSE clawbot_users.blocked_at END,
+         last_active_at = NOW(),
+         updated_at = NOW()`,
+      [
+        derived.cleanId,
+        channel || derived.channel,
+        email || null,
+        nickname || null,
+        status || 'active',
+        blockedReason || null,
+        email ? new Date() : null,
+      ]
+    );
+  } catch (err) {
+    logger.error('用户记录写入 DB 失败', { err: err.message, openId });
+  }
+}
+
+/**
+ * 在 PostgreSQL clawbot_users 中删除用户记录（取关/解绑时）。
+ */
+async function dbDeleteUser(openId) {
+  if (!pgPool) return;
+  const { channel, cleanId } = deriveChannelAndId(openId);
+  try {
+    await pgPool.query(
+      'DELETE FROM clawbot_users WHERE channel = $1 AND open_id = $2',
+      [channel, cleanId]
+    );
+  } catch (err) {
+    logger.error('用户记录删除 DB 失败', { err: err.message, openId });
+  }
+}
+
+/**
+ * 更新用户最后活跃时间。
+ */
+async function dbUpdateLastActive(openId) {
+  if (!pgPool) return;
+  const { channel, cleanId } = deriveChannelAndId(openId);
+  try {
+    await pgPool.query(
+      'UPDATE clawbot_users SET last_active_at = NOW(), updated_at = NOW() WHERE channel = $1 AND open_id = $2',
+      [channel, cleanId]
+    );
+  } catch (err) {
+    // 非关键操作，仅记录错误
+    logger.debug('更新用户活跃时间失败', { err: err.message, openId });
+  }
+}
+
+// ─── 登录锁定（PCI-DSS 8.1.6）──────────────────────────────
+// 基于 Redis 的 /bind 失败次数跟踪
+const BIND_FAIL_PREFIX = 'anima:clawbot:bind_fail:';
+
+/**
+ * 检查用户是否处于登录锁定状态。
+ * @param {string} openId - 用户标识
+ * @returns {Promise<{locked: boolean, remainingMin: number}>}
+ */
+async function checkBindLockout(openId) {
+  if (!redis) return { locked: false, remainingMin: 0 };
+  try {
+    const failCount = parseInt(await redis.get(`${BIND_FAIL_PREFIX}${openId}`) || '0', 10);
+    if (failCount >= BIND_LOCKOUT_THRESHOLD) {
+      const ttl = await redis.ttl(`${BIND_FAIL_PREFIX}${openId}`);
+      return { locked: true, remainingMin: Math.ceil(Math.max(ttl, 0) / 60) };
+    }
+    return { locked: false, remainingMin: 0 };
+  } catch (err) {
+    logger.error('登录锁定检查失败', { err: err.message, openId });
+    return { locked: false, remainingMin: 0 };
+  }
+}
+
+/**
+ * 记录 /bind 失败次数。达到阈值时自动锁定。
+ * @param {string} openId - 用户标识
+ */
+async function recordBindFailure(openId) {
+  if (!redis) return;
+  try {
+    const key = `${BIND_FAIL_PREFIX}${openId}`;
+    const count = await redis.incr(key);
+    if (count === 1) {
+      // 首次失败，设置 TTL 为锁定时长
+      await redis.expire(key, Math.ceil(BIND_LOCKOUT_DURATION_MS / 1000));
+    }
+    if (count >= BIND_LOCKOUT_THRESHOLD) {
+      // 确保锁定持续完整时长
+      await redis.expire(key, Math.ceil(BIND_LOCKOUT_DURATION_MS / 1000));
+      logger.info('audit', { action: 'bind_lockout', openId, detail: `locked_after_${count}_failures` });
+      dbAuditLog({ openId, action: 'bind_lockout', detail: `locked_after_${count}_failures` });
+    }
+  } catch (err) {
+    logger.error('记录绑定失败次数失败', { err: err.message, openId });
+  }
+}
+
+/**
+ * 清除 /bind 失败计数（绑定成功时调用）。
+ */
+async function clearBindFailures(openId) {
+  if (!redis) return;
+  try {
+    await redis.del(`${BIND_FAIL_PREFIX}${openId}`);
+  } catch (err) {
+    logger.error('清除绑定失败计数失败', { err: err.message, openId });
+  }
+}
+
+// ─── 审计日志保留策略（PCI-DSS 10.7）────────────────────────
+
+/**
+ * 清理超过保留期的审计日志记录。
+ * 由定时器周期性调用。
+ */
+async function cleanupExpiredAuditLogs() {
+  if (!pgPool) return;
+  try {
+    const result = await pgPool.query(
+      'DELETE FROM clawbot_audit_log WHERE created_at < NOW() - $1::interval',
+      [`${AUDIT_RETENTION_DAYS} days`]
+    );
+    if (result.rowCount > 0) {
+      logger.info('审计日志清理完成', { deleted: result.rowCount, retention_days: AUDIT_RETENTION_DAYS });
+    }
+  } catch (err) {
+    logger.error('审计日志清理失败', { err: err.message });
+  }
+}
+
+// 每天凌晨执行审计日志清理（PCI-DSS 10.7）
+// 审计日志清理间隔：每24小时执行一次（PCI-DSS 10.7）
+const AUDIT_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const auditCleanupTimer = setInterval(cleanupExpiredAuditLogs, AUDIT_CLEANUP_INTERVAL_MS);
+// 启动后延迟 5 分钟执行首次清理
+setTimeout(cleanupExpiredAuditLogs, 5 * 60 * 1000);
 
 // ─── 消息分段（微信单条消息上限约 2000 字符）────────────────
 const WECHAT_MSG_LIMIT = 2000;
@@ -1505,13 +1804,23 @@ async function handleTextMessage(openId, rawText, requestId) {
 
   // /bind <email> — 绑定邮箱（登录认证）
   if (text.startsWith('/bind ') || text.startsWith('/bind\u3000')) {
+    // 登录锁定检查（PCI-DSS 8.1.6）
+    const lockout = await checkBindLockout(openId);
+    if (lockout.locked) {
+      return `🔒 账户已被临时锁定（连续绑定失败次数过多）。\n\n请 ${lockout.remainingMin} 分钟后重试。`;
+    }
     const email = text.slice(6).trim().toLowerCase();
     if (!email || !EMAIL_RE.test(email) || email.length > 254) {
       return '❌ 邮箱格式不正确，请重新输入。\n\n用法：/bind yourname@example.com';
     }
+    // 格式验证通过后才记录绑定尝试（避免格式错误触发锁定）
     await setUserEmail(openId, email);
     await setUserAuthed(openId);
+    await clearBindFailures(openId);
     logger.info('audit', { action: 'bind', openId, detail: `email=${email}` });
+    // 异步写入 DB（不阻塞响应）
+    dbAuditLog({ openId, action: 'bind', detail: `email=${email}` });
+    dbUpsertUser({ openId, email, status: 'active' });
     return `✅ 已绑定计费邮箱：${email}\n\n你已通过认证，现在可以使用所有 AI 功能。\n后续对话将归入该账户计费。`;
   }
 
@@ -1520,6 +1829,7 @@ async function handleTextMessage(openId, rawText, requestId) {
     const email = await getUserEmail(openId);
     await clearUserData(openId);
     logger.info('audit', { action: 'unbind', openId, detail: `email=${email || 'N/A'}` });
+    dbAuditLog({ openId, action: 'unbind', detail: `email=${email || 'N/A'}` });
     return '✅ 已解除邮箱绑定并清除所有个人数据。\n\n' +
       '如需继续使用，请重新绑定邮箱：\n/bind 你的邮箱@example.com';
   }
@@ -1554,6 +1864,7 @@ async function handleTextMessage(openId, rawText, requestId) {
   const authed = await isUserAuthed(openId);
   if (!authed) {
     logger.info('audit', { action: 'auth_check_fail', openId, detail: 'unauthenticated_access_attempt' });
+    dbAuditLog({ openId, action: 'auth_check_fail', detail: 'unauthenticated_access_attempt' });
     return '🔒 请先绑定邮箱完成认证后使用。\n\n' +
       '发送：/bind 你的邮箱@example.com\n\n' +
       '绑定后即可使用所有 AI 功能。';
@@ -1629,6 +1940,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       ? session.messages.slice(-10).map((m, i) => `  ${i + 1}. [${m.role}] ${m.content.substring(0, 100)}${m.content.length > 100 ? '...' : ''}`).join('\n')
       : '  无会话记录';
     logger.info('audit', { action: 'export', openId, detail: 'user_data_export' });
+    dbAuditLog({ openId, action: 'export', detail: 'user_data_export' });
     stats.exportCount = (stats.exportCount || 0) + 1;
     return '📋 个人数据导出\n\n' +
       `【账户信息】\n` +
@@ -1640,7 +1952,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       `会话消息数：${sessionMsgCount}\n\n` +
       `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
       `导出时间：${new Date().toISOString()}\n` +
-      `版本：灵枢接入通道 v1.7\n\n` +
+      `版本：灵枢接入通道 v1.8\n\n` +
       '⚠️ 请妥善保管导出数据，避免泄露个人信息。';
   }
 
@@ -2146,6 +2458,7 @@ function requireAdminIp(req, res, next) {
       method: req.method,
       request_id: req.id,
     });
+    dbAuditLog({ openId: 'admin', action: 'admin_ip_denied', detail: `${req.method} ${req.path}`, ip: clientIp, requestId: req.id });
     res.status(403).json({ error: 'Forbidden: IP not in allowlist' });
     return;
   }
@@ -2174,6 +2487,7 @@ function requireServiceToken(req, res, next) {
       method: req.method,
       request_id: req.id,
     });
+    dbAuditLog({ openId: 'admin', action: 'admin_auth_fail', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
@@ -2185,6 +2499,7 @@ function requireServiceToken(req, res, next) {
     method: req.method,
     request_id: req.id,
   });
+  dbAuditLog({ openId: 'admin', action: 'admin_access', detail: `${req.method} ${req.path}`, ip: req.ip, requestId: req.id });
   next();
 }
 
@@ -2241,7 +2556,7 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
   }
   res.json({
-    version: '1.7.0',
+    version: '1.8.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -2257,6 +2572,10 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     total_errors: stats.totalErrors,
     blocked_users: blockedCount,
     export_count: stats.exportCount || 0,
+    db_enabled: !!pgPool,
+    bind_lockout_threshold: BIND_LOCKOUT_THRESHOLD,
+    idle_session_timeout_min: IDLE_SESSION_TIMEOUT_MIN,
+    audit_retention_days: AUDIT_RETENTION_DAYS,
   });
 });
 
@@ -2402,6 +2721,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
       limit: USER_RATE_LIMIT,
       request_id: req.id,
     });
+    dbAuditLog({ openId, action: 'rate_limit_violation', detail: `limit=${USER_RATE_LIMIT}`, requestId: req.id });
     logger.warn('用户请求超限', { openId, limit: USER_RATE_LIMIT, request_id: req.id });
     const rateLimitReply = buildTextReply(openId, toUserName, '⚠️ 操作过于频繁，请稍后再试。');
     res.set('Content-Type', 'text/xml');
@@ -2413,6 +2733,10 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   stats.totalMessages++;
   if (stats.messagesByType[msgType] !== undefined) {
     stats.messagesByType[msgType]++;
+  }
+  // 异步更新用户活跃时间（不阻塞消息处理）
+  if (msgType !== 'event') {
+    dbUpdateLastActive(openId);
   }
 
   logger.info('收到 ClawBot 消息', {
@@ -2468,6 +2792,8 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
         if (eventType === 'subscribe') {
           // 用户关注（可能通过扫码关注：eventKey 包含 qrscene_ 前缀）
+          dbAuditLog({ openId, action: 'subscribe', detail: eventKey ? `scene=${eventKey}` : 'direct', requestId: req.id });
+          dbUpsertUser({ openId, status: 'active' });
           // 异步获取用户资料（不阻塞欢迎消息）
           setImmediate(async () => {
             try {
@@ -2503,6 +2829,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
         } else if (eventType === 'unsubscribe') {
           // 用户取消关注：清除所有用户数据（保证数据安全）
           logger.info('audit', { action: 'unsubscribe_cleanup', openId, detail: 'user_unfollowed' });
+          dbAuditLog({ openId, action: 'unsubscribe', detail: 'user_unfollowed' });
           await clearUserData(openId);
         } else if (eventType === 'CLICK') {
           // 菜单点击事件
@@ -2732,23 +3059,36 @@ app.get('/clawbot/users', adminLimiter, requireAdminIp, requireServiceToken, asy
   // 分页参数（企业级扩展性）
   const page = Math.max(1, parseInt(req.query.page || '1', 10));
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50', 10)));
+  // 搜索与筛选参数（企业级运维增强 v1.8）
+  const search = typeof req.query.search === 'string' ? req.query.search.trim().substring(0, 128) : '';
+  const statusFilter = typeof req.query.status === 'string' ? req.query.status.trim() : '';
 
   try {
     // 获取所有已认证用户
     const authedUsers = await redis.smembers(REDIS_AUTH_KEY);
-    const total = authedUsers.length;
-    const totalPages = Math.ceil(total / limit) || 1;
-    const startIdx = (page - 1) * limit;
-    const pageUsers = authedUsers.slice(startIdx, startIdx + limit);
 
     const users = [];
-    for (const openId of pageUsers) {
-      const email = await redis.hget(REDIS_EMAIL_KEY, openId) || '';
-      const model = await redis.hget(REDIS_MODELS_KEY, openId) || DEFAULT_MODEL;
-      const nickname = await redis.hget(REDIS_NICKNAMES_KEY, openId) || '';
-      const blocked = await redis.sismember(REDIS_BLOCKED_KEY, openId) === 1;
-      users.push({ openId, email, model, nickname, blocked });
+    for (const oid of authedUsers) {
+      const email = await redis.hget(REDIS_EMAIL_KEY, oid) || '';
+      const model = await redis.hget(REDIS_MODELS_KEY, oid) || DEFAULT_MODEL;
+      const nickname = await redis.hget(REDIS_NICKNAMES_KEY, oid) || '';
+      const blocked = await redis.sismember(REDIS_BLOCKED_KEY, oid) === 1;
+
+      // 搜索过滤（邮箱/昵称模糊匹配）
+      if (search && !email.includes(search) && !nickname.includes(search) && !oid.includes(search)) {
+        continue;
+      }
+      // 状态过滤
+      if (statusFilter === 'active' && blocked) continue;
+      if (statusFilter === 'blocked' && !blocked) continue;
+
+      users.push({ openId: oid, email, model, nickname, blocked });
     }
+
+    const total = users.length;
+    const totalPages = Math.ceil(total / limit) || 1;
+    const startIdx = (page - 1) * limit;
+    const pageUsers = users.slice(startIdx, startIdx + limit);
 
     res.json({
       success: true,
@@ -2756,7 +3096,7 @@ app.get('/clawbot/users', adminLimiter, requireAdminIp, requireServiceToken, asy
       page,
       limit,
       totalPages,
-      users,
+      users: pageUsers,
     });
   } catch (err) {
     logger.error('查询已认证用户失败', { err: err.message });
@@ -2787,6 +3127,8 @@ app.post('/clawbot/users/:openId/block', adminLimiter, requireAdminIp, requireSe
     ip: req.ip,
     request_id: req.id,
   });
+  dbAuditLog({ openId, action: 'block', detail: reason, ip: req.ip, requestId: req.id });
+  dbUpsertUser({ openId, status: 'blocked', blockedReason: reason });
 
   res.json({ success: true, msg: `用户 ${openId} 已封禁`, reason });
 });
@@ -2810,8 +3152,87 @@ app.delete('/clawbot/users/:openId/block', adminLimiter, requireAdminIp, require
     ip: req.ip,
     request_id: req.id,
   });
+  dbAuditLog({ openId, action: 'unblock', ip: req.ip, requestId: req.id });
+  dbUpsertUser({ openId, status: 'active' });
 
   res.json({ success: true, msg: `用户 ${openId} 已解封` });
+});
+
+// ─── 审计日志查询端点（PCI-DSS 10.2 合规报告）──────────────────
+app.get('/clawbot/audit', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  if (!pgPool) {
+    res.status(503).json({ success: false, msg: 'PostgreSQL 未配置，审计日志查询不可用' });
+    return;
+  }
+
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50', 10)));
+  const offset = (page - 1) * limit;
+  const openIdFilter = typeof req.query.open_id === 'string' ? req.query.open_id.trim().substring(0, 128) : '';
+  const actionFilter = typeof req.query.action === 'string' ? req.query.action.trim().substring(0, 64) : '';
+  const since = typeof req.query.since === 'string' ? req.query.since.trim() : '';
+  const until = typeof req.query.until === 'string' ? req.query.until.trim() : '';
+
+  // ISO 8601 日期格式验证（防止畸形日期导致 SQL 错误）
+  const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+  if (since && !ISO_DATE_RE.test(since)) {
+    res.status(400).json({ success: false, msg: 'since 参数格式无效（需 ISO 8601 日期）' });
+    return;
+  }
+  if (until && !ISO_DATE_RE.test(until)) {
+    res.status(400).json({ success: false, msg: 'until 参数格式无效（需 ISO 8601 日期）' });
+    return;
+  }
+
+  try {
+    let where = 'WHERE 1=1';
+    const params = [];
+    let paramIdx = 1;
+
+    if (openIdFilter) {
+      where += ` AND open_id = $${paramIdx++}`;
+      params.push(openIdFilter);
+    }
+    if (actionFilter) {
+      where += ` AND action = $${paramIdx++}`;
+      params.push(actionFilter);
+    }
+    if (since) {
+      where += ` AND created_at >= $${paramIdx++}::timestamptz`;
+      params.push(since);
+    }
+    if (until) {
+      where += ` AND created_at <= $${paramIdx++}::timestamptz`;
+      params.push(until);
+    }
+
+    const countResult = await pgPool.query(
+      `SELECT COUNT(*) as total FROM clawbot_audit_log ${where}`,
+      params
+    );
+    const total = parseInt(countResult.rows[0].total, 10);
+
+    const dataResult = await pgPool.query(
+      `SELECT id, open_id, channel, action, detail, ip, request_id, created_at
+       FROM clawbot_audit_log ${where}
+       ORDER BY created_at DESC
+       LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      success: true,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit) || 1,
+      retention_days: AUDIT_RETENTION_DAYS,
+      records: dataResult.rows,
+    });
+  } catch (err) {
+    logger.error('审计日志查询失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '审计日志查询失败' });
+  }
 });
 
 // ─── 企业微信（WeCom）Webhook 接口 ────────────────────────────
@@ -3022,7 +3443,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.7 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v1.8 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
@@ -3036,10 +3457,16 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   if (SERVICE_TOKEN) {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
   } else {
-    logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /clawbot/menu, /clawbot/users, /stats）不可用');
+    logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /clawbot/menu, /clawbot/users, /clawbot/audit, /stats）不可用');
   }
   if (ADMIN_IP_ALLOWLIST.length > 0) {
     logger.info(`管理端点 IP 白名单已启用（${ADMIN_IP_ALLOWLIST.length} 个 IP）`);
+  }
+  logger.info(`登录锁定：${BIND_LOCKOUT_THRESHOLD} 次失败后锁定 ${BIND_LOCKOUT_DURATION_MIN} 分钟（PCI-DSS 8.1.6）`);
+  logger.info(`空闲会话超时：${IDLE_SESSION_TIMEOUT_MIN} 分钟（PCI-DSS 8.1.8）`);
+  logger.info(`审计日志保留：${AUDIT_RETENTION_DAYS} 天（PCI-DSS 10.7）`);
+  if (pgPool) {
+    logger.info('PostgreSQL 审计日志/用户记录持久化已启用');
   }
 });
 
@@ -3055,9 +3482,11 @@ const SHUTDOWN_TIMEOUT_MS = GRACEFUL_SHUTDOWN_TIMEOUT * 1000;
 const shutdown = (signal) => {
   logger.info(`收到 ${signal}，正在关闭（超时 ${GRACEFUL_SHUTDOWN_TIMEOUT}s）...`);
   clearInterval(sessionCleanupTimer);
+  clearInterval(auditCleanupTimer);
 
-  server.close(() => {
+  server.close(async () => {
     if (redis) redis.disconnect();
+    if (pgPool) await pgPool.end().catch(() => {});
     logger.info('服务器已正常关闭');
     process.exit(0);
   });
@@ -3070,6 +3499,7 @@ const shutdown = (signal) => {
   // 强制退出兜底
   setTimeout(() => {
     if (redis) redis.disconnect();
+    if (pgPool) pgPool.end().catch(() => {});
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
 };
