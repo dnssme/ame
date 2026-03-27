@@ -1,12 +1,13 @@
-# 微信 ClawBot 插件灵枢接入通道 v2.3
+# 微信 ClawBot 插件灵枢接入通道 v2.4
 
 ## 概述
 
 基于微信官方 ClawBot 插件 API，将 Anima 灵枢 AI 助手接入微信。
 **使用官方微信接入方式**（扫码关注 / App 互通 / OAuth2.0 网页授权 / 官方插件商店），完全契合官方接入要求。
 
-2026年3月22日，腾讯官方宣布在微信中推出"ClawBot"插件。本通道 v2.3 全面对接官方 ClawBot 插件 API，
-新增插件清单端点、插件状态端点、插件生命周期事件处理，使普通用户可通过微信插件商店一键激活灵枢接入通道。
+2026年3月22日，腾讯官方宣布在微信中推出"ClawBot"插件。本通道 v2.4 在 v2.3 全面对接官方 ClawBot 插件 API 的基础上，
+新增插件验证挑战-响应、用户隐私同意管理、个性化偏好设置、合规性报告、健康仪表板等企业级功能，
+全面提升安全合规水平和用户体验。
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
 所有功能均需登录认证后使用，用户数据强隔离保证安全。符合企业级商业运维模式。
@@ -15,7 +16,19 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v2.3 新特性
+## v2.4 新特性
+
+- **插件验证挑战-响应（ENT-2.4-1）**：新增 `POST /clawbot/plugin/verify` 端点，接受微信平台验证挑战并返回 HMAC-SHA256 签名响应。用于插件商店上架审核与定期合规性验证。
+- **用户隐私同意管理（ENT-2.4-2）**：新增 `/consent` 命令和 `/consent agree` 命令，用户可查看并同意数据处理协议。同意记录持久化到新增 `clawbot_user_consent` 表（PCI-DSS v4.0 / GDPR 合规）。支持 `data_processing`、`privacy_policy`、`terms_of_service` 三种同意类型。
+- **用户偏好设置（ENT-2.4-3）**：新增 `/settings` 命令管理个人偏好（语言切换、通知开关、自动语音回复）。设置持久化到新增 `clawbot_user_settings` 表，Redis 热缓存加速读取。
+- **CIS v8 安全头增强（ENT-2.4-4）**：新增 `Strict-Transport-Security`（HSTS）、`Content-Security-Policy`（CSP）、`X-Content-Type-Options: nosniff`、`Referrer-Policy: strict-origin-when-cross-origin`、`Permissions-Policy`（禁用 camera/microphone/geolocation/payment）安全头。
+- **数据隔离增强（ENT-2.4-5）**：新增 Redis 键命名空间校验函数。清除用户数据时增加同意状态、设置缓存、插件激活状态的清理。跨通道访问防护增强。
+- **合规性报告端点（ENT-2.4-6）**：新增 `GET /clawbot/compliance/report` 生成 PCI-DSS v4.0 / CIS v8 合规自检报告。报告含安全配置状态、审计策略、加密状态、数据隔离信息、用户同意管理状态。
+- **插件健康仪表板（ENT-2.4-7）**：新增 `GET /clawbot/plugin/health` 端点，返回 Redis / PostgreSQL / Agent API 详细依赖健康检查（含响应延迟）、连接池状态、内存使用、系统运行时间。
+- **统计指标增强**：`/stats` 端点新增 `consentGranted`（同意授权次数）、`settingsUpdated`（设置更新次数）、`pluginVerifications`（插件验证次数）计数器。
+- **数据库迁移 012**：新增 `clawbot_user_consent` 表记录用户隐私同意状态，新增 `clawbot_user_settings` 表存储用户个性化偏好。
+
+## v2.3 新特性（历史版本）
 
 - **官方 ClawBot 插件清单端点**：新增 `GET /clawbot/plugin/manifest` 端点，返回插件能力声明、版本、已集成功能模块列表、安全合规信息，供微信平台在插件商店中验证插件合规性与能力集。响应结构符合微信 ClawBot 插件开放规范。
 - **插件状态端点**：新增 `GET /clawbot/plugin/status` 端点（需 SERVICE_TOKEN 认证），返回插件运行状态、基础设施连接状态、已认证用户数、插件激活用户数、运营指标，供运维与微信平台监控插件健康度。
@@ -299,6 +312,11 @@ docker compose up -d
 | `/clawbot/quickreply` | POST | 创建快捷回复规则（精确/模糊匹配） | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/quickreply/:ruleId` | DELETE | 删除快捷回复规则 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/miniprogram/send` | POST | 发送小程序卡片消息 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/plugin/manifest` | GET | 插件清单（能力声明 + 安全合规信息） | ❌ |
+| `/clawbot/plugin/status` | GET | 插件运行状态（用户数、基础设施） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/plugin/verify` | POST | 插件验证挑战-响应（商店认证） | ❌ |
+| `/clawbot/plugin/health` | GET | 插件健康仪表板（依赖检查 + 延迟监控） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/compliance/report` | GET | PCI-DSS / CIS 合规性自检报告 | SERVICE_TOKEN + IP白名单 |
 | `/stats` | GET | 运营统计（消息数、会话数、封禁数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
@@ -338,6 +356,9 @@ docker compose up -d
 | `anima:clawbot:quickreply_rules` | String | 快捷回复规则列表（JSON） |
 | `anima:clawbot:unbind_confirm:{openId}` | String | 解绑确认标记（TTL=120s） |
 | `anima:clawbot:admin_csrf:{token}` | String | 管理端 CSRF token |
+| `anima:clawbot:consent:{openId}` | String | 用户同意状态缓存（TTL=24h） |
+| `anima:clawbot:settings:{openId}` | String | 用户设置缓存（JSON, TTL=30d） |
+| `anima:clawbot:plugin_activated` | Set | 已激活插件的用户 openid 集合 |
 
 ### 企业微信（WeCom）
 
