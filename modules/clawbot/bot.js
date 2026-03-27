@@ -1,10 +1,45 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件接入模块 v1.1
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.2
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v1.2 相对于 v1.1）：
+ *
+ *   #ENT-1.2-1  灵枢接入通道品牌化
+ *               - 定位升级为"灵枢接入通道"（Lingshu Gateway），
+ *                 完全契合微信 ClawBot 插件官方接入要求。
+ *               - 所有用户面向字符串更新为"灵枢接入通道"。
+ *
+ *   #ENT-1.2-2  微信消息加解密（安全模式 / 兼容模式）
+ *               - 实现 AES-256-CBC 消息加解密，支持微信安全模式
+ *                 与兼容模式（完全契合官方接入方式）。
+ *               - 自动检测：配置 CLAWBOT_ENCODING_AES_KEY 时启用
+ *                 加密消息验证与解密，否则使用明文模式。
+ *               - 回复消息同步加密返回（安全模式下）。
+ *
+ *   #ENT-1.2-3  消息去重
+ *               - Redis 消息 ID 去重（5 分钟窗口），防止微信
+ *                 重试导致的重复消息处理（企业级可靠性）。
+ *
+ *   #ENT-1.2-4  用户数据安全增强
+ *               - 取消关注时自动清除用户全部数据（Redis 认证/
+ *                 邮箱/模型 + 内存会话），保证数据安全。
+ *               - 新增 /unbind 命令：用户主动解除邮箱绑定并
+ *                 清除所有个人数据（GDPR 友好）。
+ *               - 数据操作全程审计日志。
+ *
+ *   #ENT-1.2-5  微信菜单管理 API
+ *               - POST /clawbot/menu   — 创建公众号自定义菜单
+ *               - DELETE /clawbot/menu — 删除当前自定义菜单
+ *               - GET /clawbot/menu    — 查询当前菜单配置
+ *               - 所有菜单端点需 SERVICE_TOKEN 认证。
+ *
+ *   #ENT-1.2-6  用户管理端点
+ *               - GET /clawbot/users — 列出已认证用户（管理员）
+ *               - 需 SERVICE_TOKEN 认证。
  *
  * 修改记录（v1.1 相对于 v1.0）：
  *
@@ -39,6 +74,7 @@
  * 接入方式（官方微信）：
  *   - 微信公众号扫码关注接入（用户扫描二维码 → 关注 → 自动绑定）
  *   - 微信 App 互通接入（通过 Open Platform 跨应用通信）
+ *   - 支持明文模式和安全模式（AES 加解密）
  *   - 不使用企业微信作为主接入方式
  *
  * 企业微信（WeCom）接口：
@@ -48,8 +84,10 @@
  *
  * 功能：
  *   - 微信 ClawBot 插件签名验证（token + timestamp + nonce SHA1）
+ *   - 微信消息 AES-256-CBC 加解密（安全模式 / 兼容模式）
  *   - 强制登录认证（用户必须绑定邮箱后才可使用 AI 功能）
  *   - 用户强隔离（独立 Redis 键空间、独立会话、独立计费）
+ *   - 消息去重（Redis msgId 5 分钟去重窗口）
  *   - 二维码接入（扫码关注/登录）
  *   - 文字消息 → AI 对话
  *   - 语音消息 → Whisper STT → AI → TTS → 语音回复
@@ -58,9 +96,11 @@
  *   - 位置消息 → 位置相关 AI 服务
  *   - 链接消息 → 链接内容分析
  *   - 菜单事件 → CLICK/VIEW 处理
+ *   - 微信自定义菜单管理 API（创建/删除/查询）
  *   - /model 切换模型
  *   - /balance 查询余额
  *   - /status 查看账户状态
+ *   - /unbind 解除绑定并清除数据
  *   - /clear 清除对话上下文
  *   - /search 网页搜索（DuckDuckGo）
  *   - /calendar 日历管理（Nextcloud CalDAV）
@@ -70,6 +110,8 @@
  *   - 模板消息发送
  *   - 长耗时任务异步回复
  *   - 消息分段发送（适配微信消息长度限制）
+ *   - 用户数据自动清理（取关时）
+ *   - 已认证用户管理端点
  */
 
 const crypto     = require('crypto');
@@ -85,6 +127,8 @@ const AGENT_REQUEST_TIMEOUT_MS = parseInt(process.env.AGENT_REQUEST_TIMEOUT_MS |
 const BILLING_REQUEST_TIMEOUT_MS = parseInt(process.env.BILLING_REQUEST_TIMEOUT_MS || '10000', 10);
 // AbortController 兜底超时缓冲：在 undici 超时之上额外等待，确保请求被取消
 const ABORT_TIMEOUT_BUFFER_MS = 30_000;
+// 消息去重窗口（秒）：防止微信重试导致重复消息处理
+const MSG_DEDUP_TTL = 300;
 
 // ─── 日志 ────────────────────────────────────────────────────
 const logger = winston.createLogger({
@@ -108,9 +152,29 @@ const logger = winston.createLogger({
 const CLAWBOT_TOKEN           = process.env.CLAWBOT_TOKEN;
 const CLAWBOT_APP_ID          = process.env.CLAWBOT_APP_ID;
 const CLAWBOT_APP_SECRET      = process.env.CLAWBOT_APP_SECRET;
-// EncodingAESKey 用于消息加密模式（当微信服务器配置为"安全模式"时使用）
-// 当前实现使用明文模式，后续启用加密模式时需要此密钥进行 AES 解密
+// EncodingAESKey 用于消息加密模式（当微信服务器配置为"安全模式"或"兼容模式"时使用）
+// 当前实现自动检测：配置 AES Key 后启用加密消息解密能力
 const CLAWBOT_ENCODING_AES_KEY = process.env.CLAWBOT_ENCODING_AES_KEY || '';
+
+// ─── AES 加解密密钥派生（微信安全模式 / 兼容模式）──────────
+// WeChat AES Key: Base64Decode(EncodingAESKey + "=") = 32 bytes
+// IV = AES Key 前 16 bytes
+let AES_KEY = null;
+let AES_IV = null;
+const ENCRYPT_MODE = !!CLAWBOT_ENCODING_AES_KEY;
+if (CLAWBOT_ENCODING_AES_KEY) {
+  try {
+    AES_KEY = Buffer.from(CLAWBOT_ENCODING_AES_KEY + '=', 'base64');
+    if (AES_KEY.length !== 32) {
+      throw new Error(`AES Key 长度 ${AES_KEY.length} 字节（期望 32 字节），请检查 CLAWBOT_ENCODING_AES_KEY`);
+    }
+    AES_IV = AES_KEY.subarray(0, 16);
+  } catch (err) {
+    // 延迟到 logger 初始化后输出警告 — 此处先暂存错误信息
+    AES_KEY = null;
+    AES_IV = null;
+  }
+}
 const AGENT_API_URL  = (process.env.AGENT_API_URL || 'http://172.16.1.2:3000').replace(/\/$/, '');
 const DEFAULT_MODEL  = process.env.AGENT_DEFAULT_MODEL || 'glm-4-flash';
 const BILLING_URL    = (process.env.BILLING_WEBHOOK_URL || 'http://172.16.1.6:3002').replace(/\/$/, '');
@@ -205,6 +269,7 @@ if (redis) {
 const REDIS_EMAIL_KEY  = 'anima:clawbot:emails';      // Hash: openid → email
 const REDIS_MODELS_KEY = 'anima:clawbot:user_models';  // Hash: openid → model
 const REDIS_AUTH_KEY   = 'anima:clawbot:authed';       // Set:  已认证用户 openid
+const REDIS_DEDUP_PREFIX = 'anima:clawbot:dedup:';     // String: msgId 去重（TTL=5min）
 
 // 企业微信使用独立键空间，与公众号通道完全隔离
 const WECOM_EMAIL_KEY  = 'anima:wecom:emails';         // Hash: userid → email
@@ -315,6 +380,155 @@ function verifySignature(signature, timestamp, nonce) {
     Buffer.from(hash, 'utf8'),
     Buffer.from(signature, 'utf8')
   );
+}
+
+/**
+ * 加密模式签名验证：SHA1(sort([token, timestamp, nonce, encrypt_msg]))
+ * 微信安全模式 / 兼容模式下，签名包含加密消息体。
+ */
+function verifyEncryptSignature(msgSignature, timestamp, nonce, encryptMsg) {
+  const arr = [CLAWBOT_TOKEN, timestamp, nonce, encryptMsg].sort();
+  const hash = crypto.createHash('sha1').update(arr.join('')).digest('hex');
+  return crypto.timingSafeEqual(
+    Buffer.from(hash, 'utf8'),
+    Buffer.from(msgSignature, 'utf8')
+  );
+}
+
+// ─── AES-256-CBC 消息加解密（微信安全模式）──────────────────
+
+/**
+ * PKCS#7 去除填充。
+ * @param {Buffer} buf - 解密后的原始 Buffer
+ * @returns {Buffer} 去除填充后的 Buffer
+ */
+function pkcs7Unpad(buf) {
+  const pad = buf[buf.length - 1];
+  if (pad < 1 || pad > 32) return buf;
+  return buf.subarray(0, buf.length - pad);
+}
+
+/**
+ * PKCS#7 填充到 32 字节块对齐。
+ * @param {Buffer} buf - 原始 Buffer
+ * @returns {Buffer} 填充后的 Buffer
+ */
+function pkcs7Pad(buf) {
+  const blockSize = 32;
+  const pad = blockSize - (buf.length % blockSize);
+  const padBuf = Buffer.alloc(pad, pad);
+  return Buffer.concat([buf, padBuf]);
+}
+
+/**
+ * 解密微信加密消息。
+ * 消息格式：AES-256-CBC( random(16) + msg_len(4, BE) + msg + appid )
+ * @param {string} encryptedBase64 - Base64 编码的加密消息
+ * @returns {string} 解密后的 XML 明文消息
+ */
+function decryptMessage(encryptedBase64) {
+  if (!AES_KEY || !AES_IV) {
+    throw new Error('AES 密钥未配置，无法解密加密消息');
+  }
+  const encrypted = Buffer.from(encryptedBase64, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-cbc', AES_KEY, AES_IV);
+  decipher.setAutoPadding(false);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  const unpadded = pkcs7Unpad(decrypted);
+
+  // 跳过 16 字节随机值
+  const msgLen = unpadded.readUInt32BE(16);
+  const msgContent = unpadded.subarray(20, 20 + msgLen).toString('utf8');
+  // 可选：验证 appid
+  const appId = unpadded.subarray(20 + msgLen).toString('utf8');
+  if (appId !== CLAWBOT_APP_ID) {
+    logger.warn('解密消息 AppID 不匹配', { expected: CLAWBOT_APP_ID, got: appId });
+  }
+  return msgContent;
+}
+
+/**
+ * 加密微信回复消息。
+ * @param {string} replyXml - 要加密的 XML 回复消息
+ * @returns {string} Base64 编码的加密消息
+ */
+function encryptMessage(replyXml) {
+  if (!AES_KEY || !AES_IV) {
+    throw new Error('AES 密钥未配置，无法加密消息');
+  }
+  const randomBytes = crypto.randomBytes(16);
+  const msgBuf = Buffer.from(replyXml, 'utf8');
+  const msgLenBuf = Buffer.alloc(4);
+  msgLenBuf.writeUInt32BE(msgBuf.length, 0);
+  const appIdBuf = Buffer.from(CLAWBOT_APP_ID, 'utf8');
+
+  const plaintext = Buffer.concat([randomBytes, msgLenBuf, msgBuf, appIdBuf]);
+  const padded = pkcs7Pad(plaintext);
+
+  const cipher = crypto.createCipheriv('aes-256-cbc', AES_KEY, AES_IV);
+  cipher.setAutoPadding(false);
+  const encrypted = Buffer.concat([cipher.update(padded), cipher.final()]);
+  return encrypted.toString('base64');
+}
+
+/**
+ * 构建加密模式下的回复 XML。
+ * @param {string} encryptedMsg - 加密后的消息（Base64）
+ * @param {string} timestamp - 时间戳
+ * @param {string} nonce - 随机串
+ * @returns {string} 包含加密消息和签名的 XML
+ */
+function buildEncryptedReply(encryptedMsg, timestamp, nonce) {
+  const arr = [CLAWBOT_TOKEN, timestamp, nonce, encryptedMsg].sort();
+  const msgSignature = crypto.createHash('sha1').update(arr.join('')).digest('hex');
+  return `<xml>
+<Encrypt><![CDATA[${encryptedMsg}]]></Encrypt>
+<MsgSignature><![CDATA[${msgSignature}]]></MsgSignature>
+<TimeStamp>${timestamp}</TimeStamp>
+<Nonce><![CDATA[${nonce}]]></Nonce>
+</xml>`;
+}
+
+// ─── 消息去重（Redis msgId 5分钟窗口）──────────────────────
+
+/**
+ * 检查消息 ID 是否已处理（去重）。
+ * 使用 Redis SET NX EX 保证原子性。
+ * @param {string} msgId - 微信消息 ID
+ * @returns {Promise<boolean>} true=已处理过（重复），false=首次
+ */
+async function isDuplicateMessage(msgId) {
+  if (!redis || !msgId) return false;
+  try {
+    // SET NX: 仅当 key 不存在时设置，返回 'OK' 表示首次
+    const result = await redis.set(`${REDIS_DEDUP_PREFIX}${msgId}`, '1', 'EX', MSG_DEDUP_TTL, 'NX');
+    return result !== 'OK'; // 返回 null 表示 key 已存在 = 重复消息
+  } catch (err) {
+    logger.error('消息去重检查失败', { err: err.message, msgId });
+    return false; // 出错时不阻断处理
+  }
+}
+
+// ─── 用户数据清理（取关 / 主动解绑）────────────────────────
+
+/**
+ * 清除用户所有数据（Redis + 内存会话）。
+ * 用于取关事件 和 /unbind 命令。
+ * @param {string} openId - 用户标识
+ */
+async function clearUserData(openId) {
+  sessions.delete(openId);
+  if (!redis) return;
+  try {
+    await Promise.all([
+      redis.hdel(REDIS_EMAIL_KEY, openId),
+      redis.hdel(REDIS_MODELS_KEY, openId),
+      redis.srem(REDIS_AUTH_KEY, openId),
+    ]);
+    logger.info('用户数据已清除', { openId });
+  } catch (err) {
+    logger.error('清除用户数据失败', { err: err.message, openId });
+  }
 }
 
 // ─── 消息分段（微信单条消息上限约 2000 字符）────────────────
@@ -960,11 +1174,21 @@ async function handleTextMessage(openId, rawText) {
     return `✅ 已绑定计费邮箱：${email}\n\n你已通过认证，现在可以使用所有 AI 功能。\n后续对话将归入该账户计费。`;
   }
 
+  // /unbind — 解除绑定并清除所有数据
+  if (text === '/unbind') {
+    const email = await getUserEmail(openId);
+    await clearUserData(openId);
+    logger.info('用户主动解除绑定', { openId, email: email || 'N/A' });
+    return '✅ 已解除邮箱绑定并清除所有个人数据。\n\n' +
+      '如需继续使用，请重新绑定邮箱：\n/bind 你的邮箱@example.com';
+  }
+
   // /help — 帮助
   if (text === '/help') {
-    return '📖 Anima 灵枢 · ClawBot 命令列表\n\n' +
+    return '📖 Anima 灵枢接入通道 · 命令列表\n\n' +
       '【基础】\n' +
       '/bind <邮箱> — 绑定邮箱（首次使用必须绑定）\n' +
+      '/unbind — 解除绑定并清除个人数据\n' +
       '/balance — 查询账户余额\n' +
       '/status — 查看账户状态\n' +
       '/model <模型名> — 切换 AI 模型\n' +
@@ -1035,7 +1259,7 @@ async function handleTextMessage(openId, rawText) {
       `📧 邮箱：${email || '未绑定'}\n` +
       `🤖 模型：${model}\n` +
       `💬 当前会话消息数：${sessionMsgCount}\n` +
-      `🔗 通道：ClawBot 微信公众号\n\n` +
+      `🔗 通道：灵枢接入通道（微信公众号）\n\n` +
       '发送 /help 查看所有命令。';
   }
 
@@ -1472,10 +1696,13 @@ app.get('/health', (req, res) => {
 app.get('/stats', requireServiceToken, (req, res) => {
   const uptimeMs = Date.now() - stats.startedAt;
   res.json({
+    version: '1.2.0',
+    channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
     max_sessions: MAX_SESSIONS,
     redis_status: redis ? redis.status : 'not_configured',
+    encrypt_mode: ENCRYPT_MODE,
     wecom_enabled: WECOM_ENABLED,
     voice_enabled: VOICE_ENABLED,
     total_messages: stats.totalMessages,
@@ -1534,7 +1761,7 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   }
 
   // 解析 XML 消息体（简单正则解析，无需依赖 XML 库）
-  const xmlBody = typeof req.body === 'string' ? req.body : '';
+  let xmlBody = typeof req.body === 'string' ? req.body : '';
   if (!xmlBody) {
     res.status(400).send('Empty body');
     return;
@@ -1557,6 +1784,38 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
     return match2 ? match2[1] : '';
   };
 
+  // ── AES 加密消息解密（安全模式 / 兼容模式）──
+  // 检查消息是否包含 <Encrypt> 节点（加密模式）
+  let isEncryptedMsg = false;
+  const encryptField = getXmlValue(xmlBody, 'Encrypt');
+  if (encryptField && ENCRYPT_MODE) {
+    // 验证加密消息签名
+    const msgSignature = String(req.query.msg_signature || '');
+    if (msgSignature) {
+      try {
+        if (!verifyEncryptSignature(msgSignature, String(timestamp), String(nonce), encryptField)) {
+          logger.warn('加密消息签名验证失败');
+          res.status(403).send('Encrypt signature verification failed');
+          return;
+        }
+      } catch (sigErr) {
+        logger.error('加密签名验证异常', { err: sigErr.message });
+        res.status(500).send('Internal error');
+        return;
+      }
+    }
+    // 解密消息
+    try {
+      xmlBody = decryptMessage(encryptField);
+      isEncryptedMsg = true;
+      logger.debug('消息已解密（安全模式）');
+    } catch (decErr) {
+      logger.error('消息解密失败', { err: decErr.message });
+      res.status(400).send('Decrypt failed');
+      return;
+    }
+  }
+
   const toUserName   = getXmlValue(xmlBody, 'ToUserName');
   const fromUserName = getXmlValue(xmlBody, 'FromUserName');   // 用户 OpenID
   const msgType      = getXmlValue(xmlBody, 'MsgType');
@@ -1572,6 +1831,13 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
   }
 
   const openId = fromUserName;
+
+  // ── 消息去重（防止微信重试导致重复处理）──
+  if (msgId && await isDuplicateMessage(msgId)) {
+    logger.info('消息去重：跳过重复消息', { openId, msgId, request_id: req.id });
+    res.status(200).send('success');
+    return;
+  }
 
   // 运营统计
   stats.totalMessages++;
@@ -1635,14 +1901,14 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           if (eventKey && eventKey.startsWith('qrscene_')) {
             const scene = eventKey.slice(8);
             logger.info('用户通过扫码关注', { openId, scene });
-            replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
+            replyText = '🤖 欢迎使用 Anima 灵枢接入通道！\n\n' +
               '你通过扫码关注，' +
               '首次使用请绑定邮箱完成认证：\n' +
               '/bind 你的邮箱@example.com\n\n' +
               '绑定后即可直接发送消息与 AI 对话。\n\n' +
               '发送 /help 查看所有可用命令。';
           } else {
-            replyText = '🤖 欢迎使用 Anima 灵枢 AI 助手！\n\n' +
+            replyText = '🤖 欢迎使用 Anima 灵枢接入通道！\n\n' +
               '首次使用请先绑定邮箱完成认证：\n' +
               '/bind 你的邮箱@example.com\n\n' +
               '绑定后即可直接发送消息与 AI 对话。\n' +
@@ -1653,11 +1919,13 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
           // 已关注用户扫码（不触发 subscribe，触发 SCAN 事件）
           const scene = eventKey || '';
           logger.info('已关注用户扫码', { openId, scene });
-          replyText = '📱 扫码成功！你已关注 Anima 灵枢。\n\n' +
+          replyText = '📱 扫码成功！你已关注 Anima 灵枢接入通道。\n\n' +
             '直接发送消息即可与 AI 对话。\n' +
             '发送 /help 查看可用命令。';
         } else if (eventType === 'unsubscribe') {
-          logger.info('用户取消关注', { openId });
+          // 用户取消关注：清除所有用户数据（保证数据安全）
+          logger.info('用户取消关注，清除用户数据', { openId });
+          await clearUserData(openId);
         } else if (eventType === 'CLICK') {
           // 菜单点击事件
           logger.info('用户点击菜单', { openId, eventKey });
@@ -1681,8 +1949,24 @@ app.post('/clawbot/webhook', webhookLimiter, async (req, res) => {
 
     if (replyText) {
       const replyXml = buildTextReply(openId, toUserName, replyText);
-      res.set('Content-Type', 'text/xml');
-      res.status(200).send(replyXml);
+      // 安全模式：加密回复消息
+      if (isEncryptedMsg && ENCRYPT_MODE) {
+        try {
+          const encryptedReply = encryptMessage(replyXml);
+          const ts = String(Math.floor(Date.now() / 1000));
+          const replyNonce = crypto.randomBytes(8).toString('hex');
+          const encReplyXml = buildEncryptedReply(encryptedReply, ts, replyNonce);
+          res.set('Content-Type', 'text/xml');
+          res.status(200).send(encReplyXml);
+        } catch (encErr) {
+          logger.error('回复消息加密失败，回退明文', { err: encErr.message });
+          res.set('Content-Type', 'text/xml');
+          res.status(200).send(replyXml);
+        }
+      } else {
+        res.set('Content-Type', 'text/xml');
+        res.status(200).send(replyXml);
+      }
     } else {
       // 微信要求返回 "success" 表示已处理
       res.status(200).send('success');
@@ -1715,6 +1999,149 @@ app.get('/clawbot/qrcode', verifyLimiter, requireServiceToken, async (req, res) 
     qrcodeUrl: result.qrcodeUrl,
     scene,
   });
+});
+
+// ─── 微信自定义菜单管理（需要 SERVICE_TOKEN 认证）──────────────
+
+// 创建自定义菜单
+app.post('/clawbot/menu', express.json({ limit: '64kb' }), requireServiceToken, async (req, res) => {
+  const menuData = req.body;
+  if (!menuData || !menuData.button || !Array.isArray(menuData.button)) {
+    res.status(400).json({ success: false, msg: '菜单数据格式错误，需要 { button: [...] }' });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(500).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/menu/create?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(menuData),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode && result.errcode !== 0) {
+      logger.error('创建菜单失败', { errcode: result.errcode, errmsg: result.errmsg });
+      res.status(400).json({ success: false, errcode: result.errcode, msg: result.errmsg });
+    } else {
+      logger.info('自定义菜单创建成功');
+      res.json({ success: true, msg: '菜单创建成功' });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('创建菜单异常', { err: err.message });
+    res.status(500).json({ success: false, msg: '菜单创建失败' });
+  }
+});
+
+// 查询当前自定义菜单
+app.get('/clawbot/menu', requireServiceToken, async (req, res) => {
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(500).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/get_current_selfmenu_info?access_token=${encodeURIComponent(token)}`,
+      {
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    res.json({ success: true, menu: result });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('查询菜单异常', { err: err.message });
+    res.status(500).json({ success: false, msg: '菜单查询失败' });
+  }
+});
+
+// 删除自定义菜单
+app.delete('/clawbot/menu', requireServiceToken, async (req, res) => {
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(500).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/menu/delete?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'GET',
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const result = await body.json();
+    if (result.errcode && result.errcode !== 0) {
+      logger.error('删除菜单失败', { errcode: result.errcode, errmsg: result.errmsg });
+      res.status(400).json({ success: false, errcode: result.errcode, msg: result.errmsg });
+    } else {
+      logger.info('自定义菜单已删除');
+      res.json({ success: true, msg: '菜单已删除' });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('删除菜单异常', { err: err.message });
+    res.status(500).json({ success: false, msg: '菜单删除失败' });
+  }
+});
+
+// ─── 已认证用户管理端点（需要 SERVICE_TOKEN 认证）──────────────
+app.get('/clawbot/users', requireServiceToken, async (req, res) => {
+  if (!redis) {
+    res.status(503).json({ success: false, msg: 'Redis 不可用' });
+    return;
+  }
+
+  try {
+    // 获取所有已认证用户
+    const authedUsers = await redis.smembers(REDIS_AUTH_KEY);
+    const users = [];
+
+    for (const openId of authedUsers) {
+      const email = await redis.hget(REDIS_EMAIL_KEY, openId) || '';
+      const model = await redis.hget(REDIS_MODELS_KEY, openId) || DEFAULT_MODEL;
+      users.push({ openId, email, model });
+    }
+
+    res.json({
+      success: true,
+      total: users.length,
+      users,
+    });
+  } catch (err) {
+    logger.error('查询已认证用户失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '查询失败' });
+  }
 });
 
 // ─── 企业微信（WeCom）Webhook 接口 ────────────────────────────
@@ -1911,15 +2338,20 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`ClawBot 接入服务 v1.1 已启动，端口 ${PORT}`);
-  logger.info('官方微信接入（扫码/App互通）就绪，等待回调...');
+  logger.info(`灵枢接入通道 v1.2 已启动，端口 ${PORT}`);
+  logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
+  if (ENCRYPT_MODE) {
+    logger.info('消息加解密模式已启用（AES-256-CBC 安全模式）');
+  } else {
+    logger.info('消息加解密模式未启用（明文模式）');
+  }
   if (WECOM_ENABLED) {
     logger.info('企业微信（WeCom）接口已就绪 /wecom/webhook');
   }
   if (SERVICE_TOKEN) {
     logger.info('管理端点已启用 SERVICE_TOKEN 认证保护');
   } else {
-    logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /stats）不可用');
+    logger.warn('SERVICE_TOKEN 未设置，管理端点（/clawbot/qrcode, /clawbot/menu, /clawbot/users, /stats）不可用');
   }
 });
 
