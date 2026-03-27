@@ -878,7 +878,7 @@ async function callAgent(openId, message, requestId) {
     const reply = data.reply || data.choices?.[0]?.message?.content || '抱歉，我暂时无法回答。';
     session.messages.push({ role: 'assistant', content: reply });
     // 异步持久化会话到 Redis（不阻塞响应）
-    persistSession(openId).catch(() => {});
+    persistSession(openId).catch((err) => logger.error('Session persist failed', { err: err.message, openId }));
     return reply;
   } catch (err) {
     clearTimeout(timeoutId);
@@ -1595,7 +1595,7 @@ async function handleTextMessage(openId, rawText, requestId) {
   if (text === '/clear') {
     sessions.delete(openId);
     if (redis) {
-      redis.del(`${REDIS_SESSION_PREFIX}${openId}`).catch(() => {});
+      redis.del(`${REDIS_SESSION_PREFIX}${openId}`).catch((err) => logger.error('Session clear failed', { err: err.message, openId }));
     }
     logger.info('用户清除对话上下文', { openId });
     return '🗑 对话上下文已清除。';
@@ -1640,7 +1640,8 @@ async function handleTextMessage(openId, rawText, requestId) {
       `会话消息数：${sessionMsgCount}\n\n` +
       `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
       `导出时间：${new Date().toISOString()}\n` +
-      `版本：灵枢接入通道 v1.7`;
+      `版本：灵枢接入通道 v1.7\n\n` +
+      '⚠️ 请妥善保管导出数据，避免泄露个人信息。';
   }
 
   // /search <query> — 网页搜索（通过 Agent 调用 DuckDuckGo）
@@ -2776,7 +2777,7 @@ app.post('/clawbot/users/:openId/block', adminLimiter, requireAdminIp, requireSe
     return;
   }
 
-  const reason = (req.body && typeof req.body.reason === 'string') ? req.body.reason.substring(0, 500) : '';
+  const reason = (req.body && typeof req.body.reason === 'string') ? stripControlChars(req.body.reason).substring(0, 500) : '';
 
   await setUserBlocked(openId, true);
   logger.info('audit', {
