@@ -498,7 +498,8 @@ const pgPool = DATABASE_URL
       max: 3,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000,
-      ssl: DATABASE_URL.includes('sslmode=require') ? { rejectUnauthorized: true } : undefined,
+      // 始终启用 SSL 证书验证（PCI-DSS 4.1 传输加密）
+      ssl: { rejectUnauthorized: true },
     })
   : null;
 
@@ -918,6 +919,18 @@ async function clearUserData(openId) {
 // ─── PostgreSQL 审计日志持久化（PCI-DSS 10.2）────────────────
 
 /**
+ * 从用户标识推导通道和清洁 ID。
+ * @param {string} openId - 原始用户标识（可能含 'wecom:' 前缀）
+ * @returns {{channel: string, cleanId: string}}
+ */
+function deriveChannelAndId(openId) {
+  if (openId && openId.startsWith('wecom:')) {
+    return { channel: 'wecom', cleanId: openId.slice(6) };
+  }
+  return { channel: 'wechat', cleanId: openId || '' };
+}
+
+/**
  * 将审计事件写入 PostgreSQL clawbot_audit_log 表。
  * 不阻塞消息处理——异步写入，失败时仅记录错误日志。
  * @param {Object} event - 审计事件
@@ -931,13 +944,14 @@ async function clearUserData(openId) {
 async function dbAuditLog(event) {
   if (!pgPool) return;
   const { openId, action, detail, ip, requestId, channel } = event;
+  const derived = deriveChannelAndId(openId);
   try {
     await pgPool.query(
       `INSERT INTO clawbot_audit_log (open_id, channel, action, detail, ip, request_id)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [
-        openId || '',
-        channel || (openId && openId.startsWith('wecom:') ? 'wecom' : 'wechat'),
+        derived.cleanId,
+        channel || derived.channel,
         action || '',
         detail || null,
         ip || null,
@@ -956,6 +970,7 @@ async function dbAuditLog(event) {
 async function dbUpsertUser(user) {
   if (!pgPool) return;
   const { openId, channel, email, nickname, status, blockedReason } = user;
+  const derived = deriveChannelAndId(openId);
   try {
     await pgPool.query(
       `INSERT INTO clawbot_users (open_id, channel, email, nickname, status, blocked_reason, bound_at, last_active_at)
@@ -970,8 +985,8 @@ async function dbUpsertUser(user) {
          last_active_at = NOW(),
          updated_at = NOW()`,
       [
-        openId.startsWith('wecom:') ? openId.slice(6) : openId,
-        channel || (openId.startsWith('wecom:') ? 'wecom' : 'wechat'),
+        derived.cleanId,
+        channel || derived.channel,
         email || null,
         nickname || null,
         status || 'active',
@@ -989,8 +1004,7 @@ async function dbUpsertUser(user) {
  */
 async function dbDeleteUser(openId) {
   if (!pgPool) return;
-  const channel = openId.startsWith('wecom:') ? 'wecom' : 'wechat';
-  const cleanId = openId.startsWith('wecom:') ? openId.slice(6) : openId;
+  const { channel, cleanId } = deriveChannelAndId(openId);
   try {
     await pgPool.query(
       'DELETE FROM clawbot_users WHERE channel = $1 AND open_id = $2',
@@ -1006,8 +1020,7 @@ async function dbDeleteUser(openId) {
  */
 async function dbUpdateLastActive(openId) {
   if (!pgPool) return;
-  const channel = openId.startsWith('wecom:') ? 'wecom' : 'wechat';
-  const cleanId = openId.startsWith('wecom:') ? openId.slice(6) : openId;
+  const { channel, cleanId } = deriveChannelAndId(openId);
   try {
     await pgPool.query(
       'UPDATE clawbot_users SET last_active_at = NOW(), updated_at = NOW() WHERE channel = $1 AND open_id = $2',
@@ -1101,7 +1114,9 @@ async function cleanupExpiredAuditLogs() {
 }
 
 // 每天凌晨执行审计日志清理（PCI-DSS 10.7）
-const auditCleanupTimer = setInterval(cleanupExpiredAuditLogs, 24 * 60 * 60 * 1000);
+// 审计日志清理间隔：每24小时执行一次（PCI-DSS 10.7）
+const AUDIT_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const auditCleanupTimer = setInterval(cleanupExpiredAuditLogs, AUDIT_CLEANUP_INTERVAL_MS);
 // 启动后延迟 5 分钟执行首次清理
 setTimeout(cleanupExpiredAuditLogs, 5 * 60 * 1000);
 
@@ -1796,9 +1811,9 @@ async function handleTextMessage(openId, rawText, requestId) {
     }
     const email = text.slice(6).trim().toLowerCase();
     if (!email || !EMAIL_RE.test(email) || email.length > 254) {
-      await recordBindFailure(openId);
       return '❌ 邮箱格式不正确，请重新输入。\n\n用法：/bind yourname@example.com';
     }
+    // 格式验证通过后才记录绑定尝试（避免格式错误触发锁定）
     await setUserEmail(openId, email);
     await setUserAuthed(openId);
     await clearBindFailures(openId);
@@ -3158,6 +3173,17 @@ app.get('/clawbot/audit', adminLimiter, requireAdminIp, requireServiceToken, asy
   const since = typeof req.query.since === 'string' ? req.query.since.trim() : '';
   const until = typeof req.query.until === 'string' ? req.query.until.trim() : '';
 
+  // ISO 8601 日期格式验证（防止畸形日期导致 SQL 错误）
+  const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+  if (since && !ISO_DATE_RE.test(since)) {
+    res.status(400).json({ success: false, msg: 'since 参数格式无效（需 ISO 8601 日期）' });
+    return;
+  }
+  if (until && !ISO_DATE_RE.test(until)) {
+    res.status(400).json({ success: false, msg: 'until 参数格式无效（需 ISO 8601 日期）' });
+    return;
+  }
+
   try {
     let where = 'WHERE 1=1';
     const params = [];
@@ -3172,11 +3198,11 @@ app.get('/clawbot/audit', adminLimiter, requireAdminIp, requireServiceToken, asy
       params.push(actionFilter);
     }
     if (since) {
-      where += ` AND created_at >= $${paramIdx++}`;
+      where += ` AND created_at >= $${paramIdx++}::timestamptz`;
       params.push(since);
     }
     if (until) {
-      where += ` AND created_at <= $${paramIdx++}`;
+      where += ` AND created_at <= $${paramIdx++}::timestamptz`;
       params.push(until);
     }
 
