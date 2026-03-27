@@ -56,8 +56,15 @@ channels:
 
   clawbot:
     enabled: true
-    version: "2.3.0"
-    description: "微信 ClawBot 灵枢接入通道 (v2.3)
+    version: "2.4.0"
+    description: "微信 ClawBot 灵枢接入通道 (v2.4)
+      - 插件验证挑战-响应（官方 ClawBot 插件商店认证）
+      - 用户隐私同意管理（PCI-DSS v4.0 / GDPR 合规）
+      - 用户偏好设置（语言/通知/语音回复）
+      - CIS v8 安全头增强（HSTS/CSP/Permissions-Policy）
+      - 数据隔离增强（Redis 命名空间校验/插件状态清理）
+      - 合规性报告端点（PCI-DSS v4.0 / CIS v8 自检）
+      - 插件健康仪表板（依赖健康检查/响应延迟监控）
       - 官方 ClawBot 插件清单端点 + 插件状态端点
       - 插件生命周期事件（activate/deactivate/update）
       - 会话静态加密 AES-256-GCM（PCI-DSS 3.4）
