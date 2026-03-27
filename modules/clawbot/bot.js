@@ -1,10 +1,54 @@
 'use strict';
 
 /**
- * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v1.9
+ * Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道 v2.0
  * ─────────────────────────────────────────────────────────────
  * 基于 Express HTTP Webhook，接收微信 ClawBot 插件回调，
  * 桥接到 OpenClaw Agent API 实现 AI 对话。
+ *
+ * 修改记录（v2.0 相对于 v1.9）：
+ *
+ *   #ENT-2.0-1  JS-SDK 签名配置端点（完整 ClawBot 网页能力）
+ *               - 新增 GET /clawbot/jssdk/config 端点，生成
+ *                 微信 JS-SDK wx.config 所需的签名参数。
+ *               - jsapi_ticket 缓存（7200s TTL），自动续期。
+ *               - 支持自定义 JS-SDK 接口列表（jsApiList）。
+ *               - 网页端可调用微信扫一扫、位置、图片、分享等能力。
+ *
+ *   #ENT-2.0-2  用户标签管理（官方用户分群管理）
+ *               - 新增 GET /clawbot/tags 列出标签。
+ *               - 新增 POST /clawbot/tags 创建标签。
+ *               - 新增 DELETE /clawbot/tags/:tagId 删除标签。
+ *               - 新增 POST /clawbot/tags/:tagId/users 批量打标签。
+ *               - 新增 DELETE /clawbot/tags/:tagId/users 批量取消标签。
+ *               - 审计日志记录所有标签操作（PCI-DSS 10.2.2）。
+ *
+ *   #ENT-2.0-3  群发/广播消息（官方 ClawBot 群发能力）
+ *               - 新增 POST /clawbot/broadcast 群发文本消息。
+ *               - 支持按标签群发（tag_id）或全量群发（is_to_all）。
+ *               - 新增 GET /clawbot/broadcast/:msgId 查询群发状态。
+ *               - 群发操作审计日志（PCI-DSS 10.2.2）。
+ *
+ *   #ENT-2.0-4  素材管理（官方永久素材 API）
+ *               - 新增 GET /clawbot/material/count 查询素材总数。
+ *               - 新增 POST /clawbot/material/list 分页查询素材列表。
+ *               - 新增 DELETE /clawbot/material/:mediaId 删除永久素材。
+ *               - 支持 image / voice / video / news 四种类型。
+ *
+ *   #ENT-2.0-5  数据统计代理（官方 ClawBot 数据分析接口）
+ *               - 新增 POST /clawbot/analytics/:metric 代理微信
+ *                 数据统计接口（用户增减、消息统计、接口调用）。
+ *               - 支持指标：user_summary / user_cumulate /
+ *                 article_summary / upstream_msg / interface_summary。
+ *               - 按日期范围查询，最大跨度 7 天。
+ *
+ *   #ENT-2.0-6  修复 /export 版本号遗留问题
+ *               - /export 输出版本号从 v1.8 更正为 v2.0。
+ *
+ *   #ENT-2.0-7  OAuth 授权 scope 持久化（Migration 008 对接）
+ *               - OAuth 授权完成后将 oauth_scope 写入 clawbot_users
+ *                 表的 oauth_scope 列（email / snsapi_base /
+ *                 snsapi_userinfo），完整对接 Migration 008。
  *
  * 修改记录（v1.9 相对于 v1.8）：
  *
@@ -1026,17 +1070,18 @@ async function dbAuditLog(event) {
  */
 async function dbUpsertUser(user) {
   if (!pgPool) return;
-  const { openId, channel, email, nickname, status, blockedReason } = user;
+  const { openId, channel, email, nickname, status, blockedReason, oauthScope } = user;
   const derived = deriveChannelAndId(openId);
   try {
     await pgPool.query(
-      `INSERT INTO clawbot_users (open_id, channel, email, nickname, status, blocked_reason, bound_at, last_active_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+      `INSERT INTO clawbot_users (open_id, channel, email, nickname, status, blocked_reason, oauth_scope, bound_at, last_active_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        ON CONFLICT (channel, open_id) DO UPDATE SET
          email = COALESCE(EXCLUDED.email, clawbot_users.email),
          nickname = COALESCE(EXCLUDED.nickname, clawbot_users.nickname),
          status = COALESCE(EXCLUDED.status, clawbot_users.status),
          blocked_reason = CASE WHEN EXCLUDED.status = 'blocked' THEN EXCLUDED.blocked_reason ELSE clawbot_users.blocked_reason END,
+         oauth_scope = COALESCE(EXCLUDED.oauth_scope, clawbot_users.oauth_scope),
          bound_at = CASE WHEN EXCLUDED.email IS NOT NULL AND clawbot_users.email IS NULL THEN NOW() ELSE clawbot_users.bound_at END,
          blocked_at = CASE WHEN EXCLUDED.status = 'blocked' AND clawbot_users.status != 'blocked' THEN NOW() ELSE clawbot_users.blocked_at END,
          last_active_at = NOW(),
@@ -1048,6 +1093,7 @@ async function dbUpsertUser(user) {
         nickname || null,
         status || 'active',
         blockedReason || null,
+        oauthScope || null,
         email ? new Date() : null,
       ]
     );
@@ -1316,6 +1362,73 @@ async function getAccessToken() {
     logger.error('获取 access_token 请求异常', { err: err.message });
     return '';
   }
+}
+
+// ─── JS-SDK jsapi_ticket 缓存（v2.0 WeChat JS-SDK 支持）──────
+let jsapiTicketCache = { ticket: '', expiresAt: 0 };
+
+/**
+ * 获取 JS-SDK jsapi_ticket。
+ * 用于生成 wx.config 签名，使网页端可以调用微信能力（扫一扫、分享、位置等）。
+ * @returns {Promise<string>} jsapi_ticket
+ */
+async function getJsapiTicket() {
+  if (jsapiTicketCache.ticket && Date.now() < jsapiTicketCache.expiresAt) {
+    return jsapiTicketCache.ticket;
+  }
+
+  const accessToken = await getAccessToken();
+  if (!accessToken) return '';
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const url = `https://api.weixin.qq.com/cgi-bin/ticket/getticket?access_token=${encodeURIComponent(accessToken)}&type=jsapi`;
+    const { body } = await request(url, {
+      bodyTimeout: 10_000,
+      headersTimeout: 10_000,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.errcode === 0 && data.ticket) {
+      jsapiTicketCache = {
+        ticket: data.ticket,
+        expiresAt: Date.now() + ((data.expires_in || 7200) - 300) * 1000,
+      };
+      return data.ticket;
+    }
+    logger.error('获取 jsapi_ticket 失败', { errcode: data.errcode, errmsg: data.errmsg });
+    return '';
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取 jsapi_ticket 请求异常', { err: err.message });
+    return '';
+  }
+}
+
+/**
+ * 生成 JS-SDK wx.config 签名参数。
+ * @param {string} url - 当前网页 URL（不含 #hash）
+ * @returns {Promise<Object|null>} { appId, timestamp, nonceStr, signature }
+ */
+async function generateJssdkConfig(url) {
+  const ticket = await getJsapiTicket();
+  if (!ticket) return null;
+
+  const nonceStr = crypto.randomBytes(8).toString('hex');
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const signStr = `jsapi_ticket=${ticket}&noncestr=${nonceStr}&timestamp=${timestamp}&url=${url}`;
+  const signature = crypto.createHash('sha1').update(signStr).digest('hex');
+
+  return {
+    appId: CLAWBOT_APP_ID,
+    timestamp,
+    nonceStr,
+    signature,
+  };
 }
 
 /**
@@ -2049,7 +2162,7 @@ async function handleTextMessage(openId, rawText, requestId) {
       `会话消息数：${sessionMsgCount}\n\n` +
       `【最近对话记录（最多10条）】\n${recentMessages}\n\n` +
       `导出时间：${new Date().toISOString()}\n` +
-      `版本：灵枢接入通道 v1.8\n\n` +
+      `版本：灵枢接入通道 v2.0\n\n` +
       '⚠️ 请妥善保管导出数据，避免泄露个人信息。';
   }
 
@@ -2662,7 +2775,7 @@ app.get('/stats', adminLimiter, requireAdminIp, requireServiceToken, async (req,
     try { blockedCount = await redis.scard(REDIS_BLOCKED_KEY); } catch (_e) { /* ignore */ }
   }
   res.json({
-    version: '1.9.0',
+    version: '2.0.0',
     channel: '灵枢接入通道',
     uptime_seconds: Math.floor(uptimeMs / 1000),
     active_sessions: sessions.size,
@@ -3681,7 +3794,7 @@ app.get('/clawbot/oauth/callback', oauthLimiter, async (req, res) => {
 
     // 自动设置用户已认证状态
     await setUserAuthed(openid);
-    dbUpsertUser({ openId: openid, nickname, status: 'active' });
+    dbUpsertUser({ openId: openid, nickname, status: 'active', oauthScope: grantedScope || OAUTH_SCOPE });
     dbAuditLog({ openId: openid, action: 'oauth_bind', detail: `scope=${grantedScope}${nickname ? `,nickname=${nickname}` : ''}`, ip: req.ip, requestId: req.id });
 
     stats.oauthCompleted++;
@@ -3713,6 +3826,629 @@ app.get('/clawbot/oauth/callback', oauthLimiter, async (req, res) => {
   }
 });
 
+// ─── JS-SDK 签名配置端点（v2.0 微信网页能力）──────────────────
+// 网页端调用此接口获取 wx.config 签名参数，启用微信 JS-SDK 能力
+app.get('/clawbot/jssdk/config', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  if (!url) {
+    res.status(400).json({ success: false, msg: '缺少 url 参数（当前页面 URL，不含 #hash）' });
+    return;
+  }
+
+  // URL 长度限制（防止注入）
+  if (url.length > 2048) {
+    res.status(400).json({ success: false, msg: 'URL 过长（最大 2048 字符）' });
+    return;
+  }
+
+  try {
+    const config = await generateJssdkConfig(url);
+    if (!config) {
+      res.status(503).json({ success: false, msg: 'jsapi_ticket 获取失败' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      ...config,
+    });
+  } catch (err) {
+    logger.error('JS-SDK 签名生成失败', { err: err.message });
+    res.status(500).json({ success: false, msg: 'JS-SDK 签名生成失败' });
+  }
+});
+
+// ─── 用户标签管理（v2.0 官方用户分群管理）──────────────────────
+
+// 获取所有标签
+app.get('/clawbot/tags', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/tags/get?access_token=${encodeURIComponent(token)}`,
+      { bodyTimeout: 10_000, headersTimeout: 10_000, signal: controller.signal }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.tags) {
+      res.json({ success: true, tags: data.tags });
+    } else {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取标签列表失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '获取标签列表失败' });
+  }
+});
+
+// 创建标签
+app.post('/clawbot/tags', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const tagName = req.body && typeof req.body.name === 'string' ? stripControlChars(req.body.name).trim() : '';
+  if (!tagName || tagName.length > 30) {
+    res.status(400).json({ success: false, msg: '标签名称无效（1-30 字符）' });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/tags/create?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag: { name: tagName } }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (data.tag) {
+      dbAuditLog({ openId: 'admin', action: 'tag_create', detail: `tag=${tagName},id=${data.tag.id}`, ip: req.ip, requestId: req.id });
+      res.json({ success: true, tag: data.tag });
+    } else {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('创建标签失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '创建标签失败' });
+  }
+});
+
+// 删除标签
+app.delete('/clawbot/tags/:tagId', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const tagId = parseInt(req.params.tagId, 10);
+  if (Number.isNaN(tagId) || tagId < 0) {
+    res.status(400).json({ success: false, msg: '无效的标签 ID' });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/tags/delete?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag: { id: tagId } }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (!data.errcode || data.errcode === 0) {
+      dbAuditLog({ openId: 'admin', action: 'tag_delete', detail: `tagId=${tagId}`, ip: req.ip, requestId: req.id });
+      res.json({ success: true, msg: `标签 ${tagId} 已删除` });
+    } else {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('删除标签失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '删除标签失败' });
+  }
+});
+
+// 批量为用户打标签
+app.post('/clawbot/tags/:tagId/users', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const tagId = parseInt(req.params.tagId, 10);
+  if (Number.isNaN(tagId) || tagId < 0) {
+    res.status(400).json({ success: false, msg: '无效的标签 ID' });
+    return;
+  }
+
+  const openIdList = Array.isArray(req.body && req.body.openid_list) ? req.body.openid_list : [];
+  if (openIdList.length === 0 || openIdList.length > 50) {
+    res.status(400).json({ success: false, msg: 'openid_list 无效（1-50 个 OpenID）' });
+    return;
+  }
+
+  // 验证每个 OpenID 格式
+  for (const oid of openIdList) {
+    if (typeof oid !== 'string' || !OPENID_RE.test(oid)) {
+      res.status(400).json({ success: false, msg: `无效的 OpenID: ${String(oid).substring(0, 32)}` });
+      return;
+    }
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/tags/members/batchtagging?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ openid_list: openIdList, tagid: tagId }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (!data.errcode || data.errcode === 0) {
+      dbAuditLog({ openId: 'admin', action: 'tag_batch_add', detail: `tagId=${tagId},count=${openIdList.length}`, ip: req.ip, requestId: req.id });
+      res.json({ success: true, msg: `已为 ${openIdList.length} 个用户添加标签 ${tagId}` });
+    } else {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('批量打标签失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '批量打标签失败' });
+  }
+});
+
+// 批量取消标签
+app.delete('/clawbot/tags/:tagId/users', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const tagId = parseInt(req.params.tagId, 10);
+  if (Number.isNaN(tagId) || tagId < 0) {
+    res.status(400).json({ success: false, msg: '无效的标签 ID' });
+    return;
+  }
+
+  // DELETE 请求的 body 需要特别处理
+  const openIdList = Array.isArray(req.body && req.body.openid_list) ? req.body.openid_list : [];
+  if (openIdList.length === 0 || openIdList.length > 50) {
+    res.status(400).json({ success: false, msg: 'openid_list 无效（1-50 个 OpenID）' });
+    return;
+  }
+
+  for (const oid of openIdList) {
+    if (typeof oid !== 'string' || !OPENID_RE.test(oid)) {
+      res.status(400).json({ success: false, msg: `无效的 OpenID: ${String(oid).substring(0, 32)}` });
+      return;
+    }
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/tags/members/batchuntagging?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ openid_list: openIdList, tagid: tagId }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+    if (!data.errcode || data.errcode === 0) {
+      dbAuditLog({ openId: 'admin', action: 'tag_batch_remove', detail: `tagId=${tagId},count=${openIdList.length}`, ip: req.ip, requestId: req.id });
+      res.json({ success: true, msg: `已为 ${openIdList.length} 个用户取消标签 ${tagId}` });
+    } else {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('批量取消标签失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '批量取消标签失败' });
+  }
+});
+
+// ─── 群发/广播消息（v2.0 官方 ClawBot 群发能力）──────────────────
+
+// 群发文本消息
+app.post('/clawbot/broadcast', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const { content, tag_id, is_to_all } = req.body || {};
+
+  if (!content || typeof content !== 'string' || content.trim().length === 0) {
+    res.status(400).json({ success: false, msg: '缺少群发内容（content 字段）' });
+    return;
+  }
+
+  if (content.length > 10000) {
+    res.status(400).json({ success: false, msg: '群发内容过长（最大 10000 字符）' });
+    return;
+  }
+
+  // 必须指定标签或全量发送
+  if (!is_to_all && (tag_id === undefined || tag_id === null)) {
+    res.status(400).json({ success: false, msg: '请指定 tag_id（按标签发送）或 is_to_all: true（全量发送）' });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const filter = is_to_all
+      ? { is_to_all: true }
+      : { is_to_all: false, tag_id: parseInt(tag_id, 10) };
+
+    const payload = {
+      filter,
+      msgtype: 'text',
+      text: { content: content.trim() },
+    };
+
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/mass/sendall?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        bodyTimeout: 30_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+
+    if (data.errcode && data.errcode !== 0) {
+      logger.error('群发消息失败', { errcode: data.errcode, errmsg: data.errmsg });
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    } else {
+      dbAuditLog({
+        openId: 'admin',
+        action: 'broadcast',
+        detail: `msg_id=${data.msg_id || ''},target=${is_to_all ? 'all' : `tag_${tag_id}`},content_len=${content.length}`,
+        ip: req.ip,
+        requestId: req.id,
+      });
+      res.json({
+        success: true,
+        msg_id: data.msg_id,
+        msg_data_id: data.msg_data_id,
+        msg: '群发消息已提交',
+      });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('群发消息异常', { err: err.message });
+    res.status(500).json({ success: false, msg: '群发消息失败' });
+  }
+});
+
+// 查询群发消息状态
+app.get('/clawbot/broadcast/:msgId', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const msgId = req.params.msgId;
+  if (!msgId || !/^\d+$/.test(msgId)) {
+    res.status(400).json({ success: false, msg: '无效的消息 ID' });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/message/mass/get?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ msg_id: msgId }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+
+    if (data.errcode && data.errcode !== 0) {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    } else {
+      res.json({
+        success: true,
+        msg_id: data.msg_id,
+        msg_status: data.msg_status,
+      });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('查询群发状态失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '查询群发状态失败' });
+  }
+});
+
+// ─── 素材管理（v2.0 官方永久素材 API）──────────────────────────
+
+// 获取素材总数
+app.get('/clawbot/material/count', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/material/get_materialcount?access_token=${encodeURIComponent(token)}`,
+      { bodyTimeout: 10_000, headersTimeout: 10_000, signal: controller.signal }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+
+    if (data.errcode) {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    } else {
+      res.json({
+        success: true,
+        voice_count: data.voice_count,
+        video_count: data.video_count,
+        image_count: data.image_count,
+        news_count: data.news_count,
+      });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取素材总数失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '获取素材总数失败' });
+  }
+});
+
+// 获取素材列表
+app.post('/clawbot/material/list', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const validTypes = ['image', 'voice', 'video', 'news'];
+  const type = req.body && typeof req.body.type === 'string' ? req.body.type.trim() : '';
+  if (!validTypes.includes(type)) {
+    res.status(400).json({ success: false, msg: `type 参数无效（支持：${validTypes.join(', ')}）` });
+    return;
+  }
+
+  const offset = Math.max(0, parseInt(req.body.offset || '0', 10));
+  const count = Math.min(20, Math.max(1, parseInt(req.body.count || '20', 10)));
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/material/batchget_material?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, offset, count }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+
+    if (data.errcode) {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    } else {
+      res.json({
+        success: true,
+        total_count: data.total_count,
+        item_count: data.item_count,
+        item: data.item,
+      });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('获取素材列表失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '获取素材列表失败' });
+  }
+});
+
+// 删除永久素材
+app.delete('/clawbot/material/:mediaId', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const mediaId = req.params.mediaId;
+  if (!mediaId || mediaId.length > 256) {
+    res.status(400).json({ success: false, msg: '无效的 media_id' });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com/cgi-bin/material/del_material?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ media_id: mediaId }),
+        bodyTimeout: 10_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+
+    if (data.errcode && data.errcode !== 0) {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    } else {
+      dbAuditLog({ openId: 'admin', action: 'material_delete', detail: `media_id=${mediaId}`, ip: req.ip, requestId: req.id });
+      res.json({ success: true, msg: '素材已删除' });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('删除素材失败', { err: err.message });
+    res.status(500).json({ success: false, msg: '删除素材失败' });
+  }
+});
+
+// ─── 数据统计代理（v2.0 官方 ClawBot 数据分析接口）──────────────
+// 代理微信数据统计接口，支持用户分析、消息分析、接口分析
+const ANALYTICS_METRICS = {
+  user_summary: '/datacube/getusersummary',
+  user_cumulate: '/datacube/getusercumulate',
+  article_summary: '/datacube/getarticlesummary',
+  upstream_msg: '/datacube/getupstreammsg',
+  interface_summary: '/datacube/getinterfacesummary',
+};
+
+app.post('/clawbot/analytics/:metric', adminLimiter, requireAdminIp, requireServiceToken, async (req, res) => {
+  const metricKey = req.params.metric;
+  const apiPath = ANALYTICS_METRICS[metricKey];
+  if (!apiPath) {
+    res.status(400).json({
+      success: false,
+      msg: `不支持的指标（支持：${Object.keys(ANALYTICS_METRICS).join(', ')}）`,
+    });
+    return;
+  }
+
+  const { begin_date, end_date } = req.body || {};
+  if (!begin_date || !end_date) {
+    res.status(400).json({ success: false, msg: '缺少 begin_date 和 end_date 参数（格式：YYYY-MM-DD）' });
+    return;
+  }
+
+  // 日期格式校验
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  if (!DATE_RE.test(begin_date) || !DATE_RE.test(end_date)) {
+    res.status(400).json({ success: false, msg: '日期格式无效（需 YYYY-MM-DD）' });
+    return;
+  }
+
+  // 日期范围校验（微信限制最大 7 天跨度）
+  const beginMs = new Date(begin_date).getTime();
+  const endMs = new Date(end_date).getTime();
+  if (Number.isNaN(beginMs) || Number.isNaN(endMs) || endMs < beginMs) {
+    res.status(400).json({ success: false, msg: 'end_date 不能早于 begin_date' });
+    return;
+  }
+  const MAX_RANGE_DAYS = 7;
+  if ((endMs - beginMs) > MAX_RANGE_DAYS * 24 * 60 * 60 * 1000) {
+    res.status(400).json({ success: false, msg: `日期范围不能超过 ${MAX_RANGE_DAYS} 天` });
+    return;
+  }
+
+  const token = await getAccessToken();
+  if (!token) {
+    res.status(503).json({ success: false, msg: 'access_token 不可用' });
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const { body } = await request(
+      `https://api.weixin.qq.com${apiPath}?access_token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ begin_date, end_date }),
+        bodyTimeout: 15_000,
+        headersTimeout: 10_000,
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeoutId);
+    const data = await body.json();
+
+    if (data.errcode) {
+      res.status(400).json({ success: false, errcode: data.errcode, msg: data.errmsg });
+    } else {
+      res.json({
+        success: true,
+        metric: metricKey,
+        begin_date,
+        end_date,
+        list: data.list || [],
+      });
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    logger.error('数据统计查询失败', { err: err.message, metric: metricKey });
+    res.status(500).json({ success: false, msg: '数据统计查询失败' });
+  }
+});
+
 // ─── 404 处理 ────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
@@ -3726,7 +4462,7 @@ app.use((err, req, res, _next) => {
 
 // ─── 启动服务器 ──────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(`灵枢接入通道 v1.9 已启动，端口 ${PORT}`);
+  logger.info(`灵枢接入通道 v2.0 已启动，端口 ${PORT}`);
   logger.info('官方微信 ClawBot 插件接入（扫码/App互通）就绪，等待回调...');
   logger.info(`Per-user 速率限制：${USER_RATE_LIMIT} 次/分钟`);
   if (ENCRYPT_MODE) {
