@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v2.1
+# 微信 ClawBot 插件灵枢接入通道 v2.2
 
 ## 概述
 
@@ -12,7 +12,15 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v2.1 新特性
+## v2.2 新特性
+
+- **快捷回复认证修复（PCI-DSS 7.1）**：快捷回复规则匹配从认证检查之前移至之后，修复未登录用户可触发快捷回复的安全漏洞。确保「所有用户必须登录才可使用」的安全要求（PCI-DSS 7.1 访问控制）。
+- **模板消息送达回调（TEMPLATESENDJOBFINISH）**：新增 TEMPLATESENDJOBFINISH 事件处理，微信推送模板消息送达/失败结果时，自动回写 `clawbot_template_log` 表的 `status` 字段（delivered/failed），实现模板消息全生命周期追踪（PCI-DSS 10.2.2）。
+- **群发完成回调（MASSSENDJOBFINISH）**：新增 MASSSENDJOBFINISH 事件处理，群发消息完成后自动接收微信推送的发送量/过滤量/成功量/失败量，持久化到新增 `clawbot_broadcast_log` 表。群发完成审计日志记录（PCI-DSS 10.2.2）。
+- **数据库迁移 010**：新增 `clawbot_broadcast_log` 表记录群发消息完成回调结果。
+- **统计指标增强**：`/stats` 端点新增 `templateCallbacks`（模板送达回调次数）和 `broadcastCallbacks`（群发完成回调次数）计数器，完善企业级运维可观测性。
+
+## v2.1 新特性（历史版本）
 
 - **模板消息 API**：新增 `POST /clawbot/template/send` 发送模板消息（服务通知），支持 first/keyword/remark 数据字段、跳转 URL 和小程序路径。新增 `GET /clawbot/template/list` 查询模板列表。发送记录持久化到 `clawbot_template_log` 表（PCI-DSS 10.2.2）。
 - **客服会话转接**：新增 `/transfer` 用户命令和 `POST /clawbot/kf/transfer` 管理端点，支持将用户转接到人工客服。转接事件审计记录（PCI-DSS 10.2.2）。
