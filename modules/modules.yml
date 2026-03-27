@@ -56,8 +56,15 @@ channels:
 
   clawbot:
     enabled: true
-    version: "2.4.0"
-    description: "微信 ClawBot 灵枢接入通道 (v2.4)
+    version: "2.6.0"
+    description: "微信 ClawBot 灵枢接入通道 (v2.6)
+      - 灵枢通道网关（通道注册/发现/能力矩阵/心跳监控）
+      - 接入向导 /setup（分步引导普通用户完成全流程）
+      - Webhook 事件中继（第三方订阅/HMAC-SHA256 签名/投递追踪）
+      - 跨通道会话联邦（WeChat ↔ WeCom 会话关联/审计）
+      - PCI-DSS/CIS 实时合规监控（漂移检测/趋势分析）
+      - 多租户隔离/API 密钥管理/插件心跳/能力协商/合规历史
+      - 自助激活/企业运维增强/持续合规监控
       - 插件验证挑战-响应（官方 ClawBot 插件商店认证）
       - 用户隐私同意管理（PCI-DSS v4.0 / GDPR 合规）
       - 用户偏好设置（语言/通知/语音回复）
