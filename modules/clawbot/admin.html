@@ -129,7 +129,7 @@ tr:hover{background:rgba(59,130,246,.05)}
   <nav class="sidebar">
     <div class="sidebar-header">
       <h2>🔮 灵枢管理</h2>
-      <div class="ver">ClawBot v2.7</div>
+      <div class="ver">ClawBot v2.8</div>
     </div>
     <div class="nav-group">
       <div class="nav-group-title">概览</div>
@@ -149,6 +149,11 @@ tr:hover{background:rgba(59,130,246,.05)}
       <div class="nav-item" data-page="qrcode"><span class="icon">📱</span><span>二维码</span></div>
       <div class="nav-item" data-page="material"><span class="icon">🗂️</span><span>素材管理</span></div>
       <div class="nav-item" data-page="tags"><span class="icon">🏷️</span><span>标签管理</span></div>
+      <div class="nav-item" data-page="kf"><span class="icon">🎧</span><span>客服系统</span></div>
+      <div class="nav-item" data-page="drafts"><span class="icon">📝</span><span>草稿/发布</span></div>
+      <div class="nav-item" data-page="comments"><span class="icon">💬</span><span>评论管理</span></div>
+      <div class="nav-item" data-page="subscribe"><span class="icon">🔔</span><span>订阅消息</span></div>
+      <div class="nav-item" data-page="condmenu"><span class="icon">🎯</span><span>个性化菜单</span></div>
     </div>
     <div class="nav-group">
       <div class="nav-group-title">企业运营</div>
@@ -344,6 +349,50 @@ tr:hover{background:rgba(59,130,246,.05)}
         </div>
         <div id="plugin-content" class="loading">加载中...</div>
       </div>
+
+      <!-- v2.8 新增页面 -->
+      <div class="page" id="page-kf">
+        <div class="tabs">
+          <div class="tab active" onclick="showKfTab('accounts')">客服账号</div>
+          <div class="tab" onclick="showKfTab('sessions')">会话状态</div>
+          <div class="tab" onclick="showKfTab('send')">主动消息</div>
+        </div>
+        <div id="kf-content" class="loading">加载中...</div>
+      </div>
+
+      <div class="page" id="page-drafts">
+        <div class="tabs">
+          <div class="tab active" onclick="showDraftTab('list')">草稿列表</div>
+          <div class="tab" onclick="showDraftTab('create')">新建草稿</div>
+          <div class="tab" onclick="showDraftTab('autoreply')">自动回复规则</div>
+        </div>
+        <div id="draft-content" class="loading">加载中...</div>
+      </div>
+
+      <div class="page" id="page-comments">
+        <div class="tabs">
+          <div class="tab active" onclick="showCommentTab('list')">评论列表</div>
+          <div class="tab" onclick="showCommentTab('reply')">回复评论</div>
+        </div>
+        <div id="comment-content" class="loading">加载中...</div>
+      </div>
+
+      <div class="page" id="page-subscribe">
+        <div class="tabs">
+          <div class="tab active" onclick="showSubscribeTab('templates')">模板列表</div>
+          <div class="tab" onclick="showSubscribeTab('send')">发送消息</div>
+        </div>
+        <div id="subscribe-content" class="loading">加载中...</div>
+      </div>
+
+      <div class="page" id="page-condmenu">
+        <div class="tabs">
+          <div class="tab active" onclick="showCondMenuTab('list')">个性化菜单</div>
+          <div class="tab" onclick="showCondMenuTab('create')">创建菜单</div>
+          <div class="tab" onclick="showCondMenuTab('test')">匹配测试</div>
+        </div>
+        <div id="condmenu-content" class="loading">加载中...</div>
+      </div>
     </div>
   </div>
 </div>
@@ -367,7 +416,8 @@ const pageTitles = {
   dashboard:'运营仪表盘',health:'系统健康',users:'用户管理',broadcast:'群发消息',
   templates:'模板消息',quickreply:'快捷回复',menu:'自定义菜单',qrcode:'二维码',
   material:'素材管理',tags:'标签管理',tenants:'租户管理',gateway:'通道网关',
-  relay:'事件中继',federation:'会话联邦',compliance:'合规报告',audit:'审计日志',plugin:'插件状态'
+  relay:'事件中继',federation:'会话联邦',compliance:'合规报告',audit:'审计日志',plugin:'插件状态',
+  kf:'客服系统',drafts:'草稿/发布',comments:'评论管理',subscribe:'订阅消息',condmenu:'个性化菜单'
 };
 
 /* ── Auth ── */
@@ -450,7 +500,9 @@ function loadPage(page){
     dashboard:loadDashboard,health:loadHealth,users:loadUsers,templates:loadTemplates,
     quickreply:loadQuickReplies,menu:loadMenu,material:loadMaterialCount,tags:loadTags,
     tenants:loadTenants,gateway:loadGateway,relay:loadRelay,federation:loadFederation,
-    compliance:()=>showComplianceTab('report'),audit:loadAudit,plugin:()=>showPluginTab('status')
+    compliance:()=>showComplianceTab('report'),audit:loadAudit,plugin:()=>showPluginTab('status'),
+    kf:()=>showKfTab('accounts'),drafts:()=>showDraftTab('list'),comments:()=>showCommentTab('list'),
+    subscribe:()=>showSubscribeTab('templates'),condmenu:()=>showCondMenuTab('list')
   };
   if(loaders[page]) loaders[page]();
 }
@@ -476,6 +528,10 @@ async function loadDashboard(){
       <div class="stat-card"><div class="label">通道数</div><div class="value">${d.channel_registered}</div></div>
       <div class="stat-card"><div class="label">Webhook 投递</div><div class="value">${d.webhook_deliveries}</div><div class="sub">失败 ${d.webhook_delivery_failures}</div></div>
       <div class="stat-card"><div class="label">合规扫描</div><div class="value">${d.compliance_scans}</div></div>
+      <div class="stat-card"><div class="label">客服消息</div><div class="value">${d.kf_message_sent||0}</div></div>
+      <div class="stat-card"><div class="label">草稿/发布</div><div class="value">${d.drafts_created||0}/${d.drafts_published||0}</div></div>
+      <div class="stat-card"><div class="label">订阅消息</div><div class="value">${d.subscriptions_sent||0}</div></div>
+      <div class="stat-card"><div class="label">一键接入</div><div class="value">${d.quickstart_completed||0}</div></div>
     `;
     // Message types
     const mt = d.messages_by_type||{};
@@ -929,8 +985,102 @@ document.getElementById('modal').addEventListener('click',e=>{if(e.target===docu
 
 /* ── Utils ── */
 function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
+function escJs(s){if(s==null)return'';return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\x3c').replace(/>/g,'\\x3e')}
 function fmtNum(n){return(n||0).toLocaleString()}
 function fmtDate(d){if(!d)return'-';const dt=new Date(d);if(isNaN(dt.getTime()))return'-';return dt.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'})}
+
+/* ── v2.8 客服系统 ── */
+async function showKfTab(tab){
+  const el=document.getElementById('kf-content');
+  document.querySelectorAll('#page-kf .tab').forEach((t,i)=>t.classList.toggle('active',['accounts','sessions','send'][i]===tab));
+  try{
+    if(tab==='accounts'){
+      const d=await api('GET','/kf/accounts');
+      const list=d.kf_list||[];
+      el.innerHTML=list.length?'<table><tr><th>账号</th><th>昵称</th><th>操作</th></tr>'+list.map(k=>'<tr><td>'+esc(k.kf_account)+'</td><td>'+esc(k.kf_nick)+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteKfAccount(\''+escJs(k.kf_account)+'\')">删除</button></td></tr>').join('')+'</table><br><button class="btn btn-primary btn-sm" onclick="showAddKfForm()">添加客服</button>':'<p>暂无客服账号</p><button class="btn btn-primary btn-sm" onclick="showAddKfForm()">添加客服</button>';
+    }else if(tab==='sessions'){
+      const d=await api('GET','/kf/sessions');
+      el.innerHTML='<h3>等待接入：'+d.waiting.count+'</h3>'+(d.waiting.list.length?'<table><tr><th>用户</th><th>客服</th><th>创建时间</th></tr>'+d.waiting.list.map(s=>'<tr><td>'+esc(s.openid)+'</td><td>'+esc(s.kf_account)+'</td><td>'+fmtDate(s.createtime*1000)+'</td></tr>').join('')+'</table>':'<p>暂无等待会话</p>')+'<h3>在线客服</h3>'+(d.online_kf.length?'<table><tr><th>账号</th><th>接入数</th></tr>'+d.online_kf.map(k=>'<tr><td>'+esc(k.kf_account)+'</td><td>'+k.accepted_case+'</td></tr>').join('')+'</table>':'<p>暂无在线客服</p>');
+    }else{
+      el.innerHTML='<div class="form-grid"><div class="field"><label>用户 OpenID</label><input id="kf-touser" placeholder="输入用户OpenID"></div><div class="field"><label>消息类型</label><select id="kf-msgtype"><option value="text">文本</option><option value="image">图片</option><option value="voice">语音</option></select></div><div class="field"><label>内容/MediaID</label><textarea id="kf-content" rows="3" placeholder="文本消息输入内容，其他类型输入 media_id"></textarea></div><button class="btn btn-primary" onclick="sendKfMessage()">发送</button></div>';
+    }
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+function showAddKfForm(){showModal('<h2>添加客服账号</h2><div class="field"><label>账号</label><input id="kf-new-account" placeholder="账号@微信号"></div><div class="field"><label>昵称</label><input id="kf-new-nick" placeholder="客服昵称"></div><button class="btn btn-primary" onclick="addKfAccount()">添加</button>')}
+async function addKfAccount(){const a=document.getElementById('kf-new-account').value.trim();const n=document.getElementById('kf-new-nick').value.trim();if(!a||!n)return;await api('POST','/kf/accounts',{kf_account:a,nickname:n});closeModal();showKfTab('accounts')}
+async function deleteKfAccount(a){if(!confirm('确认删除客服 '+a+'？'))return;await api('DELETE','/kf/accounts/'+encodeURIComponent(a));showKfTab('accounts')}
+async function sendKfMessage(){const t=document.getElementById('kf-touser').value.trim();const mt=document.getElementById('kf-msgtype').value;const c=document.getElementById('kf-content').value.trim();if(!t||!c)return;const body={touser:t,msgtype:mt};if(mt==='text')body.content=c;else body.media_id=c;await api('POST','/kf/message',body);alert('发送成功')}
+
+/* ── v2.8 草稿/发布 ── */
+async function showDraftTab(tab){
+  const el=document.getElementById('draft-content');
+  document.querySelectorAll('#page-drafts .tab').forEach((t,i)=>t.classList.toggle('active',['list','create','autoreply'][i]===tab));
+  try{
+    if(tab==='list'){
+      const d=await api('POST','/draft/list',{offset:0,count:20,no_content:1});
+      const items=d.item||[];
+      el.innerHTML='<p>共 '+d.total_count+' 篇草稿</p>'+(items.length?'<table><tr><th>MediaID</th><th>更新时间</th><th>操作</th></tr>'+items.map(it=>'<tr><td>'+esc(it.media_id)+'</td><td>'+fmtDate(it.update_time*1000)+'</td><td><button class="btn btn-primary btn-sm" onclick="publishDraft(\''+escJs(it.media_id)+'\')">发布</button> <button class="btn btn-danger btn-sm" onclick="deleteDraft(\''+escJs(it.media_id)+'\')">删除</button></td></tr>').join('')+'</table>':'<p>暂无草稿</p>');
+    }else if(tab==='create'){
+      el.innerHTML='<div class="form-grid"><div class="field"><label>标题</label><input id="draft-title" placeholder="文章标题" maxlength="64"></div><div class="field"><label>封面 MediaID</label><input id="draft-thumb" placeholder="封面图片素材 ID"></div><div class="field"><label>内容 (HTML)</label><textarea id="draft-body" rows="6" placeholder="文章正文 HTML"></textarea></div><div class="field"><label>摘要</label><input id="draft-digest" placeholder="文章摘要（可选）"></div><button class="btn btn-primary" onclick="createDraft()">保存草稿</button></div>';
+    }else{
+      const d=await api('GET','/autoreply');
+      el.innerHTML='<h3>当前自动回复规则</h3><pre style="background:var(--card);padding:16px;border-radius:8px;overflow:auto;max-height:500px">'+esc(JSON.stringify(d.autoreply_info,null,2))+'</pre>';
+    }
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+async function createDraft(){const t=document.getElementById('draft-title').value.trim();const th=document.getElementById('draft-thumb').value.trim();const b=document.getElementById('draft-body').value.trim();const dg=document.getElementById('draft-digest').value.trim();if(!t||!th||!b)return alert('请填写标题、封面和内容');const art={title:t,thumb_media_id:th,content:b};if(dg)art.digest=dg;await api('POST','/draft',{articles:[art]});alert('草稿已保存');showDraftTab('list')}
+async function publishDraft(id){if(!confirm('确认发布此草稿？'))return;await api('POST','/publish',{media_id:id});alert('已提交发布');showDraftTab('list')}
+async function deleteDraft(id){if(!confirm('确认删除此草稿？'))return;await api('DELETE','/draft/'+encodeURIComponent(id));showDraftTab('list')}
+
+/* ── v2.8 评论管理 ── */
+async function showCommentTab(tab){
+  const el=document.getElementById('comment-content');
+  document.querySelectorAll('#page-comments .tab').forEach((t,i)=>t.classList.toggle('active',['list','reply'][i]===tab));
+  try{
+    if(tab==='list'){
+      el.innerHTML='<div class="form-grid"><div class="field"><label>文章 DataID</label><input id="comment-dataid" placeholder="msg_data_id"></div><button class="btn btn-primary" onclick="loadComments()">查询评论</button></div><div id="comment-list"></div>';
+    }else{
+      el.innerHTML='<div class="form-grid"><div class="field"><label>文章 DataID</label><input id="reply-dataid" placeholder="msg_data_id"></div><div class="field"><label>评论 ID</label><input id="reply-commentid" placeholder="user_comment_id"></div><div class="field"><label>回复内容</label><textarea id="reply-content" rows="3" maxlength="512"></textarea></div><button class="btn btn-primary" onclick="replyComment()">回复</button></div>';
+    }
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+async function loadComments(){const id=document.getElementById('comment-dataid').value.trim();if(!id)return;const d=await api('POST','/comment/list',{msg_data_id:id,count:50});const el=document.getElementById('comment-list');const list=d.comment||[];el.innerHTML='<p>共 '+d.total+' 条评论</p>'+(list.length?'<table><tr><th>用户</th><th>内容</th><th>时间</th><th>操作</th></tr>'+list.map(c=>'<tr><td>'+esc(c.openid)+'</td><td>'+esc(c.content)+'</td><td>'+fmtDate(c.create_time*1000)+'</td><td><button class="btn btn-danger btn-sm" onclick="deleteComment(\''+escJs(id)+'\','+c.user_comment_id+')">删除</button></td></tr>').join('')+'</table>':'<p>暂无评论</p>')}
+async function replyComment(){const d=document.getElementById('reply-dataid').value.trim();const c=document.getElementById('reply-commentid').value.trim();const t=document.getElementById('reply-content').value.trim();if(!d||!c||!t)return alert('请填写所有字段');await api('POST','/comment/reply',{msg_data_id:d,user_comment_id:parseInt(c),content:t});alert('回复成功')}
+async function deleteComment(did,cid){if(!confirm('确认删除评论？'))return;await api('POST','/comment/delete',{msg_data_id:did,user_comment_id:cid});loadComments()}
+
+/* ── v2.8 订阅消息 ── */
+async function showSubscribeTab(tab){
+  const el=document.getElementById('subscribe-content');
+  document.querySelectorAll('#page-subscribe .tab').forEach((t,i)=>t.classList.toggle('active',['templates','send'][i]===tab));
+  try{
+    if(tab==='templates'){
+      const d=await api('GET','/subscribe/templates');
+      const list=d.templates||[];
+      el.innerHTML=list.length?'<table><tr><th>模板ID</th><th>标题</th><th>类型</th></tr>'+list.map(t=>'<tr><td>'+esc(t.priTmplId)+'</td><td>'+esc(t.title)+'</td><td>'+esc(t.type)+'</td></tr>').join('')+'</table>':'<p>暂无订阅模板</p>';
+    }else{
+      el.innerHTML='<div class="form-grid"><div class="field"><label>用户 OpenID</label><input id="sub-touser" placeholder="openid"></div><div class="field"><label>模板 ID</label><input id="sub-tplid" placeholder="template_id"></div><div class="field"><label>模板数据 (JSON)</label><textarea id="sub-data" rows="4" placeholder=\'{"key1":{"value":"val1"},"key2":{"value":"val2"}}\'></textarea></div><div class="field"><label>跳转页面 (可选)</label><input id="sub-page" placeholder="/pages/index"></div><button class="btn btn-primary" onclick="sendSubscribeMsg()">发送</button></div>';
+    }
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+async function sendSubscribeMsg(){const t=document.getElementById('sub-touser').value.trim();const tpl=document.getElementById('sub-tplid').value.trim();const dStr=document.getElementById('sub-data').value.trim();const p=document.getElementById('sub-page').value.trim();if(!t||!tpl||!dStr)return alert('请填写用户、模板和数据');let data;try{data=JSON.parse(dStr)}catch(e){return alert('数据格式错误，请输入有效 JSON')}const body={touser:t,template_id:tpl,data:data};if(p)body.page=p;await api('POST','/subscribe/send',body);alert('发送成功')}
+
+/* ── v2.8 个性化菜单 ── */
+async function showCondMenuTab(tab){
+  const el=document.getElementById('condmenu-content');
+  document.querySelectorAll('#page-condmenu .tab').forEach((t,i)=>t.classList.toggle('active',['list','create','test'][i]===tab));
+  try{
+    if(tab==='list'){
+      const d=await api('GET','/menu');
+      el.innerHTML='<h3>当前菜单配置</h3><pre style="background:var(--card);padding:16px;border-radius:8px;overflow:auto;max-height:500px">'+esc(JSON.stringify(d,null,2))+'</pre>';
+    }else if(tab==='create'){
+      el.innerHTML='<div class="form-grid"><div class="field"><label>菜单 JSON</label><textarea id="cond-menu-json" rows="8" placeholder=\'{"button":[...],"matchrule":{"tag_id":"2"}}\'></textarea></div><button class="btn btn-primary" onclick="createCondMenu()">创建个性化菜单</button></div>';
+    }else{
+      el.innerHTML='<div class="form-grid"><div class="field"><label>用户 OpenID</label><input id="cond-test-user" placeholder="输入用户 OpenID"></div><button class="btn btn-primary" onclick="testMenuMatch()">测试匹配</button></div><div id="cond-test-result"></div>';
+    }
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+async function createCondMenu(){const s=document.getElementById('cond-menu-json').value.trim();if(!s)return;let j;try{j=JSON.parse(s)}catch(e){return alert('JSON 格式错误')}await api('POST','/menu/conditional',j);alert('创建成功');showCondMenuTab('list')}
+async function testMenuMatch(){const u=document.getElementById('cond-test-user').value.trim();if(!u)return;const d=await api('POST','/menu/trymatch',{user_id:u});document.getElementById('cond-test-result').innerHTML='<pre style="background:var(--card);padding:16px;border-radius:8px;overflow:auto">'+esc(JSON.stringify(d.menu,null,2))+'</pre>'}
 </script>
 </body>
 </html>
