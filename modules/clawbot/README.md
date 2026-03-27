@@ -1,4 +1,4 @@
-# 微信 ClawBot 插件灵枢接入通道 v1.7
+# 微信 ClawBot 插件灵枢接入通道 v1.8
 
 ## 概述
 
@@ -12,7 +12,17 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v1.7 新特性
+## v1.8 新特性
+
+- **PostgreSQL 审计日志持久化**：所有审计事件持久化写入 clawbot_audit_log 表（与 Redis/Winston 日志并行），确保审计记录不可丢失（PCI-DSS 10.2 增强）
+- **PostgreSQL 用户记录持久化**：用户 bind/unbind/block/unblock 操作同步写入 clawbot_users 表，Redis 仍为 L1 实时状态层（企业级用户管理）
+- **登录锁定**：/bind 连续失败达到阈值（默认 6 次）后锁定指定时长（默认 30 分钟），防止暴力绑定（PCI-DSS 8.1.6）
+- **空闲会话超时**：可配置空闲会话超时（默认 15 分钟），超过空闲时间的会话自动清除上下文（PCI-DSS 8.1.8）
+- **审计日志查询端点**：新增 GET /clawbot/audit 管理端点，支持按 openId/action/时间范围查询审计记录，分页返回（PCI-DSS 10.2 合规报告）
+- **审计日志保留策略**：可配置保留天数（默认 365 天），定时自动清理超过保留期的审计记录（PCI-DSS 10.7）
+- **管理端点用户搜索**：GET /clawbot/users 支持 search 查询参数按邮箱/昵称模糊搜索，支持 status 参数筛选活跃/封禁用户（企业级运维增强）
+
+## v1.7 新特性（历史版本）
 
 - **Redis 会话持久化**：会话上下文由内存迁移至 Redis 双层缓存（L1 内存 + L2 Redis），容器重启后会话不丢失（企业级可靠性）
 - **管理员封禁/解封用户**：POST/DELETE `/clawbot/users/:openId/block` 端点，管理员可封禁/解封用户（CIS 访问控制），封禁操作记录审计日志
@@ -89,6 +99,12 @@
 - **Content-Type 强制校验**：管理端点 POST/PUT/PATCH 强制 application/json（CIS）
 - **CORS & Cache-Control 安全头**：Helmet CORS 策略 + Cache-Control: no-store（CIS 14.x）
 - **结构化审计日志**：认证/管理/速率限制操作统一 audit 事件格式（PCI-DSS 10.2）
+- **PostgreSQL 审计日志持久化**：所有审计事件持久化写入 clawbot_audit_log 表，不可丢失（PCI-DSS 10.2 增强）
+- **PostgreSQL 用户记录持久化**：用户绑定/解绑/封禁同步写入 clawbot_users 表（企业级用户管理）
+- **登录锁定**：/bind 连续失败达到阈值后锁定（默认 6 次失败锁定 30 分钟，PCI-DSS 8.1.6）
+- **空闲会话超时**：可配置空闲会话超时（默认 15 分钟，PCI-DSS 8.1.8）
+- **审计日志查询端点**：GET /clawbot/audit 支持合规审计报告查询（PCI-DSS 10.2）
+- **审计日志保留策略**：可配置保留天数（默认 365 天，PCI-DSS 10.7）
 - **管理端点 IP 白名单**：可选 ADMIN_IP_ALLOWLIST 限制管理端点访问来源（CIS 9.x）
 - 管理端点 SERVICE_TOKEN Bearer 认证保护
 - 管理端点速率限制（30/min，CIS）
@@ -209,6 +225,7 @@ docker compose up -d
 | `/clawbot/users` | GET | 列出已认证用户（含昵称、封禁状态） | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/users/:openId/block` | POST | 封禁用户 | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/users/:openId/block` | DELETE | 解封用户 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/audit` | GET | 查询审计日志（按 openId/action/时间范围，分页） | SERVICE_TOKEN + IP白名单 |
 | `/stats` | GET | 运营统计（消息数、会话数、封禁数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
@@ -244,6 +261,7 @@ docker compose up -d
 | `anima:clawbot:blocked` | Set | 被封禁用户 openid 集合 |
 | `anima:clawbot:nicknames` | Hash | openid → 用户昵称 |
 | `anima:clawbot:session:{openId}` | String | JSON 会话数据（TTL=SESSION_TTL） |
+| `anima:clawbot:bind_fail:{openId}` | String | /bind 失败次数（登录锁定，TTL=锁定时长） |
 
 ### 企业微信（WeCom）
 
@@ -258,7 +276,8 @@ docker compose up -d
 ## 依赖
 
 - OpenClaw Agent（核心模块，AI 推理 + 工具调用）
-- Redis（会话缓存 + 用户认证 + 邮箱绑定）
+- Redis（会话缓存 + 用户认证 + 邮箱绑定 + 登录锁定）
+- PostgreSQL（审计日志持久化 + 用户记录持久化，可选但强烈推荐）
 - Webhook 计费服务（余额查询/计费）
 - Whisper STT（可选，语音转文字）
 - Coqui TTS（可选，文字转语音）

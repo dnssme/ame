@@ -56,8 +56,8 @@ channels:
 
   clawbot:
     enabled: true
-    version: "1.7.0"
-    description: "微信 ClawBot 灵枢接入通道（官方插件接入 + AES 加解密 + 消息去重 + 菜单管理 + 用户管理 + 强制认证 + 用户隔离 + Per-user 速率限制 + 管理端点速率限制 + 用户分页 + 请求追踪贯通 + OpenID 校验 + Content-Type 强制校验 + 结构化审计日志 + CORS/Cache-Control 安全头 + 管理操作审计 + 速率限制审计 + 就绪探针 + IP 白名单 + Redis 会话持久化 + 用户封禁管理 + 数据导出 + 用户资料获取 + 增强菜单事件 + 全功能整合含邮件/云存储/日历/智能家居/搜索/语音/文件分析 + 企业级运维 + PCI-DSS/CIS，含企业微信接口但默认不启用）"
+    version: "1.8.0"
+    description: "微信 ClawBot 灵枢接入通道（官方插件接入 + AES 加解密 + 消息去重 + 菜单管理 + 用户管理 + 强制认证 + 用户隔离 + Per-user 速率限制 + 管理端点速率限制 + 用户分页 + 请求追踪贯通 + OpenID 校验 + Content-Type 强制校验 + 结构化审计日志 + CORS/Cache-Control 安全头 + 管理操作审计 + 速率限制审计 + 就绪探针 + IP 白名单 + Redis 会话持久化 + 用户封禁管理 + 数据导出 + 用户资料获取 + 增强菜单事件 + PostgreSQL 审计日志持久化 + PostgreSQL 用户记录持久化 + 登录锁定 + 空闲会话超时 + 审计日志查询端点 + 审计日志保留策略 + 用户搜索筛选 + 全功能整合含邮件/云存储/日历/智能家居/搜索/语音/文件分析 + 企业级运维 + PCI-DSS/CIS，含企业微信接口但默认不启用）"
     node: VPS-B
     path: ./clawbot/
     depends_on: [agent]
