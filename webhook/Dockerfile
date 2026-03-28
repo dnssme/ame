@@ -1,7 +1,7 @@
 FROM node:20-slim
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev && npm cache clean --force
 COPY server.js ./
 COPY public/ ./public/
 USER node
