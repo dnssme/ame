@@ -1,8 +1,36 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.31
+ * Anima 灵枢 · Webhook 服务 v5.32
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.32 相对于 v5.31）：
+ *
+ *   #FIX-5.32-1  safeRollback ROLLBACK 失败时销毁连接而非放回连接池
+ *                - 原：ROLLBACK 异常被吞掉，finally 块仍调用
+ *                  client.release()，连接以未知事务状态（可能有
+ *                  行锁泄漏）被放回池中，后续请求复用该连接时
+ *                  可能读到脏状态或持有幽灵锁。
+ *                - 修：safeRollback 在 ROLLBACK 失败时设置
+ *                  client.destroyOnRelease = true 标志；所有
+ *                  finally 块改为 client.release(!!client.destroyOnRelease)，
+ *                  触发 pg Pool 销毁该连接而非回收。
+ *
+ *   #FIX-5.32-2  Redis 免费限额新增 fail-closed 模式
+ *                - 原：Redis 不可用时 incrFreeDailyUsage 返回
+ *                  allowed=true（fail-open），攻击者可在 Redis
+ *                  宕机期间无限调用免费模型耗尽上游 API 配额。
+ *                - 修：新增 FREE_LIMIT_REDIS_REQUIRED 环境变量；
+ *                  设为 true 时 Redis 不可用即拒绝免费请求
+ *                  （HTTP 503），默认 false 保持原有 fail-open 行为。
+ *
+ *   #FIX-5.32-3  付费模型幂等冲突解决改用 client 而非 db 池
+ *                - 原：/billing/record 幂等冲突分支在 safeRollback
+ *                  后使用 db.query()（从池获取新连接）查询已有记录。
+ *                  虽然 ROLLBACK 是同步完成的，但使用已回滚的 client
+ *                  （autocommit 模式）语义更清晰、避免额外连接开销、
+ *                  且保证读到 ROLLBACK 后的一致状态。
+ *                - 修：改为 client.query()。
+ *
  * 修复记录（v5.31 相对于 v5.30）：
  *
  *   #FIX-5.31-1  /admin/dashboard 新增 adminLimiter 速率限制
@@ -715,10 +743,18 @@ async function peekFreeDailyUsage(userEmail) {
   }
 }
 
+// FIX-5.32-2: Redis 免费限额 fail-closed 模式——当 Redis 不可用时拒绝免费请求，
+// 防止 Redis 宕机期间无限调用免费模型耗尽上游 API 配额
+const FREE_LIMIT_REDIS_REQUIRED = process.env.FREE_LIMIT_REDIS_REQUIRED === 'true';
+
 async function incrFreeDailyUsage(userEmail) {
   const FREE_DAILY_LIMIT = getFreeDailyLimit();
   try {
     if (redis.status !== 'ready') {
+      if (FREE_LIMIT_REDIS_REQUIRED) {
+        logger.error('Redis unavailable and FREE_LIMIT_REDIS_REQUIRED=true: rejecting free request', { userEmail });
+        return { allowed: false, used: 0, limit: FREE_DAILY_LIMIT, key: null, redisUnavailable: true };
+      }
       logger.warn('Redis unavailable: free daily limit NOT enforced', { userEmail });
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
     }
@@ -727,6 +763,10 @@ async function incrFreeDailyUsage(userEmail) {
     const count = await redis.eval(INCR_EXPIRE_LUA, 1, key, FREE_DAILY_LIMIT);
     return { allowed: count <= FREE_DAILY_LIMIT, used: count, limit: FREE_DAILY_LIMIT, key };
   } catch (err) {
+    if (FREE_LIMIT_REDIS_REQUIRED) {
+      logger.error('Redis daily limit incr failed and FREE_LIMIT_REDIS_REQUIRED=true: rejecting free request', { err: err.message, userEmail });
+      return { allowed: false, used: 0, limit: FREE_DAILY_LIMIT, key: null, redisUnavailable: true };
+    }
     logger.warn('Redis daily limit incr failed, allowing request', { err: err.message });
     return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
   }
@@ -1150,7 +1190,10 @@ async function safeRollback(client, context) {
   try {
     await client.query('ROLLBACK');
   } catch (rollbackErr) {
-    logger.warn('ROLLBACK 失败，可能存在连接泄漏', {
+    // FIX-5.32-1: ROLLBACK 失败时标记连接需销毁，防止以未知事务状态放回连接池
+    // 使用自定义属性（非 pg 内部字段），由 finally 块的 client.release() 读取
+    client.destroyOnRelease = true;
+    logger.warn('ROLLBACK 失败，连接将被销毁以避免状态不一致', {
       context,
       err: rollbackErr.message,
     });
@@ -1349,7 +1392,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
     logger.error('Activation error', { err: err.message, userEmail, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误，请稍后重试' });
   } finally {
-    client.release();
+    client.release(!!client.destroyOnRelease); // FIX-5.32-1
   }
 });
 
@@ -1740,6 +1783,14 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       const dailyCheck = await incrFreeDailyUsage(userEmail);
       if (!dailyCheck.allowed) {
         await safeRollback(client, '/billing/record free daily limit');
+        // FIX-5.32-2: Redis 不可用时返回 503（服务暂不可用），区别于正常限额耗尽的 429
+        if (dailyCheck.redisUnavailable) {
+          return res.status(503).json({
+            success: false, is_free: true,
+            msg: '免费模型限额服务暂时不可用，请稍后重试',
+            balance_fen: freeBalance, is_suspended: false,
+          });
+        }
         return res.status(429).json({
           success: false, is_free: true,
           msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
@@ -1892,10 +1943,11 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     // 并发幂等冲突（付费模型）：回滚已扣费的事务，返回已有记录
     // FIX-5.10-1：查询新增 AND au.user_email = $2，防止跨用户 key 碰撞
+    // FIX-5.32-3：改用 client（ROLLBACK 后处于 autocommit 模式），避免额外池连接开销
     if (usageRes.rows.length === 0 && normalizedIdempKey) {
       await safeRollback(client, '/billing/record idempotency conflict');
       logger.info('Idempotent billing record (conflict resolution)', { idempotencyKey: normalizedIdempKey, userEmail });
-      const existingRes = await db.query(
+      const existingRes = await client.query(
         `SELECT au.charged_fen, au.is_free, ub.balance_fen, ub.is_suspended
            FROM api_usage au
            LEFT JOIN user_billing ub ON ub.user_email = $2
@@ -1952,7 +2004,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     logger.error('Billing record error', { err: err.message, userEmail, request_id: req.id });
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
-    client.release();
+    client.release(!!client.destroyOnRelease); // FIX-5.32-1
   }
 });
 // ─── 管理员接口 ───────────────────────────────────────────────
@@ -2569,7 +2621,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     logger.error('Admin adjust error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
-    client.release();
+    client.release(!!client.destroyOnRelease); // FIX-5.32-1
   }
 });
 
@@ -2810,12 +2862,13 @@ const server = app.listen(PORT, HOST, () => {
   }
   // FIX-5.30-2: SERVICE_TOKEN 缺失已在启动校验阶段拒绝启动，此处无需冗余 warn
   logger.info('运行时配置', {
-    freeDailyLimit:      getFreeDailyLimit(),
-    maxSingleRequestFen: getMaxSingleRequestFen(),
-    usdToCnyRate:        getUsdToCnyRate(),
-    modelCacheTtlSec:    MODEL_CACHE_TTL_MS / 1000,
-    modelCacheMaxSize:   MAX_MODEL_CACHE_SIZE,
-    pgPoolMax:           PG_POOL_MAX,
+    freeDailyLimit:           getFreeDailyLimit(),
+    freeLimitRedisRequired:   FREE_LIMIT_REDIS_REQUIRED, // FIX-5.32-2
+    maxSingleRequestFen:      getMaxSingleRequestFen(),
+    usdToCnyRate:             getUsdToCnyRate(),
+    modelCacheTtlSec:         MODEL_CACHE_TTL_MS / 1000,
+    modelCacheMaxSize:        MAX_MODEL_CACHE_SIZE,
+    pgPoolMax:                PG_POOL_MAX,
   });
 });
 
