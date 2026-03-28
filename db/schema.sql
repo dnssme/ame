@@ -513,6 +513,8 @@ CREATE TABLE IF NOT EXISTS billing_transactions (
     ref_id            VARCHAR(128),
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     -- v5.4: 类型感知 CHECK——charge/recharge/refund 强制正数，admin_adjust 允许正负但禁止零
+    -- 注：admin_adjust 负数扣减时，应用层使用 GREATEST(0, balance_fen + amount) 截断余额，
+    --     实际写入的 amount_fen 是截断后的实际变动值，balance_after_fen 始终 >= 0
     CONSTRAINT chk_billing_txn_amount CHECK (
         (type IN ('charge', 'recharge', 'refund') AND amount_fen > 0)
         OR (type = 'admin_adjust' AND amount_fen != 0)
