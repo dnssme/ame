@@ -18,11 +18,12 @@
 7. [部署 WAF 配置](#7-部署-waf-配置)
 8. [部署 Nginx 反向代理配置](#8-部署-nginx-反向代理配置)
 9. [配置证书自动续期](#9-配置证书自动续期)
-10. [CIS 合规核查清单](#10-cis-合规核查清单)
-11. [PCI-DSS 合规核查清单](#11-pci-dss-合规核查清单)
-12. [功能测试](#12-功能测试)
-13. [日常运维](#13-日常运维)
-14. [故障排查](#14-故障排查)
+10. [配置 auditd 操作审计](#10-配置-auditd-操作审计)
+11. [CIS 合规核查清单](#11-cis-合规核查清单)
+12. [PCI-DSS 合规核查清单](#12-pci-dss-合规核查清单)
+13. [功能测试](#13-功能测试)
+14. [日常运维](#14-日常运维)
+15. [故障排查](#15-故障排查)
 
 ---
 
@@ -529,7 +530,7 @@ crontab -l | grep certbot
 
 ---
 
-## 9.5 配置 auditd 操作审计
+## 10. 配置 auditd 操作审计
 
 ```bash
 # 使用统一审计配置脚本
@@ -542,7 +543,7 @@ auditctl -l | wc -l
 
 ---
 
-## 10. CIS 合规核查清单
+## 11. CIS 合规核查清单
 
 ```bash
 echo "=== CIS 合规核查 ==="
@@ -603,7 +604,7 @@ chronyc tracking &>/dev/null && echo "✅ 通过" || echo "❌ 失败"
 
 ---
 
-## 11. PCI-DSS 合规核查清单
+## 12. PCI-DSS 合规核查清单
 
 ```bash
 echo "=== PCI-DSS 合规核查 ==="
@@ -675,9 +676,9 @@ EXPIRY=$(openssl x509 -noout -enddate \
 
 ---
 
-## 12. 功能测试
+## 13. 功能测试
 
-### 12.1 HTTPS 基础测试
+### 13.1 HTTPS 基础测试
 
 ```bash
 DOMAIN="ai.example.com"
@@ -694,7 +695,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${DOMAIN}/")
 [ "${HTTP_CODE}" = "301" ] && echo "✅ 通过" || echo "❌ 失败 (HTTP ${HTTP_CODE})"
 ```
 
-### 12.2 TLS 配置测试
+### 13.2 TLS 配置测试
 
 ```bash
 # TLS 版本测试（TLSv1.0/1.1 应被拒绝）
@@ -717,7 +718,7 @@ openssl s_client -connect "${DOMAIN}:443" -tls1_3 </dev/null 2>&1 \
   || echo "⚠️  TLSv1.3 不可用（可能由 OpenSSL 版本限制）"
 ```
 
-### 12.3 安全响应头测试（PCI-DSS 6.4.x）
+### 13.3 安全响应头测试（PCI-DSS 6.4.x）
 
 ```bash
 echo "[测试 6] 安全响应头检查:"
@@ -744,7 +745,7 @@ echo "${HEADERS}" | grep -qi 'X-Powered-By' \
   || echo "✅ 通过"
 ```
 
-### 12.4 WAF 功能测试（PCI-DSS 6.4.1/6.4.2）
+### 13.4 WAF 功能测试（PCI-DSS 6.4.1/6.4.2）
 
 ```bash
 echo "[测试 7] WAF 拦截测试（应返回 403）:"
@@ -782,7 +783,7 @@ AUDIT_SIZE=$(wc -c < /www/wwwlogs/owasp/modsec_audit.log 2>/dev/null || echo 0)
   || echo "⚠️  审计日志为空（检查日志路径配置）"
 ```
 
-### 12.5 速率限制测试（PCI-DSS 8.3）
+### 13.5 速率限制测试（PCI-DSS 8.3）
 
 ```bash
 echo -n "[测试 8] 登录接口速率限制: "
@@ -801,7 +802,7 @@ done
 ${BLOCKED} || echo "⚠️  未在 10 次内触发限速（检查 limit_req 配置）"
 ```
 
-### 12.6 反向代理路径测试
+### 13.6 反向代理路径测试
 
 ```bash
 echo "[测试 9] 反向代理路径测试:"
@@ -823,7 +824,7 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" \
   || echo "HTTP ${CODE}（502/504 表示 Webhook 不可达）"
 ```
 
-### 12.7 敏感路径拦截测试
+### 13.7 敏感路径拦截测试
 
 ```bash
 echo "[测试 10] 敏感路径拦截测试（应返回 403/404）:"
@@ -849,7 +850,7 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}/admin/models")
 
 ---
 
-## 13. 日常运维
+## 14. 日常运维
 
 ### Nginx 常用命令
 
@@ -895,7 +896,7 @@ EOF
 
 ---
 
-## 14. 故障排查
+## 15. 故障排查
 
 ### Nginx 配置测试失败
 

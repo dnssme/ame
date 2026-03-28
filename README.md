@@ -365,7 +365,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | **VPS B** (172.16.1.2) | OpenClaw + ClawBot | 2 核 | 1 GB | — | OpenClaw 384m + ClawBot 192m = 576m | ~448 MB 系统 |
 | **VPS C** (172.16.1.3) | LibreChat | 2 核 | 1 GB | — | 容器 ≤680 MB | ~320 MB 系统 |
 | **VPS D** (172.16.1.4) | Nextcloud | 2 核 | 1 GB | — | 容器 ≤512 MB | ~500 MB 系统 |
-| **VPS E** (172.16.1.6) | Webhook + Redis | 2 核 | 1 GB | — | Webhook 256m + Redis 128m | ~640 MB 系统 |
+| **VPS E** (172.16.1.6) | Webhook + Redis | 2 核 | 1 GB | — | Webhook 384m + Redis 128m | ~512 MB 系统 |
 | **CXI4** (172.16.1.5) | Whisper + TTS + Email + HA | 4 核 8 线程 (i7-10610U) | 8 GB | 500 GB SSD | Whisper 2g + TTS 768m + Email 192m + HA 512m ≈ 3.5g | ~4.5 GB 系统 |
 
 > ⚠️ **1 GB 内存 VPS 注意事项**：Linux 内核 + 系统服务约占 200–300 MB，Docker 容器的 `mem_limit` 不能设为 1g（会导致 OOM Kill）。LibreChat 设为 680m、OpenClaw 设为 384m（启用 ClawBot 时）或 450m（独立部署时），均已在 `docker-compose.yml` 中配置。
@@ -1781,7 +1781,7 @@ curl http://172.16.1.6:3002/admin/models \
 | 密钥保护（PCI 3.x） | 不硬编码凭证 | 所有密码/令牌通过环境变量注入；`.env` 权限 600 |
 | 数据完整性（PCI 6.4） | DB 约束防异常数据 | CHECK 约束：余额/充值金额/累计费用均不允许负值/零值 |
 | 容器加固（CIS Docker 5.3） | 最小权限容器 | `cap_drop: ALL` + 选择性 `cap_add`；`no-new-privileges:true`；内存限制（LibreChat 680m / OpenClaw 384m–450m / Nextcloud 512m）；JSON 日志轮替 |
-| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配各节点；CXI4 托管 Whisper（2g）+ TTS（768m）+ Email（192m）+ HA（512m），合计 ≈ 3.5g / 8 GB；VPS E 托管 Webhook（256m）+ Redis（128m）；VPS D 托管 Nextcloud（512m）；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
+| 资源管理（CIS 4, PCI 6.4） | 防止资源耗尽 | Docker 容器内存限制适配各节点；CXI4 托管 Whisper（2g）+ TTS（768m）+ Email（192m）+ HA（512m），合计 ≈ 3.5g / 8 GB；VPS E 托管 Webhook（384m）+ Redis（128m）；VPS D 托管 Nextcloud（512m）；Nginx `worker_processes auto`；ModSecurity `SecPcreMatchLimit` 防 ReDoS |
 | 纵深防御（CIS 12, PCI 1.x） | 多层访问控制 | UFW 防火墙 → Nginx 限速/路径拦截 → ModSecurity WAF → 应用层校验 → DB 约束（五层纵深防御） |
 
 ### WAF 性能优化措施
