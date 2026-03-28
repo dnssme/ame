@@ -11,8 +11,8 @@
  *                  行锁泄漏）被放回池中，后续请求复用该连接时
  *                  可能读到脏状态或持有幽灵锁。
  *                - 修：safeRollback 在 ROLLBACK 失败时设置
- *                  client._destroyOnRelease = true 标志；所有
- *                  finally 块改为 client.release(!!client._destroyOnRelease)，
+ *                  client.destroyOnRelease = true 标志；所有
+ *                  finally 块改为 client.release(!!client.destroyOnRelease)，
  *                  触发 pg Pool 销毁该连接而非回收。
  *
  *   #FIX-5.32-2  Redis 免费限额新增 fail-closed 模式
@@ -753,7 +753,7 @@ async function incrFreeDailyUsage(userEmail) {
     if (redis.status !== 'ready') {
       if (FREE_LIMIT_REDIS_REQUIRED) {
         logger.error('Redis unavailable and FREE_LIMIT_REDIS_REQUIRED=true: rejecting free request', { userEmail });
-        return { allowed: false, used: FREE_DAILY_LIMIT, limit: FREE_DAILY_LIMIT, key: null };
+        return { allowed: false, used: 0, limit: FREE_DAILY_LIMIT, key: null, redisUnavailable: true };
       }
       logger.warn('Redis unavailable: free daily limit NOT enforced', { userEmail });
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
@@ -765,7 +765,7 @@ async function incrFreeDailyUsage(userEmail) {
   } catch (err) {
     if (FREE_LIMIT_REDIS_REQUIRED) {
       logger.error('Redis daily limit incr failed and FREE_LIMIT_REDIS_REQUIRED=true: rejecting free request', { err: err.message, userEmail });
-      return { allowed: false, used: FREE_DAILY_LIMIT, limit: FREE_DAILY_LIMIT, key: null };
+      return { allowed: false, used: 0, limit: FREE_DAILY_LIMIT, key: null, redisUnavailable: true };
     }
     logger.warn('Redis daily limit incr failed, allowing request', { err: err.message });
     return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT, key: null };
@@ -1191,7 +1191,8 @@ async function safeRollback(client, context) {
     await client.query('ROLLBACK');
   } catch (rollbackErr) {
     // FIX-5.32-1: ROLLBACK 失败时标记连接需销毁，防止以未知事务状态放回连接池
-    client._destroyOnRelease = true;
+    // 使用自定义属性（非 pg 内部字段），由 finally 块的 client.release() 读取
+    client.destroyOnRelease = true;
     logger.warn('ROLLBACK 失败，连接将被销毁以避免状态不一致', {
       context,
       err: rollbackErr.message,
@@ -1391,7 +1392,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
     logger.error('Activation error', { err: err.message, userEmail, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误，请稍后重试' });
   } finally {
-    client.release(!!client._destroyOnRelease); // FIX-5.32-1
+    client.release(!!client.destroyOnRelease); // FIX-5.32-1
   }
 });
 
@@ -1782,6 +1783,14 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       const dailyCheck = await incrFreeDailyUsage(userEmail);
       if (!dailyCheck.allowed) {
         await safeRollback(client, '/billing/record free daily limit');
+        // FIX-5.32-2: Redis 不可用时返回 503（服务暂不可用），区别于正常限额耗尽的 429
+        if (dailyCheck.redisUnavailable) {
+          return res.status(503).json({
+            success: false, is_free: true,
+            msg: '免费模型限额服务暂时不可用，请稍后重试',
+            balance_fen: freeBalance, is_suspended: false,
+          });
+        }
         return res.status(429).json({
           success: false, is_free: true,
           msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used - 1} 次。充值后可无限使用。`,
@@ -1995,7 +2004,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     logger.error('Billing record error', { err: err.message, userEmail, request_id: req.id });
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
-    client.release(!!client._destroyOnRelease); // FIX-5.32-1
+    client.release(!!client.destroyOnRelease); // FIX-5.32-1
   }
 });
 // ─── 管理员接口 ───────────────────────────────────────────────
@@ -2612,7 +2621,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     logger.error('Admin adjust error', { err: err.message });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
-    client.release(!!client._destroyOnRelease); // FIX-5.32-1
+    client.release(!!client.destroyOnRelease); // FIX-5.32-1
   }
 });
 
