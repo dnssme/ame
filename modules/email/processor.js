@@ -225,7 +225,7 @@ async function sendEmail(to, subject, text) {
 // ─── 定时轮询 ────────────────────────────────────────────────
 logger.info(`邮件处理模块启动，检查间隔 ${CHECK_INTERVAL / 1000}s`);
 
-checkNewEmails();
+checkNewEmails().catch((err) => logger.error('初始邮件检查失败', { err: err.message }));
 
 const timer = setInterval(checkNewEmails, CHECK_INTERVAL);
 

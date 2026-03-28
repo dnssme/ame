@@ -291,7 +291,7 @@ bot.command('bind', async (ctx) => {
   }
   await setUserEmail(ctx.from.id, email);
   logger.info('用户绑定邮箱', { userId: ctx.from.id, email });
-  ctx.reply(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
+  await ctx.reply(`✅ 已绑定计费邮箱：${email}\n后续 AI 对话将归入该账户计费。`);
 });
 
 bot.command('model', async (ctx) => {
@@ -304,7 +304,7 @@ bot.command('model', async (ctx) => {
     return ctx.reply('❌ 模型名称过长（最多 128 字符）');
   }
   await setUserModel(ctx.from.id, model);
-  ctx.reply(`✅ 已切换到模型：${model}`);
+  await ctx.reply(`✅ 已切换到模型：${model}`);
 });
 
 bot.command('balance', async (ctx) => {
@@ -343,9 +343,9 @@ bot.command('balance', async (ctx) => {
   }
 });
 
-bot.command('clear', (ctx) => {
+bot.command('clear', async (ctx) => {
   sessions.delete(ctx.from.id);
-  ctx.reply('🗑 对话上下文已清除。');
+  await ctx.reply('🗑 对话上下文已清除。');
 });
 
 bot.on('text', async (ctx) => {

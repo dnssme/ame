@@ -2766,7 +2766,7 @@ async function dbQueryAuditTrail({ openId, action, startDate, endDate, page, pag
     if (startDate) { query += ` AND created_at >= $${idx++}`; params.push(startDate); }
     if (endDate) { query += ` AND created_at <= $${idx++}`; params.push(endDate); }
     const countResult = await pgPool.query(query.replace('SELECT *', 'SELECT COUNT(*)'), params);
-    const total = parseInt(countResult.rows[0].count, 10);
+    const total = countResult.rows.length > 0 ? parseInt(countResult.rows[0].count, 10) : 0;
     query += ` ORDER BY created_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
     params.push(limit, offset);
     const result = await pgPool.query(query, params);
@@ -2822,8 +2822,8 @@ async function requireAuthSession(req, res, next) {
 
   // 未认证 — 记录并拒绝
   stats.authEnforcementBlocked++;
-  dbAuditLog({ openId: 'anonymous', action: 'auth_enforcement_blocked', detail: `${req.method} ${req.path}`, ip: req.ip });
-  dbLogAuthEnforcement({ endpoint: req.path, method: req.method, authResult: 'blocked', ipAddress: req.ip, userAgent: req.headers['user-agent'] });
+  await dbAuditLog({ openId: 'anonymous', action: 'auth_enforcement_blocked', detail: `${req.method} ${req.path}`, ip: req.ip });
+  await dbLogAuthEnforcement({ endpoint: req.path, method: req.method, authResult: 'blocked', ipAddress: req.ip, userAgent: req.headers['user-agent'] });
   res.status(401).json({
     success: false,
     msg: '所有功能需要登录后使用。请先登录获取认证令牌。',
@@ -2857,7 +2857,7 @@ async function dbLogAuthEnforcement({ openId, endpoint, method, authResult, auth
 /**
  * 每请求租户隔离校验 — 确保跨租户数据无法访问（PCI-DSS 7.1 / CIS 4.6）。
  */
-function enforceRequestIsolation(requestorId, requestorTenant, targetTenant, resourceType, resourceId) {
+async function enforceRequestIsolation(requestorId, requestorTenant, targetTenant, resourceType, resourceId) {
   if (!requestorId) return false;
   // 管理员可跨租户
   if (requestorId === 'admin' || requestorId === 'system') return true;
@@ -2873,12 +2873,12 @@ function enforceRequestIsolation(requestorId, requestorTenant, targetTenant, res
     resource_type: resourceType,
     resource_id: resourceId,
   });
-  dbAuditLog({
+  await dbAuditLog({
     openId: requestorId,
     action: 'isolation_violation',
     detail: `From: ${requestorTenant} → To: ${targetTenant}, Resource: ${resourceType}/${resourceId}`,
   });
-  dbLogIsolationAudit({
+  await dbLogIsolationAudit({
     requestorId, requestorTenant, targetTenant,
     resourceType, resourceId, action: 'access', result: 'denied',
   });
@@ -6901,7 +6901,7 @@ app.get('/clawbot/audit', adminLimiter, requireAdminIp, requireServiceToken, asy
       `SELECT COUNT(*) as total FROM clawbot_audit_log ${where}`,
       params
     );
-    const total = parseInt(countResult.rows[0].total, 10);
+    const total = countResult.rows.length > 0 ? parseInt(countResult.rows[0].total, 10) : 0;
 
     const dataResult = await pgPool.query(
       `SELECT id, open_id, channel, action, detail, ip, request_id, created_at
@@ -8313,7 +8313,7 @@ app.get('/clawbot/plugin/health', adminLimiter, requireAdminIp, requireServiceTo
       checks.postgresql = {
         status: 'healthy',
         latency_ms: Date.now() - dbStart,
-        recent_audit_events: parseInt(result.rows[0].cnt, 10),
+        recent_audit_events: result.rows.length > 0 ? parseInt(result.rows[0].cnt, 10) : 0,
         pool_total: pgPool.totalCount,
         pool_idle: pgPool.idleCount,
         pool_waiting: pgPool.waitingCount,
@@ -10269,7 +10269,7 @@ app.post('/clawbot/auth/login', adminLimiter, async (req, res) => {
 
   stats.authLoginSuccess++;
   await trackUsage(null, 'auth_logins', 1);
-  dbAuditLog({ openId: open_id, action: 'auth_login_success', detail: `platform=${detectedPlatform}` });
+  await dbAuditLog({ openId: open_id, action: 'auth_login_success', detail: `platform=${detectedPlatform}` });
 
   res.json({
     success: true,
@@ -11025,13 +11025,16 @@ app.post('/clawbot/portal/dispatch', adminLimiter, async (req, res) => {
   }
 
   // 记录计费
-  await dbSaveBillingRecord({
+  const billingRecord = await dbSaveBillingRecord({
     tenantId: 'default', openId: session.open_id, featureId: feature_id,
     action: action || 'invoke', quantity: 1, unitCost: 0, totalCost: 0,
   });
+  if (!billingRecord) {
+    logger.warn('计费记录写入失败', { feature_id, openId: session.open_id });
+  }
 
   stats.portalDispatches++;
-  dbAuditLog({ openId: session.open_id, action: 'portal_dispatch', detail: `Feature: ${feature_id}, Action: ${action || 'default'}` });
+  await dbAuditLog({ openId: session.open_id, action: 'portal_dispatch', detail: `Feature: ${feature_id}, Action: ${action || 'default'}` });
 
   res.json({
     success: true,
@@ -11110,10 +11113,16 @@ app.get('/clawbot/ops/billing', adminLimiter, requireAdminIp, requireServiceToke
       records = result.rows;
       summary.total_records = records.length;
       for (const r of records) {
-        summary.total_cost += parseFloat(r.total_cost || 0);
+        const cost = Math.round(parseFloat(r.total_cost || 0) * 100);
+        summary.total_cost += cost;
         if (!summary.by_feature[r.feature_id]) summary.by_feature[r.feature_id] = { count: 0, cost: 0 };
         summary.by_feature[r.feature_id].count++;
-        summary.by_feature[r.feature_id].cost += parseFloat(r.total_cost || 0);
+        summary.by_feature[r.feature_id].cost += cost;
+      }
+      // 将累加的整数分转换回元
+      summary.total_cost = summary.total_cost / 100;
+      for (const key of Object.keys(summary.by_feature)) {
+        summary.by_feature[key].cost = summary.by_feature[key].cost / 100;
       }
     } catch (err) {
       logger.error('查询计费记录失败', { err: err.message, targetTenant });
