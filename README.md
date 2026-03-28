@@ -71,6 +71,12 @@
 ```
 modules/
 ├── modules.yml              # 中央模块注册表（启用/禁用控制）
+├── clawbot/                 # ClawBot 微信/企业微信接入通道 (v3.2)
+│   ├── bot.js               # ClawBot 主程序
+│   ├── admin.html           # Web 管理后台
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── README.md
 ├── wechat/                  # 微信接入
 │   ├── bot.js               # Wechaty Bot 主程序
 │   ├── docker-compose.yml
@@ -83,6 +89,10 @@ modules/
 │   └── README.md
 ├── email/                   # 邮件处理
 │   ├── processor.js         # IMAP/SMTP 处理器
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   └── README.md
+├── nextcloud/               # Nextcloud 基础设施（CalDAV + WebDAV 底层）
 │   ├── docker-compose.yml
 │   ├── .env.example
 │   └── README.md
@@ -287,16 +297,18 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   └── migrations/          # 增量迁移（001-020: ClawBot 扩展表等 31 张）
 ├── webhook/
 │   ├── package.json         # Node.js 依赖
-│   └── server.js            # Webhook 计费服务（11 个接口）
+│   └── server.js            # Webhook 计费服务（24 个接口）
 ├── nginx/
 │   ├── anima.conf           # Nginx 反向代理 + WAF 配置
 │   └── modsecurity/         # ModSecurity + OWASP CRS 规则
+│       ├── main.conf                                   # WAF 入口配置（Include CRS 规则链）
 │       ├── modsecurity.conf                            # ModSecurity 引擎配置
 │       ├── crs-setup.conf                              # OWASP CRS 调优（异常评分阈值等）
 │       ├── REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf # 应用专属排除规则（CRS 前）
 │       └── RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf # 响应排除规则（CRS 后）
 ├── librechat/
 │   ├── .env.example         # LibreChat 环境变量模板
+│   ├── librechat.yaml       # LibreChat 配置文件（模型/功能开关）
 │   └── docker-compose.yml   # LibreChat Docker Compose
 ├── openclaw/
 │   ├── .env.example         # OpenClaw 环境变量模板
@@ -304,6 +316,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 │   └── docker-compose.yml   # OpenClaw Docker Compose
 ├── modules/                 # 功能模块（按需启用）
 │   ├── modules.yml          # 中央模块注册表
+│   ├── clawbot/             # ClawBot 微信/企业微信接入通道 (v3.2)
 │   ├── wechat/              # 微信接入
 │   ├── telegram/            # Telegram 接入
 │   ├── email/               # 邮件处理
