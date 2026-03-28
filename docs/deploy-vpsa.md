@@ -678,7 +678,7 @@ EXPIRY=$(openssl x509 -noout -enddate \
 
 ## 13. 功能测试
 
-### 12.1 HTTPS 基础测试
+### 13.1 HTTPS 基础测试
 
 ```bash
 DOMAIN="ai.example.com"
@@ -695,7 +695,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${DOMAIN}/")
 [ "${HTTP_CODE}" = "301" ] && echo "✅ 通过" || echo "❌ 失败 (HTTP ${HTTP_CODE})"
 ```
 
-### 12.2 TLS 配置测试
+### 13.2 TLS 配置测试
 
 ```bash
 # TLS 版本测试（TLSv1.0/1.1 应被拒绝）
@@ -718,7 +718,7 @@ openssl s_client -connect "${DOMAIN}:443" -tls1_3 </dev/null 2>&1 \
   || echo "⚠️  TLSv1.3 不可用（可能由 OpenSSL 版本限制）"
 ```
 
-### 12.3 安全响应头测试（PCI-DSS 6.4.x）
+### 13.3 安全响应头测试（PCI-DSS 6.4.x）
 
 ```bash
 echo "[测试 6] 安全响应头检查:"
@@ -745,7 +745,7 @@ echo "${HEADERS}" | grep -qi 'X-Powered-By' \
   || echo "✅ 通过"
 ```
 
-### 12.4 WAF 功能测试（PCI-DSS 6.4.1/6.4.2）
+### 13.4 WAF 功能测试（PCI-DSS 6.4.1/6.4.2）
 
 ```bash
 echo "[测试 7] WAF 拦截测试（应返回 403）:"
@@ -783,7 +783,7 @@ AUDIT_SIZE=$(wc -c < /www/wwwlogs/owasp/modsec_audit.log 2>/dev/null || echo 0)
   || echo "⚠️  审计日志为空（检查日志路径配置）"
 ```
 
-### 12.5 速率限制测试（PCI-DSS 8.3）
+### 13.5 速率限制测试（PCI-DSS 8.3）
 
 ```bash
 echo -n "[测试 8] 登录接口速率限制: "
@@ -802,7 +802,7 @@ done
 ${BLOCKED} || echo "⚠️  未在 10 次内触发限速（检查 limit_req 配置）"
 ```
 
-### 12.6 反向代理路径测试
+### 13.6 反向代理路径测试
 
 ```bash
 echo "[测试 9] 反向代理路径测试:"
@@ -824,7 +824,7 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" \
   || echo "HTTP ${CODE}（502/504 表示 Webhook 不可达）"
 ```
 
-### 12.7 敏感路径拦截测试
+### 13.7 敏感路径拦截测试
 
 ```bash
 echo "[测试 10] 敏感路径拦截测试（应返回 403/404）:"

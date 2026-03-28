@@ -16,11 +16,12 @@
 5. [安装 Docker](#5-安装-docker)
 6. [部署 OpenClaw](#6-部署-openclaw)
 7. [可选：部署微信/Telegram 模块](#7-可选部署微信telegram-模块)
-8. [CIS 合规核查清单](#8-cis-合规核查清单)
-9. [PCI-DSS 合规核查清单](#9-pci-dss-合规核查清单)
-10. [功能测试](#10-功能测试)
-11. [日常运维](#11-日常运维)
-12. [故障排查](#12-故障排查)
+8. [配置 auditd 操作审计](#8-配置-auditd-操作审计)
+9. [CIS 合规核查清单](#9-cis-合规核查清单)
+10. [PCI-DSS 合规核查清单](#10-pci-dss-合规核查清单)
+11. [功能测试](#11-功能测试)
+12. [日常运维](#12-日常运维)
+13. [故障排查](#13-故障排查)
 
 ---
 
@@ -425,7 +426,7 @@ curl -sf http://172.16.1.2:3001/health
 
 ---
 
-## 7.5 配置 auditd 操作审计
+## 8. 配置 auditd 操作审计
 
 ```bash
 sudo bash /opt/ai/scripts/audit-setup.sh
@@ -434,7 +435,7 @@ systemctl is-active auditd
 
 ---
 
-## 8. CIS 合规核查清单
+## 9. CIS 合规核查清单
 
 ```bash
 echo "=== CIS 合规核查 ==="
@@ -497,7 +498,7 @@ fi
 
 ---
 
-## 9. PCI-DSS 合规核查清单
+## 10. PCI-DSS 合规核查清单
 
 ```bash
 echo "=== PCI-DSS 合规核查 ==="
@@ -544,9 +545,9 @@ grep -q 'webhookUrl.*172.16.1.6:3002' /opt/ai/repo/openclaw/config.yml \
 
 ---
 
-## 10. 功能测试
+## 11. 功能测试
 
-### 10.1 容器健康检查
+### 11.1 容器健康检查
 
 ```bash
 echo "=== OpenClaw 功能测试 ==="
@@ -563,7 +564,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://172.16.1.2:3000/health
 [ "${HTTP_CODE}" = "200" ] && echo "✅ 通过" || echo "❌ 失败 (HTTP ${HTTP_CODE})"
 ```
 
-### 10.2 Webhook 计费接口连通性
+### 11.2 Webhook 计费接口连通性
 
 ```bash
 # 从 VPS B 发起计费请求，验证与 VPS-E 的连通性
@@ -582,7 +583,7 @@ echo "${BILL_RESULT}" | grep -q '"success":true' \
   || echo "❌ 失败 → ${BILL_RESULT}"
 ```
 
-### 10.3 Redis 连通性
+### 11.3 Redis 连通性
 
 ```bash
 echo -n "[测试 4] Redis 连通性（从 VPS B 访问 VPS-E Redis）: "
@@ -592,7 +593,7 @@ redis-cli -h 172.16.1.6 -a "${REDIS_PASS}" ping 2>/dev/null | grep -q 'PONG' \
   || echo "❌ 失败（Redis 不可达或密码错误）"
 ```
 
-### 10.4 AI API 连通性
+### 11.4 AI API 连通性
 
 ```bash
 # 验证 Anthropic API 可访问（需要公网出口）
@@ -611,7 +612,7 @@ else
 fi
 ```
 
-### 10.5 模拟完整 AI 请求测试
+### 11.5 模拟完整 AI 请求测试
 
 ```bash
 # 通过 OpenClaw API 发起实际聊天请求
@@ -628,7 +629,7 @@ echo "${CHAT_RESULT}" | grep -qi 'content\|message\|reply\|assistant' \
   || echo "⚠️  响应: ${CHAT_RESULT:0:300}"
 ```
 
-### 10.6 ClawBot 灵枢测试（如已启用）
+### 11.6 ClawBot 灵枢测试（如已启用）
 
 ```bash
 if docker ps --format '{{.Names}}' | grep -q 'anima-clawbot'; then
@@ -638,7 +639,7 @@ if docker ps --format '{{.Names}}' | grep -q 'anima-clawbot'; then
 fi
 ```
 
-### 10.7 Telegram Bot 测试（如已启用）
+### 11.7 Telegram Bot 测试（如已启用）
 
 ```bash
 if docker ps --format '{{.Names}}' | grep -q 'anima-telegram'; then
@@ -648,7 +649,7 @@ if docker ps --format '{{.Names}}' | grep -q 'anima-telegram'; then
 fi
 ```
 
-### 10.8 微信 Bot 测试（如已启用）
+### 11.8 微信 Bot 测试（如已启用）
 
 ```bash
 if docker ps --format '{{.Names}}' | grep -q 'anima-wechat'; then
@@ -660,7 +661,7 @@ fi
 
 ---
 
-## 11. 日常运维
+## 12. 日常运维
 
 ```bash
 # 查看 OpenClaw 状态
@@ -685,7 +686,7 @@ docker image prune -f
 
 ---
 
-## 12. 故障排查
+## 13. 故障排查
 
 ### OpenClaw 启动失败
 
