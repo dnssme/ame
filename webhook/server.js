@@ -2011,6 +2011,12 @@ app.get('/admin/modules', adminLimiter, requireAdmin, async (_req, res) => {
       logger.warn('MODULES_YML_PATH 扩展名不合法', { path: resolvedPath });
       return res.json({ success: true, categories: {} });
     }
+    // FIX-5.32-1: CWE-22 路径遍历防护——限制文件读取范围在项目目录内
+    const allowedBase = path.resolve(path.join(__dirname, '..'));
+    if (!resolvedPath.startsWith(allowedBase + path.sep) && resolvedPath !== allowedBase) {
+      logger.warn('MODULES_YML_PATH 路径遍历检测：路径超出允许范围', { path: resolvedPath, allowedBase });
+      return res.json({ success: true, categories: {} });
+    }
     const content = await fs.promises.readFile(resolvedPath, 'utf8');
     // FIX-5.21-1: CIS 输入校验——使用 FAILSAFE_SCHEMA 阻断 YAML 反序列化攻击
     const parsed = yaml.load(content, { schema: yaml.FAILSAFE_SCHEMA });
