@@ -16,6 +16,9 @@ services:
 
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 100
 
     ports:
       - "172.16.1.5:8082:5002"

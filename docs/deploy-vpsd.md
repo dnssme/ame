@@ -35,6 +35,7 @@
 
 - [ ] Ubuntu 22.04 LTS 全新安装，已完成基础系统更新
 - [ ] 已分配 WireGuard 内网 IP `172.16.1.4`
+- [ ] **VPS E (172.16.1.6) 已部署完成**（Webhook 计费服务 + Redis，所有服务依赖此节点）
 - [ ] **Azure PostgreSQL** 已创建 `nextcloud` 数据库
 - [ ] 已记录以下信息：
   - Azure PostgreSQL `animaapp` 用户密码

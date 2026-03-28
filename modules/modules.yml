@@ -101,6 +101,7 @@ channels:
 
   email:
     enabled: true
+    version: "1.0.0"
     description: "邮件处理（IMAP 收件 + SMTP 发件 + AI 分析）"
     node: CXI4
     path: ./email/
