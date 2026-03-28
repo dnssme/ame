@@ -1,8 +1,16 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.28
+ * Anima 灵枢 · Webhook 服务 v5.29
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.29 相对于 v5.28）：
+ *
+ *   #FIX-5.29-1  ADMIN_TOKEN / SERVICE_TOKEN 最短长度加严至 64 字符
+ *                - 原硬性要求 ≥ 32 字符（128 位），仅 warn < 64 字符。
+ *                  现对齐至 ≥ 64 字符（256 位，即 openssl rand -hex 32
+ *                  的输出长度），不满足则拒绝启动（PCI-DSS 8.2.3 / NIST
+ *                  密钥长度要求）。启动回调中的冗余 < 64 warn 已移除。
+ *
  * 修复记录（v5.28 相对于 v5.27）：
  *
  *   #FIX-5.28-1  企业生产级安全加固（PCI-DSS / CIS 增量）
@@ -2707,15 +2715,15 @@ if (ADMIN_TOKEN && SERVICE_TOKEN && ADMIN_TOKEN === SERVICE_TOKEN) {
   logger.error('ADMIN_TOKEN 与 SERVICE_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
   process.exit(1);
 }
-// FIX-5.28-1: PCI-DSS 8.2.3——ADMIN_TOKEN / SERVICE_TOKEN 最短 32 字符强制校验
-// 32 字符 = 128 位熵（hex 编码 16 字节），满足 PCI-DSS 最低密钥长度要求
-// 原 < 64 字符仅 warn，现 < 32 字符直接拒绝启动
-if (ADMIN_TOKEN && ADMIN_TOKEN.length < 32) {
-  logger.error('ADMIN_TOKEN 过短（< 32 字符），不满足 PCI-DSS 8.2.3 最低密钥长度要求，拒绝启动');
+// FIX-5.28-1 + FIX-5.29-1: PCI-DSS 8.2.3——ADMIN_TOKEN / SERVICE_TOKEN 最短 64 字符强制校验
+// 64 字符 = 256 位熵（hex 编码 32 字节，即 openssl rand -hex 32 的输出），满足 PCI-DSS / NIST 密钥长度要求
+// 原 < 32 字符拒绝启动，现对齐至 < 64 字符拒绝启动
+if (ADMIN_TOKEN && ADMIN_TOKEN.length < 64) {
+  logger.error('ADMIN_TOKEN 过短（< 64 字符 / 256 位），不满足 PCI-DSS 8.2.3 密钥长度要求，请使用 openssl rand -hex 32 生成，拒绝启动');
   process.exit(1);
 }
-if (SERVICE_TOKEN && SERVICE_TOKEN.length < 32) {
-  logger.error('SERVICE_TOKEN 过短（< 32 字符），不满足 PCI-DSS 8.2.3 最低密钥长度要求，拒绝启动');
+if (SERVICE_TOKEN && SERVICE_TOKEN.length < 64) {
+  logger.error('SERVICE_TOKEN 过短（< 64 字符 / 256 位），不满足 PCI-DSS 8.2.3 密钥长度要求，请使用 openssl rand -hex 32 生成，拒绝启动');
   process.exit(1);
 }
 // FIX-5.28-1: PCI-DSS 4.1——检测 NODE_TLS_REJECT_UNAUTHORIZED=0（全局禁用 TLS 证书校验）
@@ -2740,13 +2748,9 @@ const server = app.listen(PORT, HOST, () => {
     .catch((err) => logger.warn('DB 连接池预热失败（首次请求将自动重试）', { err: err.message }));
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
-  } else if (ADMIN_TOKEN.length < 64) {
-    logger.warn('ADMIN_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   if (!SERVICE_TOKEN) {
     logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口将拒绝所有请求（fail-closed）');
-  } else if (SERVICE_TOKEN.length < 64) {
-    logger.warn('SERVICE_TOKEN 过短（< 64 字符），建议执行 openssl rand -hex 32 重新生成');
   }
   logger.info('运行时配置', {
     freeDailyLimit:      getFreeDailyLimit(),
