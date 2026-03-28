@@ -343,7 +343,51 @@ docker compose logs --tail=50 openclaw | grep -v DEBUG
 
 ---
 
-## 7. 可选：部署微信/Telegram 模块
+## 7. 可选：部署 ClawBot / 微信 / Telegram 模块
+
+### 7.0 ClawBot 灵枢接入通道（微信/企业微信 Webhook）
+
+ClawBot 是独立于 OpenClaw 的微信消息接入服务，监听端口 3004，接收微信公众号/企业微信消息并桥接到 OpenClaw API。
+
+> ⚠️ 如果不需要微信公众号对话功能，可跳过此步骤。
+
+```bash
+# 创建 ClawBot 配置文件
+cd /opt/ai/repo/modules/clawbot
+cp .env.example .env
+chmod 600 .env
+vim .env   # 填写微信公众号 AppID、AppSecret、Token、EncodingAESKey 等
+
+# 验证配置
+grep -n '<.*>' .env && echo "⚠️  占位符未填写" || echo "✅ 配置完整"
+```
+
+ClawBot 服务定义在 `openclaw/docker-compose.yml` 中，与 OpenClaw 一起管理：
+
+```bash
+cd /opt/ai/repo/openclaw
+
+# 启动（如 OpenClaw 已运行，会自动添加 clawbot 服务）
+docker compose up -d
+
+# 等待启动
+sleep 15
+docker compose ps
+
+# 健康检查
+curl -sf http://172.16.1.2:3004/health && echo "ClawBot OK" || echo "ClawBot FAIL"
+
+# 查看日志
+docker compose logs --tail=50 clawbot
+```
+
+**预期输出：**
+
+```
+NAME            IMAGE                         SERVICE    STATUS
+openclaw        openclaw/openclaw:latest         ...     Up (healthy)
+anima-clawbot   openclaw-clawbot:latest          ...     Up (healthy)
+```
 
 ### 7.1 Telegram 模块
 

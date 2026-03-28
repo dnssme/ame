@@ -244,6 +244,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 [VPS A] Nginx 反向代理 (172.16.1.1)
     ├─── /              → [VPS C] LibreChat    :3080
     ├─── /api/agent     → [VPS B] OpenClaw     :3000
+    ├─── /clawbot/*     → [VPS B] ClawBot      :3004  （微信/企业微信 Webhook）
     ├─── /activate      → [VPS E] Webhook      :3002
     ├─── /billing/*     → [VPS E] Webhook      :3002
     ├─── /models        → [VPS E] Webhook      :3002
@@ -264,7 +265,9 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
     ├─── (Email 处理)      :3004  （邮件处理模块）
     └─── (Home Assistant)  :8123  （智能家居 Zigbee/WiFi/Matter）
 
-[VPS B] (172.16.1.2) ── 可选模块
+[VPS B] (172.16.1.2) ── OpenClaw + 可选模块
+    ├─── OpenClaw Agent    :3000  （AI Agent 后端）
+    ├─── (ClawBot 灵枢)    :3004  （微信/企业微信接入通道）
     ├─── (微信 Bot)        :3001  （微信接入模块）
     └─── (Telegram Bot)    :3003  （Telegram 接入模块）
 
@@ -280,7 +283,8 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 ```
 .
 ├── db/
-│   └── schema.sql           # PostgreSQL Schema（v5: 按 Token 计费）
+│   ├── schema.sql           # PostgreSQL Schema（v5.4: 核心 6 表 + 预置模型）
+│   └── migrations/          # 增量迁移（001-020: ClawBot 扩展表等 31 张）
 ├── webhook/
 │   ├── package.json         # Node.js 依赖
 │   └── server.js            # Webhook 计费服务（11 个接口）
@@ -358,7 +362,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 | 节点 | 角色 | CPU | 内存 | 存储 | 容器/服务内存 | 系统预留 |
 |------|------|-----|------|------|--------------|---------|
 | **VPS A** (172.16.1.1) | Nginx 反向代理 | 2 核 | 1 GB | — | Nginx ~50 MB | ~950 MB 系统 |
-| **VPS B** (172.16.1.2) | OpenClaw Agent | 2 核 | 1 GB | — | 容器 ≤450 MB | ~400 MB 系统 |
+| **VPS B** (172.16.1.2) | OpenClaw + ClawBot | 2 核 | 1 GB | — | OpenClaw 384m + ClawBot 192m | ~400 MB 系统 |
 | **VPS C** (172.16.1.3) | LibreChat | 2 核 | 1 GB | — | 容器 ≤768 MB | ~256 MB 系统 |
 | **VPS D** (172.16.1.4) | Nextcloud | 2 核 | 1 GB | — | 容器 ≤512 MB | ~500 MB 系统 |
 | **VPS E** (172.16.1.6) | Webhook + Redis | 2 核 | 1 GB | — | Webhook 256m + Redis 128m | ~640 MB 系统 |
@@ -589,7 +593,22 @@ PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
   -d librechat \
   -f /opt/ai/repo/db/schema.sql \
   -v ON_ERROR_STOP=1
+
+# 执行所有数据库迁移（ClawBot 等模块所需的扩展表）
+for f in /opt/ai/repo/db/migrations/*.sql; do
+  echo "▸ 执行迁移: $(basename "$f")"
+  PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
+    --quiet \
+    -h anima-db.postgres.database.azure.com \
+    -U animaapp \
+    -d librechat \
+    -f "$f" \
+    -v ON_ERROR_STOP=1
+done
+echo "✅ 所有迁移执行完成"
 ```
+
+> **注意**：`db/schema.sql` 包含 6 张核心表（api_models、api_providers、user_billing 等），`db/migrations/` 目录包含 20 个增量迁移文件（001-020），添加了 ClawBot 相关的 31 张扩展表。**全新部署时两者都需要执行。**
 
 ### 1.7 创建 systemd 服务并启动
 
@@ -1185,6 +1204,27 @@ curl http://172.16.1.6:3002/models
 
 ---
 
+#### `GET /providers` — 查看所有 API 提供商
+
+```bash
+curl http://172.16.1.6:3002/providers
+```
+```json
+{
+  "success": true,
+  "providers": [
+    {
+      "id": 1,
+      "provider_name": "anthropic",
+      "display_name": "Anthropic",
+      "base_url": "https://api.anthropic.com"
+    }
+  ]
+}
+```
+
+---
+
 #### `POST /activate` — 充值卡激活
 
 ```bash
@@ -1374,6 +1414,175 @@ curl http://172.16.1.6:3002/admin/models \
 
 ---
 
+#### `GET /admin/dashboard` — Web 管理控制台
+
+浏览器访问即可打开管理面板，提供模型管理、用户管理、充值卡管理等可视化界面。
+
+```bash
+# 访问地址（需通过 Nginx 反向代理或直接内网访问）
+curl http://172.16.1.6:3002/admin/dashboard
+# 返回 HTML 管理页面
+```
+
+---
+
+#### `GET /admin/modules` — 查看已注册模块状态
+
+```bash
+curl http://172.16.1.6:3002/admin/modules \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+```json
+{
+  "success": true,
+  "modules": [
+    { "name": "voice", "enabled": true, "version": "1.0.0" },
+    { "name": "email", "enabled": true, "version": "1.0.0" }
+  ]
+}
+```
+
+---
+
+#### `DELETE /admin/models/:id` — 删除模型定价记录
+
+```bash
+curl -X DELETE "http://172.16.1.6:3002/admin/models/42" \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+```json
+{"success": true, "msg": "模型已删除"}
+```
+
+---
+
+#### `GET /admin/providers` — 查看所有 API 提供商
+
+```bash
+curl http://172.16.1.6:3002/admin/providers \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+
+---
+
+#### `POST /admin/providers` — 添加 API 提供商
+
+```bash
+curl -X POST http://172.16.1.6:3002/admin/providers \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"provider_name":"newprovider","display_name":"New Provider","base_url":"https://api.newprovider.com"}'
+```
+
+---
+
+#### `PUT /admin/providers/:id` — 修改 API 提供商
+
+```bash
+curl -X PUT "http://172.16.1.6:3002/admin/providers/3" \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"display_name":"Updated Name","base_url":"https://new-api.example.com"}'
+```
+
+---
+
+#### `DELETE /admin/providers/:id` — 删除 API 提供商
+
+```bash
+curl -X DELETE "http://172.16.1.6:3002/admin/providers/3" \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+
+---
+
+#### `GET /admin/users` — 查看用户列表
+
+```bash
+curl http://172.16.1.6:3002/admin/users \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+```json
+{
+  "success": true,
+  "users": [
+    {
+      "user_email": "user@example.com",
+      "balance_fen": 2000,
+      "is_suspended": false,
+      "created_at": "2026-01-01T00:00:00.000Z"
+    }
+  ]
+}
+```
+
+---
+
+#### `PUT /admin/users/:email/suspend` — 停用用户
+
+```bash
+curl -X PUT "http://172.16.1.6:3002/admin/users/user@example.com/suspend" \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+```json
+{"success": true, "msg": "用户已停用"}
+```
+
+---
+
+#### `PUT /admin/users/:email/unsuspend` — 恢复用户
+
+```bash
+curl -X PUT "http://172.16.1.6:3002/admin/users/user@example.com/unsuspend" \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+```json
+{"success": true, "msg": "用户已恢复"}
+```
+
+---
+
+#### `POST /admin/cards` — 批量生成充值卡
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `credit_fen` | number | 面值（分） |
+| `label` | string | 卡标签（如 "¥20 充值卡"） |
+| `count` | number | 生成数量（默认 1，最大 100） |
+
+```bash
+curl -X POST http://172.16.1.6:3002/admin/cards \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"credit_fen":2000,"label":"¥20 充值卡","count":5}'
+```
+
+---
+
+#### `GET /admin/cards` — 查看充值卡列表
+
+```bash
+curl http://172.16.1.6:3002/admin/cards \
+  -H "Authorization: Bearer \${ADMIN_TOKEN}"
+```
+```json
+{
+  "success": true,
+  "cards": [
+    {
+      "key": "ANIMA-A1B2C3D4E5F6",
+      "credit_fen": 2000,
+      "label": "¥20 充值卡",
+      "used": false,
+      "used_by": null,
+      "created_at": "2026-01-01T00:00:00.000Z"
+    }
+  ]
+}
+```
+
+---
+
 ## 常用运维 SQL
 
 ```sql
@@ -1442,6 +1651,14 @@ PGPASSWORD="<密码>" PGSSLMODE=require psql \
   -h anima-db.postgres.database.azure.com \
   -U animaapp -d librechat \
   -f /opt/ai/repo/db/schema.sql
+
+# 执行所有迁移
+for f in /opt/ai/repo/db/migrations/*.sql; do
+  PGPASSWORD="<密码>" PGSSLMODE=require psql \
+    -h anima-db.postgres.database.azure.com \
+    -U animaapp -d librechat \
+    -f "$f"
+done
 
 # 检查错误（不过滤输出）
 PGPASSWORD="<密码>" PGSSLMODE=require psql \
