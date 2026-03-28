@@ -507,11 +507,11 @@ const logger = winston.createLogger({
 
 // ─── 数据库连接池 ─────────────────────────────────────────────
 // FIX-5.27-1: CIS 资源保护——PG_POOL_MAX 上限校验，防止误配置导致连接数爆炸
-const PG_POOL_MAX_RAW = parseInt(process.env.PG_POOL_MAX || '15', 10);
+const PG_POOL_MAX_RAW = parseInt(process.env.PG_POOL_MAX || '10', 10);
 const PG_POOL_MAX = (Number.isFinite(PG_POOL_MAX_RAW) && PG_POOL_MAX_RAW >= 1 && PG_POOL_MAX_RAW <= 100)
-  ? PG_POOL_MAX_RAW : 15;
+  ? PG_POOL_MAX_RAW : 10;
 if (process.env.PG_POOL_MAX && PG_POOL_MAX !== PG_POOL_MAX_RAW) {
-  logger.warn('PG_POOL_MAX 值超出有效范围（1-100），已回退至默认值 15', { raw: process.env.PG_POOL_MAX });
+  logger.warn('PG_POOL_MAX 值超出有效范围（1-100），已回退至默认值 10', { raw: process.env.PG_POOL_MAX });
 }
 const db = new Pool({
   host:     process.env.PG_HOST     || 'anima-db.postgres.database.azure.com',
@@ -1198,6 +1198,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
   if (typeof cardKey !== 'string') {
     return res.status(400).json({ success: false, msg: 'cardKey 必须为字符串' });
   }
+  cardKey = cardKey.trim();
   userEmail = normalizeEmail(userEmail);
   if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -1287,7 +1288,7 @@ app.post('/activate', activateLimiter, async (req, res) => {
 });
 
 // ─── 余额查询 ─────────────────────────────────────────────────
-app.get('/billing/balance/:email', readLimiter, async (req, res) => {
+app.get('/billing/balance/:email', readLimiter, requireServiceToken, async (req, res) => {
   const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -1318,7 +1319,7 @@ app.get('/billing/balance/:email', readLimiter, async (req, res) => {
 });
 
 // ─── 消费历史 ─────────────────────────────────────────────────
-app.get('/billing/history/:email', readLimiter, async (req, res) => {
+app.get('/billing/history/:email', readLimiter, requireServiceToken, async (req, res) => {
   const email = normalizeEmail(req.params.email);
   if (!isValidEmail(email)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
@@ -1349,7 +1350,7 @@ app.get('/billing/history/:email', readLimiter, async (req, res) => {
 });
 
 // ─── 余额预检（只读，无需服务鉴权）──────────────────────────
-app.post('/billing/check', billingCheckLimiter, async (req, res) => {
+app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req, res) => {
   let {
     userEmail, modelName,
     estimatedInputTokens, estimatedOutputTokens,
@@ -1364,7 +1365,11 @@ app.post('/billing/check', billingCheckLimiter, async (req, res) => {
   if (!modelName) {
     return res.status(400).json({ success: false, msg: '缺少 modelName' });
   }
-  if (typeof modelName !== 'string' || modelName.length > 128) {
+  if (typeof modelName !== 'string') {
+    return res.status(400).json({ success: false, msg: 'modelName 必须为字符串' });
+  }
+  modelName = modelName.trim();
+  if (modelName.length === 0 || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
 
@@ -1537,14 +1542,22 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   if (!isValidEmail(userEmail)) {
     return res.status(400).json({ success: false, msg: '邮箱格式不正确' });
   }
-  if (typeof apiProvider !== 'string' || apiProvider.length > 32) {
+  if (typeof apiProvider !== 'string') {
+    return res.status(400).json({ success: false, msg: 'apiProvider 必须为字符串' });
+  }
+  apiProvider = apiProvider.trim();
+  if (apiProvider.length === 0 || apiProvider.length > 32) {
     return res.status(400).json({ success: false, msg: 'apiProvider 长度不能超过 32 字符' });
   }
   // FIX-5.23-1: apiProvider 字符集校验——防御日志/SQL 注入（PCI-DSS 6.5）
   if (!API_PROVIDER_RE.test(apiProvider)) {
     return res.status(400).json({ success: false, msg: 'apiProvider 仅允许字母、数字、连字符、下划线、点' });
   }
-  if (typeof modelName !== 'string' || modelName.length > 128) {
+  if (typeof modelName !== 'string') {
+    return res.status(400).json({ success: false, msg: 'modelName 必须为字符串' });
+  }
+  modelName = modelName.trim();
+  if (modelName.length === 0 || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
   // FIX-5.24-1: modelName 字符集校验——防御日志注入（PCI-DSS 6.5 输入校验完整性）
@@ -1564,8 +1577,11 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   }
 
   if (idempotencyKey !== undefined) {
+    if (typeof idempotencyKey !== 'string') {
+      return res.status(400).json({ success: false, msg: 'idempotencyKey 必须为字符串' });
+    }
+    idempotencyKey = idempotencyKey.trim();
     if (
-      typeof idempotencyKey !== 'string' ||
       idempotencyKey.length === 0 ||
       idempotencyKey.length > 128 ||
       !IDEMPOTENCY_KEY_RE.test(idempotencyKey)
@@ -1783,9 +1799,18 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
             SET balance_fen       = balance_fen - $1,
                 total_charged_fen = total_charged_fen + $1
           WHERE user_email = $2
+            AND balance_fen >= $1
           RETURNING balance_fen`,
         [chargedFen, userEmail]
       );
+      // 防御性兜底：FOR UPDATE 锁后余额仍不足（理论不可达，DB CHECK 约束兜底）
+      if (deductRes.rows.length === 0) {
+        await safeRollback(client, '/billing/record balance deduct race');
+        return res.status(402).json({
+          success: false, msg: '余额不足，请充值后继续使用',
+          balance_fen: Number(u.balance_fen), is_suspended: !!u.is_suspended,
+        });
+      }
       newBalance = Number(deductRes.rows[0].balance_fen);
     }
 
@@ -1855,7 +1880,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     await client.query('COMMIT');
 
-    logger.info('Billing recorded', { userEmail, modelName, chargedFen, newBalance, idempotencyKey: normalizedIdempKey });
+    logger.info('Billing recorded', { userEmail, modelName, chargedFen, idempotencyKey: normalizedIdempKey });
 
     res.json({ success: true, is_free: false, charged_fen: chargedFen, balance_fen: newBalance, is_suspended: !!u.is_suspended });
   } catch (err) {
@@ -1957,23 +1982,35 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
 });
 
 app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
-  const { provider, modelName, displayName, isFree, priceInput, priceOutput,
+  let { provider, modelName, displayName, isFree, priceInput, priceOutput,
           currency, supportsCache, description } = req.body ?? {};
 
   if (!provider || !modelName || !displayName) {
     return res.status(400).json({ success: false, msg: '缺少必填字段：provider、modelName、displayName' });
   }
-  if (typeof provider !== 'string' || provider.length > 32) {
+  if (typeof provider !== 'string') {
+    return res.status(400).json({ success: false, msg: 'provider 必须为字符串' });
+  }
+  provider = provider.trim();
+  if (provider.length === 0 || provider.length > 32) {
     return res.status(400).json({ success: false, msg: 'provider 长度不能超过 32 字符' });
   }
   // FIX-5.24-1: provider 字符集校验——防御日志/SQL 注入（PCI-DSS 6.5）
   if (!API_PROVIDER_RE.test(provider)) {
     return res.status(400).json({ success: false, msg: 'provider 仅允许字母、数字、连字符、下划线、点' });
   }
-  if (typeof modelName !== 'string' || modelName.length > 128) {
+  if (typeof modelName !== 'string') {
+    return res.status(400).json({ success: false, msg: 'modelName 必须为字符串' });
+  }
+  modelName = modelName.trim();
+  if (modelName.length === 0 || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
   }
-  if (typeof displayName !== 'string' || displayName.length > 128) {
+  if (typeof displayName !== 'string') {
+    return res.status(400).json({ success: false, msg: 'displayName 必须为字符串' });
+  }
+  displayName = displayName.trim();
+  if (displayName.length === 0 || displayName.length > 128) {
     return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 128 字符' });
   }
   if (typeof isFree !== 'boolean') {
@@ -1995,8 +2032,14 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   if (!['USD', 'CNY'].includes(currencyVal)) {
     return res.status(400).json({ success: false, msg: 'currency 必须为 USD 或 CNY' });
   }
-  if (description != null && (typeof description !== 'string' || description.length > 1000)) {
-    return res.status(400).json({ success: false, msg: 'description 长度不能超过 1000 字符' });
+  if (description != null) {
+    if (typeof description !== 'string') {
+      return res.status(400).json({ success: false, msg: 'description 必须为字符串' });
+    }
+    description = description.trim();
+    if (description.length > 1000) {
+      return res.status(400).json({ success: false, msg: 'description 长度不能超过 1000 字符' });
+    }
   }
 
   try {
@@ -2202,22 +2245,34 @@ app.get('/admin/providers', adminLimiter, requireAdmin, async (_req, res) => {
 });
 
 app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
-  const { providerName, displayName, baseUrl, isEnabled, description } = req.body ?? {};
+  let { providerName, displayName, baseUrl, isEnabled, description } = req.body ?? {};
 
   if (!providerName || !displayName || !baseUrl) {
     return res.status(400).json({ success: false, msg: '缺少必填字段：providerName、displayName、baseUrl' });
   }
-  if (typeof providerName !== 'string' || providerName.length > 32) {
+  if (typeof providerName !== 'string') {
+    return res.status(400).json({ success: false, msg: 'providerName 必须为字符串' });
+  }
+  providerName = providerName.trim();
+  if (providerName.length === 0 || providerName.length > 32) {
     return res.status(400).json({ success: false, msg: 'providerName 长度不能超过 32 字符' });
   }
   // FIX-5.25-1: providerName 字符集校验——与 apiProvider 校验对齐，防御日志/SQL 注入（PCI-DSS 6.5）
   if (!API_PROVIDER_RE.test(providerName)) {
     return res.status(400).json({ success: false, msg: 'providerName 仅允许字母、数字、连字符、下划线、点' });
   }
-  if (typeof displayName !== 'string' || displayName.length > 64) {
+  if (typeof displayName !== 'string') {
+    return res.status(400).json({ success: false, msg: 'displayName 必须为字符串' });
+  }
+  displayName = displayName.trim();
+  if (displayName.length === 0 || displayName.length > 64) {
     return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 64 字符' });
   }
-  if (typeof baseUrl !== 'string' || baseUrl.length > 256) {
+  if (typeof baseUrl !== 'string') {
+    return res.status(400).json({ success: false, msg: 'baseUrl 必须为字符串' });
+  }
+  baseUrl = baseUrl.trim();
+  if (baseUrl.length === 0 || baseUrl.length > 256) {
     return res.status(400).json({ success: false, msg: 'baseUrl 长度不能超过 256 字符' });
   }
   // FIX-5.21-1: SSRF 防护——校验 URL 格式并禁止内网/保留地址
@@ -2225,8 +2280,14 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
     return res.status(400).json({ success: false, msg: 'baseUrl 格式不正确或指向内网/保留地址（仅允许公网 HTTP/HTTPS URL）' });
   }
   // FIX-5.9-4: description 长度校验
-  if (description != null && (typeof description !== 'string' || description.length > 500)) {
-    return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
+  if (description != null) {
+    if (typeof description !== 'string') {
+      return res.status(400).json({ success: false, msg: 'description 必须为字符串' });
+    }
+    description = description.trim();
+    if (description.length > 500) {
+      return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
+    }
   }
 
   try {
@@ -2348,8 +2409,8 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
   if (typeof amount_fen !== 'number' || !Number.isInteger(amount_fen) || amount_fen === 0) {
     return res.status(400).json({ success: false, msg: 'amount_fen 必须为非零整数' });
   }
-  if (Math.abs(amount_fen) > 10_000_000) {
-    return res.status(400).json({ success: false, msg: '单次调整金额不能超过 ¥100,000（10,000,000 分）' });
+  if (Math.abs(amount_fen) > 1_000_000) {
+    return res.status(400).json({ success: false, msg: '单次调整金额不能超过 ¥10,000（1,000,000 分）' });
   }
   const validTypes = ['recharge', 'refund', 'admin_adjust'];
   if (!validTypes.includes(type)) {
@@ -2363,8 +2424,14 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
       msg: `${type} 类型的 amount_fen 必须为正数（如需扣减请使用 admin_adjust 类型并传入负数）`,
     });
   }
-  if (description != null && (typeof description !== 'string' || description.length > 500)) {
-    return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
+  if (description != null) {
+    if (typeof description !== 'string') {
+      return res.status(400).json({ success: false, msg: 'description 必须为字符串' });
+    }
+    description = description.trim();
+    if (description.length > 500) {
+      return res.status(400).json({ success: false, msg: 'description 长度不能超过 500 字符' });
+    }
   }
 
   const client = await db.connect();
@@ -2501,7 +2568,7 @@ app.put('/admin/users/:email/unsuspend', adminLimiter, requireAdmin, async (req,
 
 // ── FIX-5.15-4: 充值卡管理 ───────────────────────────────────
 
-const MAX_CREDIT_FEN          = 10_000_000; // 单张卡密最大面额（分），与 admin/adjust 上限一致
+const MAX_CREDIT_FEN          = 1_000_000;  // 单张卡密最大面额（分），与 admin/adjust 上限一致
 const MAX_CARDS_PER_REQUEST   = 100;        // 单次批量创建卡密上限
 
 app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
@@ -2513,8 +2580,14 @@ app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
   if (creditFen > MAX_CREDIT_FEN) {
     return res.status(400).json({ success: false, msg: `creditFen 不能超过 ${MAX_CREDIT_FEN.toLocaleString()} 分（¥${(MAX_CREDIT_FEN / 100).toLocaleString()}）` });
   }
-  if (label != null && (typeof label !== 'string' || label.length > 128)) {
-    return res.status(400).json({ success: false, msg: 'label 长度不能超过 128 字符' });
+  if (label != null) {
+    if (typeof label !== 'string') {
+      return res.status(400).json({ success: false, msg: 'label 必须为字符串' });
+    }
+    label = label.trim();
+    if (label.length > 128) {
+      return res.status(400).json({ success: false, msg: 'label 长度不能超过 128 字符' });
+    }
   }
 
   const cardCount = (typeof count === 'number' && Number.isInteger(count) && count >= 1 && count <= MAX_CARDS_PER_REQUEST)
