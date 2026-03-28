@@ -1109,7 +1109,7 @@ async function safeRollback(client, context) {
 // FIX-5.27-2: DB 与 Redis 并行检查，健康检查延迟从串行 2×RTT 降至 1×RTT
 app.get('/health', async (_req, res) => {
   // 并行发起 DB 和 Redis 检查，各自返回是否成功
-  const [dbOk] = await Promise.all([
+  const [dbOk, redisOk] = await Promise.all([
     db.query('SELECT 1').then(() => true, (err) => {
       logger.error('Health check DB error', { err: err.message });
       return false;
@@ -1118,11 +1118,14 @@ app.get('/health', async (_req, res) => {
       try {
         if (redis.status === 'ready') {
           await redis.ping();
+          return true;
         } else {
           logger.info('Health check: Redis disconnected (degraded mode)');
+          return false;
         }
       } catch (err) {
         logger.warn('Health check Redis error', { err: err.message });
+        return false;
       }
     })(),
   ]);
@@ -1134,6 +1137,8 @@ app.get('/health', async (_req, res) => {
   res.status(httpStatus).json({
     status: httpStatus === 200 ? 'ok' : 'degraded',
     ts: new Date().toISOString(),
+    db: dbOk ? 'ok' : 'error',
+    redis: redisOk ? 'ok' : 'degraded',
   });
 });
 
@@ -1246,6 +1251,10 @@ app.post('/activate', activateLimiter, async (req, res) => {
         RETURNING balance_fen`,
       [card.credit_fen, userEmail]
     );
+    if (rechargeRes.rows.length === 0) {
+      await safeRollback(client, '/activate user balance update returned no rows');
+      return res.status(500).json({ success: false, msg: '用户数据异常，请重试' });
+    }
     const newBalance = Number(rechargeRes.rows[0].balance_fen);
 
     await client.query(
@@ -1886,13 +1895,11 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
   } catch (err) {
     await safeRollback(client, '/billing/record unhandled error');
     logger.error('Billing record error', { err: err.message, userEmail, request_id: req.id });
-    res.status(500).json({ success: false, msg: '服务器内部错误' });
+    return res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
     client.release();
   }
 });
-
-// =============================================================
 // ─── 管理员接口 ───────────────────────────────────────────────
 // =============================================================
 
@@ -2110,6 +2117,11 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
       values.push(0);
       updates.push(`price_output_per_1k_tokens = $${values.length + 1}`);
       values.push(0);
+    } else if (currentModel.is_free) {
+      // 从免费切换为付费：必须同时提供价格参数
+      if (typeof priceInput !== 'number' || typeof priceOutput !== 'number') {
+        return res.status(400).json({ success: false, msg: '从免费模型切换为付费模型时必须同时提供 priceInput 和 priceOutput' });
+      }
     }
   }
 
@@ -2155,14 +2167,15 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     values.push(currency);
   }
   if (typeof displayName === 'string') {
-    if (displayName.trim().length === 0) {
+    const trimmedDisplayName = displayName.trim();
+    if (trimmedDisplayName.length === 0) {
       return res.status(400).json({ success: false, msg: 'displayName 不能为空' });
     }
-    if (displayName.length > 128) {
+    if (trimmedDisplayName.length > 128) {
       return res.status(400).json({ success: false, msg: 'displayName 长度不能超过 128 字符' });
     }
     updates.push(`display_name = $${values.length + 1}`);
-    values.push(stripControlChars(displayName));
+    values.push(stripControlChars(trimmedDisplayName));
   }
   if (typeof description === 'string') {
     if (description.length > 1000) {
@@ -2188,6 +2201,9 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
 
     // 清除模型缓存（FIX-5.9-6）
     modelCacheDelete(currentModel.model_name);
+    if (result.rows[0].model_name !== currentModel.model_name) {
+      modelCacheDelete(result.rows[0].model_name);
+    }
 
     auditLog('model_update', { id, modelName: currentModel.model_name }, req);
     res.json({ success: true, model: result.rows[0] });
@@ -2323,11 +2339,12 @@ app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => 
   const values  = [];
 
   if (typeof displayName === 'string') {
-    if (displayName.trim().length === 0 || displayName.length > 64) {
+    const trimmedDisplayName = displayName.trim();
+    if (trimmedDisplayName.length === 0 || trimmedDisplayName.length > 64) {
       return res.status(400).json({ success: false, msg: 'displayName 不能为空且长度不超过 64 字符' });
     }
     updates.push(`display_name = $${values.length + 1}`);
-    values.push(stripControlChars(displayName));
+    values.push(stripControlChars(trimmedDisplayName));
   }
   if (typeof baseUrl === 'string') {
     // FIX-5.21-1: SSRF 防护（同 POST /admin/providers）
