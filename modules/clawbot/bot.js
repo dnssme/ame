@@ -11034,7 +11034,7 @@ app.post('/clawbot/portal/dispatch', adminLimiter, async (req, res) => {
   }
 
   stats.portalDispatches++;
-  dbAuditLog({ openId: session.open_id, action: 'portal_dispatch', detail: `Feature: ${feature_id}, Action: ${action || 'default'}` });
+  await dbAuditLog({ openId: session.open_id, action: 'portal_dispatch', detail: `Feature: ${feature_id}, Action: ${action || 'default'}` });
 
   res.json({
     success: true,
