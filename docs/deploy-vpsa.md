@@ -238,6 +238,7 @@ ping -c 2 172.16.1.6 && echo "✅ VPS E (Webhook) 可达" || echo "❌ VPS E 不
 # 验证各服务健康状态
 curl -sf http://172.16.1.3:3080/health && echo "✅ LibreChat" || echo "❌ LibreChat 不可达"
 curl -sf http://172.16.1.2:3000/health && echo "✅ OpenClaw"  || echo "❌ OpenClaw 不可达"
+curl -sf http://172.16.1.2:3004/health && echo "✅ ClawBot"   || echo "❌ ClawBot 不可达（如未启用可忽略）"
 curl -sf http://172.16.1.6:3002/health && echo "✅ Webhook"   || echo "❌ Webhook 不可达"
 curl -sf http://172.16.1.4:8090/status.php | grep -q '"installed":true' && echo "✅ Nextcloud" || echo "❌ Nextcloud 不可达"
 ```

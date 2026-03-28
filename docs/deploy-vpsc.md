@@ -373,7 +373,7 @@ docker compose logs --tail=50 librechat | grep -i error || echo "✅ 无错误�
 
 ---
 
-## 6.5 配置 auditd 操作审计
+## 6.6 配置 auditd 操作审计
 
 ```bash
 sudo bash /opt/ai/scripts/audit-setup.sh

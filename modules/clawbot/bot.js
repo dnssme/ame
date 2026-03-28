@@ -1037,7 +1037,7 @@ if (SESSION_ENCRYPT_KEY_RAW) {
 }
 // 插件生命周期 Redis 键前缀
 const REDIS_PLUGIN_ACTIVATED_KEY = 'anima:clawbot:plugin_activated'; // Set: activated openid
-const PLUGIN_VERSION = '3.1.0';
+const PLUGIN_VERSION = '3.2.0';
 const PLUGIN_NAME = 'Anima 灵枢 ClawBot 插件';
 
 // ─── v2.7 Web 管理后台配置 ──────────────────────────────────────
