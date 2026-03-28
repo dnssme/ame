@@ -132,6 +132,8 @@ ufw allow 22/tcp
 ufw allow 51820/udp
 # OpenClaw Agent：仅 VPS A 和 VPS C 需要访问
 ufw allow in from 172.16.1.0/24 to any port 3000
+# ClawBot 灵枢接入通道（微信/企业微信 Webhook）
+ufw allow in from 172.16.1.0/24 to any port 3004
 # 微信 Bot 健康检查端口（如启用微信模块）
 ufw allow in from 172.16.1.0/24 to any port 3001
 # Telegram Bot 健康检查端口（如启用 Telegram 模块）
@@ -474,6 +476,12 @@ echo -n "[CIS 2.1.x] 时间同步: "
 chronyc tracking &>/dev/null && echo "✅ 通过" || echo "❌ 失败"
 
 # Docker 模块安全（read_only）
+if docker inspect anima-clawbot &>/dev/null; then
+  echo -n "[CIS Docker 5.12] ClawBot 模块 read_only: "
+  docker inspect anima-clawbot | grep -q '"ReadonlyRootfs": true' \
+    && echo "✅ 通过" || echo "❌ 失败"
+fi
+
 if docker inspect anima-wechat &>/dev/null; then
   echo -n "[CIS Docker 5.12] 微信模块 read_only: "
   docker inspect anima-wechat | grep -q '"ReadonlyRootfs": true' \
@@ -513,6 +521,10 @@ grep -q 'unhandledRejection\|uncaughtException' /opt/ai/repo/openclaw/config.yml
 # PCI-DSS 7.x: 最小权限
 echo -n "[PCI 7.x] OpenClaw 仅内网暴露: "
 ufw status | grep '3000' | grep -q '172.16.1.0/24' \
+  && echo "✅ 通过" || echo "⚠️  请核查 UFW 规则"
+
+echo -n "[PCI 7.x] ClawBot 仅内网暴露: "
+ufw status | grep '3004' | grep -q '172.16.1.0/24' \
   && echo "✅ 通过" || echo "⚠️  请核查 UFW 规则"
 
 # PCI-DSS 10.x: 日志
@@ -616,7 +628,17 @@ echo "${CHAT_RESULT}" | grep -qi 'content\|message\|reply\|assistant' \
   || echo "⚠️  响应: ${CHAT_RESULT:0:300}"
 ```
 
-### 10.6 Telegram Bot 测试（如已启用）
+### 10.6 ClawBot 灵枢测试（如已启用）
+
+```bash
+if docker ps --format '{{.Names}}' | grep -q 'anima-clawbot'; then
+  echo -n "[测试 6] ClawBot 模块健康: "
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://172.16.1.2:3004/health)
+  [ "${HTTP_CODE}" = "200" ] && echo "✅ 通过" || echo "❌ 失败 (HTTP ${HTTP_CODE})"
+fi
+```
+
+### 10.7 Telegram Bot 测试（如已启用）
 
 ```bash
 if docker ps --format '{{.Names}}' | grep -q 'anima-telegram'; then
@@ -626,7 +648,7 @@ if docker ps --format '{{.Names}}' | grep -q 'anima-telegram'; then
 fi
 ```
 
-### 10.7 微信 Bot 测试（如已启用）
+### 10.8 微信 Bot 测试（如已启用）
 
 ```bash
 if docker ps --format '{{.Names}}' | grep -q 'anima-wechat'; then
@@ -646,11 +668,15 @@ cd /opt/ai/repo/openclaw
 docker compose ps
 docker compose logs --tail=50 openclaw
 
+# 查看 ClawBot 日志
+docker compose logs --tail=50 clawbot
+
 # 内存使用
-docker stats openclaw --no-stream
+docker stats openclaw anima-clawbot --no-stream
 
 # 重启
 docker compose restart openclaw
+docker compose restart clawbot
 
 # 更新镜像
 docker compose pull && docker compose up -d

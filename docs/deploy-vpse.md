@@ -363,13 +363,25 @@ PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
   -f /opt/ai/repo/db/schema.sql \
   -v ON_ERROR_STOP=1
 
-echo "Schema 初始化完成"
+# 执行所有数据库迁移（ClawBot 等模块所需的扩展表）
+for f in /opt/ai/repo/db/migrations/*.sql; do
+  echo "▸ 执行迁移: $(basename "$f")"
+  PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
+    --quiet \
+    -h anima-db.postgres.database.azure.com \
+    -U animaapp \
+    -d librechat \
+    -f "$f" \
+    -v ON_ERROR_STOP=1
+done
 
-# 验证表已创建
+echo "Schema 初始化 + 迁移执行完成"
+
+# 验证表已创建（核心表 + ClawBot 表）
 PGPASSWORD='<animaapp数据库密码>' PGSSLMODE=require psql \
   -h anima-db.postgres.database.azure.com \
   -U animaapp -d librechat \
-  -c "\dt" | grep -E 'api_models|api_providers|user_billing|billing_transactions|api_usage|recharge_cards'
+  -c "\dt" | grep -E 'api_models|api_providers|user_billing|billing_transactions|api_usage|recharge_cards|clawbot_users'
 ```
 
 > ⚠️ 若报 `CREATE EXTENSION` 权限错误，请在 Azure 门户 → PostgreSQL → 服务器参数 → 将 `pgcrypto` 和 `pg_stat_statements` 加入 `azure.extensions` 允许列表后重新执行。
@@ -552,7 +564,7 @@ echo -n "[测试 3] Provider 配置接口: "
 PROVIDERS=$(curl -sf http://172.16.1.6:3002/providers)
 echo "${PROVIDERS}" | grep -q 'anthropic\|openai' \
   && echo "✅ 通过（数据库统一 provider 配置）" \
-  || echo "❌ 失败（请确认 schema.sql v5.3 已执行）"
+  || echo "❌ 失败（请确认 schema.sql v5.4 及所有迁移已执行）"
 
 # 测试 4：管理员接口鉴权
 echo -n "[测试 4] 管理员接口（正确令牌）: "
@@ -724,6 +736,13 @@ PGPASSWORD='<密码>' PGSSLMODE=require psql \
 PGPASSWORD='<密码>' PGSSLMODE=require psql \
   -h anima-db.postgres.database.azure.com -U animaapp -d librechat \
   -f /opt/ai/repo/db/schema.sql -v ON_ERROR_STOP=1
+
+# 然后执行所有迁移
+for f in /opt/ai/repo/db/migrations/*.sql; do
+  PGPASSWORD='<密码>' PGSSLMODE=require psql \
+    -h anima-db.postgres.database.azure.com -U animaapp -d librechat \
+    -f "$f" -v ON_ERROR_STOP=1
+done
 ```
 
 ### 免费限额未生效（Redis 不可用）
