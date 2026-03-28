@@ -1282,14 +1282,14 @@ async function loadAdminSettings(){
           <tr><td>管理会话最大时长</td><td>${sess.admin_session_max_age_sec}s</td></tr>
         </table></div>
         <div class="card" style="margin:0"><div class="card-title">🛡️ 安全配置</div><table>
-          <tr><td>用户速率限制</td><td>${sec.user_rate_limit} 次/分钟</td></tr>
+          <tr><td>用户速率限制</td><td>${sec.user_rate_limit} 次/${sec.rate_window_sec}秒</td></tr>
           <tr><td>绑定锁定阈值</td><td>${sec.bind_lockout_threshold} 次</td></tr>
           <tr><td>锁定时长</td><td>${sec.bind_lockout_duration_min} 分钟</td></tr>
           <tr><td>OAuth Scope</td><td>${esc(sec.oauth_scope)}</td></tr>
           <tr><td>OAuth 状态 TTL</td><td>${sec.oauth_state_ttl_sec}s</td></tr>
           <tr><td>会话加密</td><td><span class="badge ${sec.session_encryption?'badge-success':'badge-warning'}">${sec.session_encryption?'已启用':'未启用'}</span></td></tr>
           <tr><td>HKDF 盐值</td><td><span class="badge ${sec.hkdf_salt_configured?'badge-success':'badge-warning'}">${sec.hkdf_salt_configured?'已配置':'使用默认'}</span></td></tr>
-          <tr><td>IP 白名单</td><td>${(sec.admin_ip_allowlist||[]).map(ip=>'<code>'+esc(ip)+'</code>').join(', ')}</td></tr>
+          <tr><td>IP 白名单</td><td>${(sec.admin_ip_allowlist||[]).length===1&&(sec.admin_ip_allowlist[0]||'').startsWith('未配置')?'<span style="color:var(--warning)">'+esc(sec.admin_ip_allowlist[0])+'</span>':(sec.admin_ip_allowlist||[]).map(ip=>'<code>'+esc(ip)+'</code>').join(', ')}</td></tr>
         </table></div>
         <div class="card" style="margin:0"><div class="card-title">📋 合规参数</div><table>
           <tr><td>审计保留</td><td>${comp.audit_retention_days} 天</td></tr>

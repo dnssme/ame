@@ -11487,7 +11487,7 @@ app.get('/clawbot/admin/api/settings', adminLimiter, requireAdminIp, requireServ
     },
     ai: {
       default_model: DEFAULT_MODEL,
-      agent_api_url: AGENT_API_URL.replace(/\/\/.*:.*@/, '//***:***@'),
+      agent_api_url: (() => { try { const u = new URL(AGENT_API_URL); if (u.username || u.password) { u.username = '***'; u.password = '***'; } return u.toString().replace(/\/$/, ''); } catch (_e) { return '(invalid URL)'; } })(),
       request_timeout_ms: AGENT_REQUEST_TIMEOUT_MS,
     },
     session: {
