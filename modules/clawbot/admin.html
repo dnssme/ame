@@ -175,6 +175,10 @@ tr:hover{background:rgba(59,130,246,.05)}
       <div class="nav-item" data-page="audit"><span class="icon">📝</span><span>审计日志</span></div>
       <div class="nav-item" data-page="plugin"><span class="icon">🔌</span><span>插件状态</span></div>
     </div>
+    <div class="nav-group">
+      <div class="nav-group-title">系统管理</div>
+      <div class="nav-item" data-page="adminsettings"><span class="icon">🔧</span><span>超级管理员设置</span></div>
+    </div>
     <div class="sidebar-footer">
       <button class="btn btn-outline btn-sm" style="width:100%;justify-content:center" onclick="doLogout()">
         <span>🚪</span><span>退出登录</span>
@@ -443,6 +447,20 @@ tr:hover{background:rgba(59,130,246,.05)}
           <div id="cis-content" class="loading">加载中...</div>
         </div>
       </div>
+
+      <!-- v3.2 超级管理员设置 -->
+      <div class="page" id="page-adminsettings">
+        <div class="card">
+          <div class="card-title">超级管理员设置</div>
+          <div class="card-subtitle" style="color:var(--text-muted);font-size:12px;margin-bottom:16px">
+            ⚠️ 超级管理员统一通过此 Web 管理面板进行系统管理（CIS 4.1 / PCI-DSS 7.1）
+          </div>
+          <div class="toolbar" style="margin-bottom:12px">
+            <button class="btn btn-outline btn-sm" onclick="loadAdminSettings()">🔄 刷新</button>
+          </div>
+          <div id="adminsettings-content" class="loading">加载中...</div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -468,7 +486,8 @@ const pageTitles = {
   material:'素材管理',tags:'标签管理',tenants:'租户管理',gateway:'通道网关',
   relay:'事件中继',federation:'会话联邦',compliance:'合规报告',audit:'审计日志',plugin:'插件状态',
   kf:'客服系统',drafts:'草稿/发布',comments:'评论管理',subscribe:'订阅消息',condmenu:'个性化菜单',
-  wxconfig:'微信接入配置',wxauthorizers:'微信授权管理',wxsessions:'登录会话监控',cis:'CIS 合规基线'
+  wxconfig:'微信接入配置',wxauthorizers:'微信授权管理',wxsessions:'登录会话监控',cis:'CIS 合规基线',
+  adminsettings:'超级管理员设置'
 };
 
 /* ── Auth ── */
@@ -554,7 +573,8 @@ function loadPage(page){
     compliance:()=>showComplianceTab('report'),audit:loadAudit,plugin:()=>showPluginTab('status'),
     kf:()=>showKfTab('accounts'),drafts:()=>showDraftTab('list'),comments:()=>showCommentTab('list'),
     subscribe:()=>showSubscribeTab('templates'),condmenu:()=>showCondMenuTab('list'),
-    wxconfig:loadWxConfig,wxauthorizers:loadWxAuthorizers,wxsessions:loadWxSessions,cis:loadCisControls
+    wxconfig:loadWxConfig,wxauthorizers:loadWxAuthorizers,wxsessions:loadWxSessions,cis:loadCisControls,
+    adminsettings:loadAdminSettings
   };
   if(loaders[page]) loaders[page]();
 }
@@ -1220,6 +1240,81 @@ async function runCisAssess(){
     alert('评估完成：合规 '+d.summary.compliant+'/'+d.summary.total);
     loadCisControls();
   }catch(e){el.innerHTML='<p class="error">评估失败: '+esc(e.message)+'</p>'}
+}
+
+/* ── 超级管理员设置 ── */
+async function loadAdminSettings(){
+  const el=document.getElementById('adminsettings-content');
+  el.innerHTML='<p>加载中...</p>';
+  try{
+    const d=await api('GET','/clawbot/admin/api/settings');
+    const s=d.system||{};
+    const ai=d.ai||{};
+    const sess=d.session||{};
+    const sec=d.security||{};
+    const comp=d.compliance||{};
+    const st=d.stats_summary||{};
+    const upH=Math.floor((s.uptime_seconds||0)/3600);
+    const upM=Math.floor(((s.uptime_seconds||0)%3600)/60);
+    el.innerHTML=`
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div class="card" style="margin:0"><div class="card-title">📊 系统信息</div><table>
+          <tr><td>版本</td><td><span class="badge badge-info">${esc(s.version)}</span></td></tr>
+          <tr><td>运行时间</td><td>${upH}h ${upM}m</td></tr>
+          <tr><td>端口</td><td>${s.port}</td></tr>
+          <tr><td>日志级别</td><td>${esc(s.log_level)}</td></tr>
+          <tr><td>加密模式</td><td>${esc(s.encrypt_mode)}</td></tr>
+          <tr><td>语音功能</td><td><span class="badge ${s.voice_enabled?'badge-success':'badge-warning'}">${s.voice_enabled?'已启用':'未启用'}</span></td></tr>
+          <tr><td>企业微信</td><td><span class="badge ${s.wecom_enabled?'badge-success':'badge-info'}">${s.wecom_enabled?'已启用':'未启用'}</span></td></tr>
+          <tr><td>数据库</td><td><span class="badge ${s.db_enabled?'badge-success':'badge-danger'}">${s.db_enabled?'已连接':'未连接'}</span></td></tr>
+          <tr><td>Redis</td><td><span class="badge ${s.redis_connected?'badge-success':'badge-danger'}">${s.redis_connected?'已连接':'未连接'}</span></td></tr>
+        </table></div>
+        <div class="card" style="margin:0"><div class="card-title">🤖 AI 模型配置</div><table>
+          <tr><td>默认模型</td><td><code>${esc(ai.default_model)}</code></td></tr>
+          <tr><td>API 地址</td><td style="word-break:break-all">${esc(ai.agent_api_url)}</td></tr>
+          <tr><td>请求超时</td><td>${ai.request_timeout_ms}ms</td></tr>
+        </table></div>
+        <div class="card" style="margin:0"><div class="card-title">🔐 会话策略</div><table>
+          <tr><td>最大会话数</td><td>${sess.max_sessions}</td></tr>
+          <tr><td>会话 TTL</td><td>${sess.session_ttl_sec}s</td></tr>
+          <tr><td>空闲超时</td><td>${sess.idle_timeout_min} 分钟</td></tr>
+          <tr><td>管理会话 TTL</td><td>${sess.admin_session_ttl_sec}s</td></tr>
+          <tr><td>管理会话最大时长</td><td>${sess.admin_session_max_age_sec}s</td></tr>
+        </table></div>
+        <div class="card" style="margin:0"><div class="card-title">🛡️ 安全配置</div><table>
+          <tr><td>用户速率限制</td><td>${sec.user_rate_limit} 次/分钟</td></tr>
+          <tr><td>绑定锁定阈值</td><td>${sec.bind_lockout_threshold} 次</td></tr>
+          <tr><td>锁定时长</td><td>${sec.bind_lockout_duration_min} 分钟</td></tr>
+          <tr><td>OAuth Scope</td><td>${esc(sec.oauth_scope)}</td></tr>
+          <tr><td>OAuth 状态 TTL</td><td>${sec.oauth_state_ttl_sec}s</td></tr>
+          <tr><td>会话加密</td><td><span class="badge ${sec.session_encryption?'badge-success':'badge-warning'}">${sec.session_encryption?'已启用':'未启用'}</span></td></tr>
+          <tr><td>HKDF 盐值</td><td><span class="badge ${sec.hkdf_salt_configured?'badge-success':'badge-warning'}">${sec.hkdf_salt_configured?'已配置':'使用默认'}</span></td></tr>
+          <tr><td>IP 白名单</td><td>${(sec.admin_ip_allowlist||[]).map(ip=>'<code>'+esc(ip)+'</code>').join(', ')}</td></tr>
+        </table></div>
+        <div class="card" style="margin:0"><div class="card-title">📋 合规参数</div><table>
+          <tr><td>审计保留</td><td>${comp.audit_retention_days} 天</td></tr>
+          <tr><td>合规扫描间隔</td><td>${comp.compliance_scan_interval_hours} 小时</td></tr>
+          <tr><td>SLA 可用性目标</td><td>${comp.sla_target_uptime}%</td></tr>
+          <tr><td>每日配额默认值</td><td>${comp.quota_default_daily}</td></tr>
+        </table></div>
+        <div class="card" style="margin:0"><div class="card-title">📈 运行统计</div><table>
+          <tr><td>总消息数</td><td>${st.total_messages}</td></tr>
+          <tr><td>总命令数</td><td>${st.total_commands}</td></tr>
+          <tr><td>总错误数</td><td>${st.total_errors}</td></tr>
+          <tr><td>管理员登录</td><td>${st.admin_logins}</td></tr>
+          <tr><td>设置更新</td><td>${st.settings_updated}</td></tr>
+        </table></div>
+      </div>
+      <div class="card" style="margin-top:16px;background:rgba(59,130,246,.08);border-color:var(--primary)">
+        <div class="card-title">ℹ️ 管理须知</div>
+        <p style="color:var(--text-muted);font-size:13px;line-height:1.8">
+          • 超级管理员所有操作统一通过此 Web 管理后台执行（CIS 4.1 / PCI-DSS 7.1）<br>
+          • 微信端管理命令已全部屏蔽，仅保留用户个人设置（/settings）<br>
+          • 系统参数通过环境变量配置，修改后需重启服务生效<br>
+          • 所有管理操作均记录审计日志，保留 ${comp.audit_retention_days} 天
+        </p>
+      </div>`;
+  }catch(e){el.innerHTML='<div class="alert alert-danger">'+esc(e.message)+'</div>'}
 }
 </script>
 </body>
