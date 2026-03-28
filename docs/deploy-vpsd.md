@@ -154,6 +154,13 @@ AllowedIPs = 172.16.1.2/32, fd00:ai::2/128
 Endpoint = <VPS-B 公网IP>:51820
 PersistentKeepalive = 25
 
+# ─── VPS C（LibreChat Web UI）───
+[Peer]
+PublicKey = <VPS-C 公钥>
+AllowedIPs = 172.16.1.3/32, fd00:ai::3/128
+Endpoint = <VPS-C 公网IP>:51820
+PersistentKeepalive = 25
+
 # ─── CXI4（Whisper + TTS + Email + HA）───
 [Peer]
 PublicKey = <CXI4 公钥>
