@@ -917,14 +917,17 @@ const ADMIN_TOKEN   = process.env.ADMIN_TOKEN;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 
 // FIX-5.31-3: 固定大小缓冲区消除长度侧信道——无论输入长度，内存分配耗时恒定
+// SAFE_CMP_LEN=256 足以容纳 ADMIN_TOKEN/SERVICE_TOKEN（启动校验 ≥ 64 字符，推荐 openssl rand -hex 32 = 64 字符）
 const SAFE_CMP_LEN = 256;
 function safeCompare(a, b) {
   const aBuf = Buffer.from(typeof a === 'string' ? a : '');
   const bBuf = Buffer.from(typeof b === 'string' ? b : '');
+  // 超出固定缓冲区大小时直接拒绝，防止截断导致误判相等
+  if (aBuf.length > SAFE_CMP_LEN || bBuf.length > SAFE_CMP_LEN) return false;
   const paddedA = Buffer.alloc(SAFE_CMP_LEN);
   const paddedB = Buffer.alloc(SAFE_CMP_LEN);
-  aBuf.copy(paddedA, 0, 0, Math.min(aBuf.length, SAFE_CMP_LEN));
-  bBuf.copy(paddedB, 0, 0, Math.min(bBuf.length, SAFE_CMP_LEN));
+  aBuf.copy(paddedA);
+  bBuf.copy(paddedB);
   const contentEqual = crypto.timingSafeEqual(paddedA, paddedB);
   // 长度比较使用位运算避免分支预测差异（防御性做法，整数比较本身已极快）
   const lengthEqual = (aBuf.length ^ bBuf.length) === 0;
