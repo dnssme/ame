@@ -1,8 +1,22 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.29
+ * Anima 灵枢 · Webhook 服务 v5.30
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.30 相对于 v5.29）：
+ *
+ *   #FIX-5.30-1  /health Redis 故障时返回 HTTP 500 而非 200
+ *                - 原：httpStatus 仅由 dbOk 决定，Redis 不可用时仍返回
+ *                  200（status:'ok'），负载均衡器/K8s 探针无法检测到
+ *                  Redis 宕机，此时免费模型每日限额 fail-open 失效。
+ *                - 修：DB 故障 → 503，Redis 故障 → 500，均正常 → 200。
+ *
+ *   #FIX-5.30-2  启动时 SERVICE_TOKEN 缺失拒绝启动（fail-fast）
+ *                - 原：SERVICE_TOKEN 未设置时仅输出 warn，服务正常启动
+ *                  但所有 /billing/* 写入接口返回 503，核心计费功能
+ *                  完全不可用，而健康检查返回 200，运维无法感知。
+ *                - 修：缺失时 logger.error 并 process.exit(1)。
+ *
  * 修复记录（v5.29 相对于 v5.28）：
  *
  *   #FIX-5.29-1  ADMIN_TOKEN / SERVICE_TOKEN 最短长度加严至 64 字符
@@ -1138,7 +1152,8 @@ app.get('/health', async (_req, res) => {
     })(),
   ]);
 
-  const httpStatus = dbOk ? 200 : 503;
+  // FIX-5.30-1: DB 故障 → 503（不可用），Redis 故障 → 500（降级，免费限额失效），均正常 → 200
+  const httpStatus = !dbOk ? 503 : !redisOk ? 500 : 200;
 
   // FIX-5.23-2: 健康检查禁止缓存——确保探针获取实时状态
   res.set('Cache-Control', 'no-store, max-age=0');
@@ -2726,6 +2741,11 @@ if (SERVICE_TOKEN && SERVICE_TOKEN.length < 64) {
   logger.error('SERVICE_TOKEN 过短（< 64 字符 / 256 位），不满足 PCI-DSS 8.2.3 密钥长度要求，请使用 openssl rand -hex 32 生成，拒绝启动');
   process.exit(1);
 }
+// FIX-5.30-2: SERVICE_TOKEN 为计费核心鉴权凭据，缺失则所有 /billing/* 写入接口返回 503，拒绝启动
+if (!SERVICE_TOKEN) {
+  logger.error('SERVICE_TOKEN 未设置，计费服务核心功能不可用，拒绝启动。请设置 SERVICE_TOKEN 环境变量（openssl rand -hex 32）');
+  process.exit(1);
+}
 // FIX-5.28-1: PCI-DSS 4.1——检测 NODE_TLS_REJECT_UNAUTHORIZED=0（全局禁用 TLS 证书校验）
 // 此设置会使所有 HTTPS 连接（包括 DB SSL）跳过证书验证，生产环境严禁使用
 if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
@@ -2749,9 +2769,7 @@ const server = app.listen(PORT, HOST, () => {
   if (!ADMIN_TOKEN) {
     logger.warn('ADMIN_TOKEN 未设置，管理员接口已禁用');
   }
-  if (!SERVICE_TOKEN) {
-    logger.warn('SERVICE_TOKEN 未设置，/billing 写入接口将拒绝所有请求（fail-closed）');
-  }
+  // FIX-5.30-2: SERVICE_TOKEN 缺失已在启动校验阶段拒绝启动，此处无需冗余 warn
   logger.info('运行时配置', {
     freeDailyLimit:      getFreeDailyLimit(),
     maxSingleRequestFen: getMaxSingleRequestFen(),
