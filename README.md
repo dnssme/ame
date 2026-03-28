@@ -328,6 +328,7 @@ Anima 灵枢是一套**开源的私有 AI 助理部署方案**，基于 [LibreCh
 └── scripts/
     ├── watchdog.sh          # Webhook 健康检查看门狗
     ├── backup-pg.sh         # PostgreSQL 每日冷备（7 天保留）
+    ├── backup-nextcloud.sh  # Nextcloud 文件卷每日冷备（7 天保留）
     └── audit-setup.sh       # auditd 操作审计统一配置
 ```
 
