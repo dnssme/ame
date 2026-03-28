@@ -1349,7 +1349,7 @@ app.get('/billing/history/:email', readLimiter, requireServiceToken, async (req,
   }
 });
 
-// ─── 余额预检（只读，无需服务鉴权）──────────────────────────
+// ─── 余额预检（需要服务鉴权）──────────────────────────────────
 app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req, res) => {
   let {
     userEmail, modelName,
