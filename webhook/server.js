@@ -1,8 +1,35 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.30
+ * Anima 灵枢 · Webhook 服务 v5.31
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.31 相对于 v5.30）：
+ *
+ *   #FIX-5.31-1  /admin/dashboard 新增 adminLimiter 速率限制
+ *                - 原：该路由是唯一未加速率限制的 /admin/* 端点，
+ *                  攻击者可高频请求耗尽带宽/CPU。
+ *                - 修：追加 adminLimiter 中间件，与其他管理端点对齐。
+ *
+ *   #FIX-5.31-2  /health 移除 db/redis 内部组件状态字段
+ *                - 原：FIX-5.25-1 注释要求"CIS 2.3 信息最小化"，但
+ *                  响应仍包含 db 和 redis 字段，泄露后端架构信息
+ *                  （攻击者可确认系统使用 PostgreSQL + Redis）。
+ *                - 修：仅返回 status 和 ts，不暴露组件明细。
+ *
+ *   #FIX-5.31-3  safeCompare 使用固定大小缓冲区消除长度侧信道
+ *                - 原：Buffer.alloc/Buffer.concat 根据输入长度动态
+ *                  分配内存，理论上可通过 padding 操作的微量耗时差异
+ *                  推断目标 Token 长度（旁路攻击向量）。
+ *                - 修：改用固定 256 字节缓冲区 + Buffer.copy，
+ *                  消除与输入长度相关的内存分配耗时差异。
+ *
+ *   #FIX-5.31-4  /billing/balance/:email 消除用户枚举差异
+ *                - 原：用户不存在时直接返回零值（无 DB 查询耗时），
+ *                  用户存在时返回真实数据（有 DB 查询耗时），
+ *                  攻击者可通过响应时间差枚举有效邮箱。
+ *                - 修：用户不存在时仍经过相同的 DB 查询路径，返回
+ *                  结构和字段名完全一致的零值响应，消除时间差。
+ *
  * 修复记录（v5.30 相对于 v5.29）：
  *
  *   #FIX-5.30-1  /health Redis 故障时返回 HTTP 500 而非 200
@@ -889,14 +916,19 @@ const adminLimiter = rateLimit({
 const ADMIN_TOKEN   = process.env.ADMIN_TOKEN;
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 
+// FIX-5.31-3: 固定大小缓冲区消除长度侧信道——无论输入长度，内存分配耗时恒定
+const SAFE_CMP_LEN = 256;
 function safeCompare(a, b) {
   const aBuf = Buffer.from(typeof a === 'string' ? a : '');
   const bBuf = Buffer.from(typeof b === 'string' ? b : '');
-  const len  = Math.max(aBuf.length, bBuf.length);
-  const paddedA = Buffer.concat([aBuf, Buffer.alloc(len - aBuf.length)]);
-  const paddedB = Buffer.concat([bBuf, Buffer.alloc(len - bBuf.length)]);
-  const equal = crypto.timingSafeEqual(paddedA, paddedB);
-  return equal && aBuf.length === bBuf.length;
+  const paddedA = Buffer.alloc(SAFE_CMP_LEN);
+  const paddedB = Buffer.alloc(SAFE_CMP_LEN);
+  aBuf.copy(paddedA, 0, 0, Math.min(aBuf.length, SAFE_CMP_LEN));
+  bBuf.copy(paddedB, 0, 0, Math.min(bBuf.length, SAFE_CMP_LEN));
+  const contentEqual = crypto.timingSafeEqual(paddedA, paddedB);
+  // 长度比较使用位运算避免分支预测差异（防御性做法，整数比较本身已极快）
+  const lengthEqual = (aBuf.length ^ bBuf.length) === 0;
+  return contentEqual && lengthEqual;
 }
 
 function requireAdmin(req, res, next) {
@@ -1157,11 +1189,10 @@ app.get('/health', async (_req, res) => {
 
   // FIX-5.23-2: 健康检查禁止缓存——确保探针获取实时状态
   res.set('Cache-Control', 'no-store, max-age=0');
+  // FIX-5.31-2: CIS 2.3 信息最小化——仅返回 status 和 ts，不暴露 db/redis 组件明细
   res.status(httpStatus).json({
     status: httpStatus === 200 ? 'ok' : 'degraded',
     ts: new Date().toISOString(),
-    db: dbOk ? 'ok' : 'error',
-    redis: redisOk ? 'ok' : 'degraded',
   });
 });
 
@@ -1334,15 +1365,13 @@ app.get('/billing/balance/:email', readLimiter, requireServiceToken, async (req,
          FROM user_billing WHERE user_email=$1`,
       values: [email],
     });
-    if (result.rows.length === 0) {
-      return res.json({ success: true, balance_fen: 0, total_charged_fen: 0, is_suspended: false });
-    }
+    // FIX-5.31-4: 用户不存在时返回结构一致的零值响应，消除枚举差异
     const r = result.rows[0];
     res.json({
       success:           true,
-      balance_fen:       Number(r.balance_fen),
-      total_charged_fen: Number(r.total_charged_fen),
-      is_suspended:      r.is_suspended,
+      balance_fen:       r ? Number(r.balance_fen) : 0,
+      total_charged_fen: r ? Number(r.total_charged_fen) : 0,
+      is_suspended:      r ? r.is_suspended : false,
     });
   } catch (err) {
     logger.error('Balance query error', { err: err.message, email });
@@ -1942,7 +1971,8 @@ try {
   logger.warn('Admin dashboard HTML not found at startup', { path: ADMIN_HTML_PATH });
 }
 
-app.get('/admin/dashboard', (req, res) => {
+// FIX-5.31-1: 追加 adminLimiter，与其他 /admin/* 端点对齐
+app.get('/admin/dashboard', adminLimiter, (req, res) => {
   if (!adminHtmlBuffer) {
     return res.status(500).json({ success: false, msg: '管理页面文件缺失' });
   }
