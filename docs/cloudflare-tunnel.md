@@ -136,9 +136,11 @@ curl -sf https://chat.yourdomain.com/health
 ```
 用户 → Cloudflare Edge → Tunnel → VPS A (Nginx+WAF)
                                       ↓ WireGuard
-                              VPS B (OpenClaw)
+                              VPS B (OpenClaw + ClawBot)
                               VPS C (LibreChat)
-                              CXI4  (Webhook)
+                              VPS D (Nextcloud)
+                              VPS E (Webhook + Redis)
+                              CXI4  (Whisper + TTS + Email + HA)
 ```
 
-Cloudflare Tunnel 替代了直接暴露 VPS A 的公网 IP，所有入站流量通过 Cloudflare 网络中转。内网通信（WireGuard 172.16.1.0/24）不受影响。
+Cloudflare Tunnel 替代了直接暴露 VPS A 的公网 IP，所有入站流量通过 Cloudflare 网络中转。内网通信（WireGuard 172.16.1.0/24）不受影响。VPS D（Nextcloud）和 VPS E（Webhook + Redis）为纯内网服务，不经 Cloudflare 中转。
