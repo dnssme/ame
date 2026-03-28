@@ -493,7 +493,7 @@ echo "=== LibreChat 功能测试 ==="
 # 容器健康状态
 echo -n "[测试 1] 容器健康状态: "
 cd /opt/ai/repo/librechat
-STATUS=$(docker compose ps --format json | jq -r '.[0].Health // .[0].Status')
+STATUS=$(docker compose ps --format json 2>/dev/null | jq -r '.[0].Health // .[0].Status')
 echo "${STATUS}" | grep -qi 'healthy\|running' \
   && echo "✅ 通过 (${STATUS})" \
   || echo "❌ 失败 (${STATUS})"
@@ -657,8 +657,8 @@ free -h
 # 在 VPS C 测试内网连通性
 ping -c 2 172.16.1.6
 
-# 从 VPS C 测试 Redis 连接
-REDIS_PASS="<Redis密码>"
+# 从 VPS C 测试 Redis 连接（密码从 .env 提取）
+REDIS_PASS="$(grep '^REDIS_URI=' /opt/ai/repo/librechat/.env | sed 's|.*://:\([^@]*\)@.*|\1|')"
 redis-cli -h 172.16.1.6 -a "${REDIS_PASS}" ping
 # 预期：PONG
 

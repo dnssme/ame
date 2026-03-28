@@ -29,6 +29,7 @@
 
 - [ ] Ubuntu 22.04 LTS 全新安装，已完成基础系统更新
 - [ ] 已分配 WireGuard 内网 IP `172.16.1.5`
+- [ ] **VPS E (172.16.1.6) 已部署完成**（Webhook 计费服务 + Redis，所有服务依赖此节点）
 - [ ] Docker 和 Docker Compose 已安装（用于运行 ML 服务容器）
 
 ```bash

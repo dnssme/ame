@@ -701,6 +701,7 @@ docker compose exec openclaw sh -c \
 
 # 常见原因 2: Redis 不可达
 ping -c 2 172.16.1.6
+REDIS_PASS="$(grep '^REDIS_PASSWORD=' /opt/ai/repo/openclaw/.env | cut -d= -f2)"
 redis-cli -h 172.16.1.6 -a "${REDIS_PASS}" ping
 
 # 常见原因 3: 内存不足

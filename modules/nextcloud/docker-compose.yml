@@ -27,6 +27,14 @@ services:
 
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    pids_limit: 200
 
     ports:
       - "172.16.1.4:8090:80"
