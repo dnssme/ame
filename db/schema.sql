@@ -1,6 +1,15 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v5.3
+-- Anima 灵枢 · 数据库 Schema v5.4
 -- 数据库: librechat (Azure PostgreSQL)
+--
+-- 变更记录（v5.4）：
+--   · billing_transactions.user_email 新增外键引用 user_billing(user_email)，
+--     ON DELETE RESTRICT 防止存在流水记录的用户被删除（审计完整性）。
+--   · recharge_cards.used_by 新增外键引用 user_billing(user_email)，
+--     ON DELETE SET NULL 保留卡密记录但清除已删除用户的关联。
+--   · billing_transactions.amount_fen CHECK 约束增强为类型感知：
+--     charge/recharge/refund 类型强制 > 0（防止负数流水破坏审计语义），
+--     admin_adjust 类型保持 != 0（允许正负但禁止零值）。
 --
 -- 变更记录（v5.3）：
 --   · 新增 api_providers 表（实现"数据库统一调用"）
@@ -440,7 +449,8 @@ CREATE TABLE IF NOT EXISTS recharge_cards (
     label       VARCHAR(128),
     used        BOOLEAN       NOT NULL DEFAULT false,
     used_at     TIMESTAMPTZ,
-    used_by     VARCHAR(254),
+    -- v5.4: FK 关联 user_billing，ON DELETE SET NULL 保留卡密记录
+    used_by     VARCHAR(254)  REFERENCES user_billing(user_email) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
@@ -488,17 +498,27 @@ COMMENT ON COLUMN api_usage.idempotency_key IS
 
 -- =============================================================
 -- 5. 充值/扣费流水
+-- v5.4: user_email 新增 FK → user_billing，ON DELETE RESTRICT 保护审计完整性
+--       amount_fen CHECK 增强为类型感知（charge/recharge/refund > 0，admin_adjust != 0）
 -- v5.3: 新增 CHECK (amount_fen != 0) 防止零金额流水在 DB 层绕过应用校验写入
 -- =============================================================
 CREATE TABLE IF NOT EXISTS billing_transactions (
     id                BIGSERIAL     PRIMARY KEY,
-    user_email        VARCHAR(254)  NOT NULL,
+    -- v5.4: FK 关联 user_billing，防止存在流水记录的用户被删除
+    user_email        VARCHAR(254)  NOT NULL REFERENCES user_billing(user_email) ON DELETE RESTRICT,
     type              VARCHAR(16)   NOT NULL CHECK (type IN ('charge','recharge','refund','admin_adjust')),
-    amount_fen        NUMERIC(12,4) NOT NULL CHECK (amount_fen != 0),
+    amount_fen        NUMERIC(12,4) NOT NULL,
     balance_after_fen NUMERIC(12,2) NOT NULL CHECK (balance_after_fen >= 0),
     description       TEXT,
     ref_id            VARCHAR(128),
-    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    -- v5.4: 类型感知 CHECK——charge/recharge/refund 强制正数，admin_adjust 允许正负但禁止零
+    -- 注：admin_adjust 负数扣减时，应用层使用 GREATEST(0, balance_fen + amount) 截断余额，
+    --     实际写入的 amount_fen 是截断后的实际变动值，balance_after_fen 始终 >= 0
+    CONSTRAINT chk_billing_txn_amount CHECK (
+        (type IN ('charge', 'recharge', 'refund') AND amount_fen > 0)
+        OR (type = 'admin_adjust' AND amount_fen != 0)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_billing_txn_user
