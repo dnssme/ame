@@ -10,7 +10,8 @@ services:
     container_name: openclaw
     restart: unless-stopped
 
-    # VPS B 1GB：OpenClaw 384m + ClawBot 192m + Telegram 128m + WeChat 192m ≈ 896m → 内核留 ~128m
+    # VPS B 1GB：OpenClaw 384m + ClawBot 192m = 576m → 系统留 ~448m
+    # 若同时启用 Telegram 128m + WeChat 192m，建议升级至 2GB RAM
     mem_limit: 384m
     mem_reservation: 180m
     # CPU 限制（CIS 2.4 防止资源耗尽）
