@@ -11469,6 +11469,63 @@ app.post('/clawbot/admin/api/wechat/revoke', adminLimiter, requireAdminIp, requi
   });
 });
 
+// ─── v3.2 超级管理员设置（Web 唯一管理入口）────────────────────
+
+// 获取系统配置概览（仅 Web 管理面可访问）
+app.get('/clawbot/admin/api/settings', adminLimiter, requireAdminIp, requireServiceToken, (_req, res) => {
+  res.json({
+    system: {
+      version: 'v3.2',
+      port: PORT,
+      log_level: process.env.LOG_LEVEL || 'info',
+      uptime_seconds: Math.floor((Date.now() - stats.startedAt) / 1000),
+      encrypt_mode: ENCRYPT_MODE ? 'AES-256-CBC（安全模式）' : '明文模式',
+      voice_enabled: VOICE_ENABLED,
+      wecom_enabled: WECOM_ENABLED,
+      db_enabled: !!pgPool,
+      redis_connected: !!redis,
+    },
+    ai: {
+      default_model: DEFAULT_MODEL,
+      agent_api_url: (() => { try { const u = new URL(AGENT_API_URL); if (u.username || u.password) { u.username = '***'; u.password = '***'; } return u.toString().replace(/\/$/, ''); } catch (_e) { return '(invalid URL)'; } })(),
+      request_timeout_ms: AGENT_REQUEST_TIMEOUT_MS,
+    },
+    session: {
+      max_sessions: MAX_SESSIONS,
+      session_ttl_sec: Math.floor(SESSION_TTL / 1000),
+      idle_timeout_min: IDLE_SESSION_TIMEOUT_MIN,
+      admin_session_ttl_sec: ADMIN_SESSION_TTL,
+      admin_session_max_age_sec: ADMIN_SESSION_MAX_AGE,
+    },
+    security: {
+      user_rate_limit: USER_RATE_LIMIT,
+      rate_window_sec: USER_RATE_WINDOW_SEC,
+      bind_lockout_threshold: BIND_LOCKOUT_THRESHOLD,
+      bind_lockout_duration_min: BIND_LOCKOUT_DURATION_MIN,
+      admin_ip_allowlist: ADMIN_IP_ALLOWLIST.length > 0
+        ? ADMIN_IP_ALLOWLIST.map(ip => ip.replace(/\d+$/, '***'))
+        : ['未配置（允许所有 IP）'],
+      oauth_scope: OAUTH_SCOPE,
+      oauth_state_ttl_sec: OAUTH_STATE_TTL,
+      session_encryption: !!process.env.SESSION_ENCRYPT_KEY,
+      hkdf_salt_configured: process.env.HKDF_SALT ? true : false,
+    },
+    compliance: {
+      audit_retention_days: AUDIT_RETENTION_DAYS,
+      compliance_scan_interval_hours: Math.floor(COMPLIANCE_SCAN_INTERVAL_MS / 3600000),
+      sla_target_uptime: SLA_TARGET_UPTIME,
+      quota_default_daily: QUOTA_DEFAULT_DAILY,
+    },
+    stats_summary: {
+      total_messages: stats.totalMessages,
+      total_commands: stats.totalCommands,
+      total_errors: stats.totalErrors,
+      admin_logins: stats.adminLogins,
+      settings_updated: stats.settingsUpdated,
+    },
+  });
+});
+
 // ─── v3.2 CIS Controls v8 合规基线（ENT-3.2-5）──────────────────
 
 // CIS 控制项状态查询
