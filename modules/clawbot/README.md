@@ -1,12 +1,12 @@
-# 微信 ClawBot 插件灵枢接入通道 v2.4
+# 微信 ClawBot 插件灵枢接入通道 v3.2
 
 ## 概述
 
 基于微信官方 ClawBot 插件 API，将 Anima 灵枢 AI 助手接入微信。
 **使用官方微信接入方式**（扫码关注 / App 互通 / OAuth2.0 网页授权 / 官方插件商店），完全契合官方接入要求。
 
-2026年3月22日，腾讯官方宣布在微信中推出"ClawBot"插件。本通道 v2.4 在 v2.3 全面对接官方 ClawBot 插件 API 的基础上，
-新增插件验证挑战-响应、用户隐私同意管理、个性化偏好设置、合规性报告、健康仪表板等企业级功能，
+2026年3月22日，腾讯官方宣布在微信中推出"ClawBot"插件。本通道 v3.2 在全面对接官方 ClawBot 插件 API 的基础上，
+实现了微信开放平台第三方平台组件授权、全局强制登录网关、增强租户隔离、Web 专属管理面板、CIS Controls v8 合规基线评估等企业级功能，
 全面提升安全合规水平和用户体验。
 
 用户通过微信 ClawBot 插件与 AI 对话，支持文字、语音、图片/文件、位置、链接等消息类型。
@@ -16,7 +16,75 @@
 > **企业微信接口**：已添加完整的企业微信（WeCom）Webhook 接口，但**默认不启用**。
 > 如需使用企业微信，设置 `WECOM_ENABLED=true` 并配置相关参数。
 
-## v2.4 新特性
+## v3.2 新特性
+
+- **微信开放平台第三方平台组件授权（ENT-3.2-1）**：采用官方第三方平台组件授权模型，新增 `POST /clawbot/component/verify_ticket`（接收微信平台 component_verify_ticket）和 `GET /clawbot/component/auth_callback`（授权回调）。替代自建 OAuth，对齐官方 OpenClaw 规范。
+- **全局强制登录网关（ENT-3.2-2）**：新增 `requireAuthSession` 中间件，对所有用户端点强制登录（PCI-DSS 8.2 / CIS 5.1）。健康探针、Webhook、OAuth 等路径豁免。未认证请求返回 401 并附登录引导。
+- **增强租户隔离（ENT-3.2-3）**：新增 `enforceRequestIsolation` 中间件，每次请求校验租户边界（HKDF 加密隔离 + 数据库 RLS）。跨租户访问尝试自动记录审计日志。
+- **Web 专属管理面板（ENT-3.2-4）**：新增 `GET/PUT /clawbot/admin/api/wechat/config`（微信配置管理）、`GET /clawbot/admin/api/wechat/authorizers`（授权列表）、会话监控、权限撤销等端点。微信消息端管理命令全面封禁，降低攻击面。
+- **CIS Controls v8 合规基线评估（ENT-3.2-5）**：新增 `GET /clawbot/compliance/cis`（合规状态查询）和 `POST /clawbot/compliance/cis/assess`（基线评估），覆盖 CIS 1.x/4.x/6.x/8.x/16.x 控制域，与 PCI-DSS v4.0 双框架覆盖。
+- **增强统计指标（ENT-3.2-6）**：新增 componentVerifyTickets、authEnforcementBlocked、isolationViolations、cisAssessments 计数器。
+- **数据库迁移 020**：新增 `clawbot_wechat_component_config`、`clawbot_wechat_authorizers`、`clawbot_auth_enforcement_log`、`clawbot_isolation_audit`、`clawbot_cis_controls` 五张表。
+
+## v3.1 新特性（历史版本）
+
+- **微信原生 OAuth 登录（ENT-3.1-1）**：新增 `/clawbot/auth/wechat-login` 和 `/clawbot/auth/wechat-callback` 端点，一键微信登录，零知识引导用户接入所有 ClawBot 功能。
+- **插件生命周期回调（ENT-3.1-2）**：新增 `/clawbot/plugin/lifecycle` 端点，支持 install/uninstall/update/enable/disable 事件，对齐 2026-03-22 官方 ClawBot 规范。
+- **统一集成中枢（ENT-3.1-3）**：新增 `/clawbot/portal/dispatch`（功能路由）和 `/clawbot/portal/integrations`（集成状态）端点，支持同步/异步调度模式。
+- **行级安全策略执行（ENT-3.1-4）**：新增 `enforceRowLevelSecurity()` 中间件，PostgreSQL RLS 策略跟踪和跨租户行级访问校验（PCI-DSS 7.1）。
+- **企业计费与计量（ENT-3.1-5）**：新增 `/clawbot/ops/billing`（计费概览）和 `/clawbot/ops/billing/export`（账单导出）端点。租户级功能使用量跟踪和费用聚合。
+- **合规自动化（ENT-3.1-6）**：新增 `/clawbot/compliance/audit-trail`（审计轨迹）和 `/clawbot/compliance/scan`（合规扫描）端点。增强 PCI-DSS 3.5 密钥管理和 CIS 6.x 生命周期安全。
+- **数据库迁移 019**：新增 `clawbot_wechat_login_sessions`、`clawbot_billing_records`、`clawbot_rls_policies`、`clawbot_plugin_lifecycle` 四张表。
+
+## v3.0 新特性（历史版本）
+
+- **自助引导门户（ENT-3.0-1）**：新增 `/clawbot/lingshu/onboard` 端点，零知识用户引导五步流程：注册 → 绑定 → 同意 → 激活 → 完成。
+- **统一登录网关（ENT-3.0-2）**：新增 `/clawbot/auth/login`、`/auth/refresh`、`/auth/session`、`/auth/logout` 端点。HMAC-SHA256 签名令牌自动续期（PCI-DSS 8.2.4）。
+- **统一功能门户（ENT-3.0-3）**：新增 `/clawbot/portal/features`、`/portal/invoke`、`/portal/status` 端点，所有功能（AI、搜索、日历、邮件、云存储、智能家居、语音等）集中管理。
+- **租户加密命名空间（ENT-3.0-4）**：租户级 HKDF 密钥派生隔离。跨租户访问中间件。数据分类标签执行（CIS 4.x）。
+- **合规增强（ENT-3.0-7）**：租户级密钥管理（PCI-DSS 3.5）、统一登录覆盖（8.2.4）、自动合规证据收集（10.2）。新增 `/clawbot/compliance/evidence` 端点。
+- **数据库迁移 018**：新增 ClawBot v3.0 相关表。
+
+## v2.9 新特性（历史版本）
+
+- **统一灵枢通道（ENT-2.9-1）**：新增 `/clawbot/lingshu/connect`、`/status`、`/init` 端点，自动检测微信/企业微信/小程序平台并路由。
+- **强制认证网关（ENT-2.9-2）**：全局认证中间件，HKDF 派生会话令牌自动刷新（PCI-DSS 3.5 + 8.2）。
+- **增强数据隔离（ENT-2.9-3）**：行级隔间校验、加密数据边界检查、跨用户访问审计轨迹、自动数据分类标签（CIS 4.x）。
+- **企业运营（ENT-2.9-5）**：新增 `/clawbot/ops/sla`、`/ops/usage`、`/ops/quota` 端点，SLA 监控、使用量计量、配额管理。
+- **数据库迁移 017**：新增 ClawBot v2.9 相关表。
+
+## v2.8 新特性（历史版本）
+
+- **完整客服系统（ENT-2.8-1）**：客服账号管理 CRUD 端点，主动消息发送，会话状态查询。集成微信 customservice/kfaccount API。
+- **内容生命周期管理（ENT-2.8-2）**：草稿、发布、评论管理。自动回复规则查询。新增 `/clawbot/draft`、`/publish`、`/comment` 端点。
+- **订阅消息管理（ENT-2.8-3）**：新增 `/clawbot/subscribe/send` 和 `/subscribe/templates` 端点。
+- **个性化菜单（ENT-2.8-4）**：新增 `/clawbot/menu/conditional` 端点，支持条件菜单和菜单配置测试。
+- **一键引导（ENT-2.8-6）**：新增 `/quickstart` 命令，自动检测 → 自动绑定 → 自动激活。
+- **数据库迁移 016**：新增 ClawBot v2.8 相关表。
+
+## v2.7 新特性（历史版本）
+
+- **Web 管理后台（ENT-2.7-1）**：新增 `/clawbot/admin` 单页应用，统一管理界面。Redis + PostgreSQL 双写会话管理。CSRF 保护和 IP 访问控制。
+- **管理仪表板集成（ENT-2.7-2）**：实时统计、用户管理（列表/搜索/封禁）、消息管理（群发/模板/快捷回复）、公众号管理、企业运营、合规审计、插件状态。
+- **管理端安全加固（ENT-2.7-3）**：会话超时 ≤15 min（PCI-DSS 8.2.8）。特权操作审计（10.2.2）。HMAC-SHA256 时序安全令牌。IP + User-Agent 会话绑定。
+- **数据库迁移 015**：新增 `clawbot_admin_sessions` 表。
+
+## v2.6 新特性（历史版本）
+
+- **统一通道网关（ENT-2.6-1）**：新增通道注册/发现/管理端点，动态通道路由和能力矩阵查询。
+- **引导向导（ENT-2.6-2）**：新增 `/setup` 命令，分步引导用户完成绑定 → 同意 → 激活 → 配置。
+- **Webhook 事件中继（ENT-2.6-3）**：第三方 Webhook 订阅/推送/重试。HMAC-SHA256 签名验证（PCI-DSS 4.2.1）。
+- **跨通道会话联邦（ENT-2.6-4）**：微信 ↔ 企业微信会话关联。联邦身份管理与审计日志。
+- **数据库迁移 014**：新增 `clawbot_gateway` 相关表。
+
+## v2.5 新特性（历史版本）
+
+- **插件自助激活（ENT-2.5-1）**：新增 `/activate` 命令，一键激活。绑定 → 同意 → 激活引导流程。激活状态持久化到 Redis + PostgreSQL。
+- **多租户数据隔离（ENT-2.5-2）**：新增 `clawbot_tenants` 和 `clawbot_api_keys` 表。租户级 Redis 命名空间。按租户限速和功能开关。API 密钥哈希存储（PCI-DSS 3.4）。
+- **插件协议增强（ENT-2.5-3）**：新增 `/clawbot/plugin/heartbeat` 和 `/plugin/negotiate` 端点。插件清单更新 v2.5 能力声明。
+- **数据库迁移 013**：新增 `clawbot_tenants` 和 `clawbot_api_keys` 表。
+
+## v2.4 新特性（历史版本）
 
 - **插件验证挑战-响应（ENT-2.4-1）**：新增 `POST /clawbot/plugin/verify` 端点，接受微信平台验证挑战并返回 HMAC-SHA256 签名响应。用于插件商店上架审核与定期合规性验证。
 - **用户隐私同意管理（ENT-2.4-2）**：新增 `/consent` 命令和 `/consent agree` 命令，用户可查看并同意数据处理协议。同意记录持久化到新增 `clawbot_user_consent` 表（PCI-DSS v4.0 / GDPR 合规）。支持 `data_processing`、`privacy_policy`、`terms_of_service` 三种同意类型。
@@ -316,7 +384,38 @@ docker compose up -d
 | `/clawbot/plugin/status` | GET | 插件运行状态（用户数、基础设施） | SERVICE_TOKEN + IP白名单 |
 | `/clawbot/plugin/verify` | POST | 插件验证挑战-响应（商店认证） | ❌ |
 | `/clawbot/plugin/health` | GET | 插件健康仪表板（依赖检查 + 延迟监控） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/plugin/heartbeat` | POST | 插件心跳（v2.5+） | SERVICE_TOKEN |
+| `/clawbot/plugin/negotiate` | POST | 插件能力协商（v2.5+） | SERVICE_TOKEN |
+| `/clawbot/plugin/lifecycle` | POST | 插件生命周期回调（v3.1+） | SERVICE_TOKEN |
+| `/clawbot/plugin/sdk/callback` | POST | SDK 事件回调（v2.9+） | SERVICE_TOKEN |
 | `/clawbot/compliance/report` | GET | PCI-DSS / CIS 合规性自检报告 | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/compliance/cis` | GET | CIS Controls v8 合规状态（v3.2+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/compliance/cis/assess` | POST | CIS 合规基线评估（v3.2+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/compliance/evidence` | GET | 合规证据收集（v3.0+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/compliance/audit-trail` | GET | 审计轨迹查询（v3.1+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/compliance/scan` | POST | 合规扫描（v3.1+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/auth/wechat-login` | POST | 微信原生 OAuth 登录（v3.1+） | ❌ |
+| `/clawbot/auth/wechat-callback` | GET | 微信 OAuth 回调（v3.1+） | ❌ |
+| `/clawbot/auth/login` | POST | 统一登录（v3.0+） | ❌ |
+| `/clawbot/auth/refresh` | POST | 令牌刷新（v3.0+） | Session |
+| `/clawbot/auth/session` | GET | 会话状态查询（v3.0+） | Session |
+| `/clawbot/auth/logout` | POST | 登出（v3.0+） | Session |
+| `/clawbot/portal/dispatch` | POST | 统一功能路由（v3.1+） | Session |
+| `/clawbot/portal/integrations` | GET | 集成状态查询（v3.1+） | SERVICE_TOKEN |
+| `/clawbot/portal/features` | GET | 功能门户列表（v3.0+） | Session |
+| `/clawbot/portal/invoke` | POST | 功能调用（v3.0+） | Session |
+| `/clawbot/portal/status` | GET | 门户状态（v3.0+） | SERVICE_TOKEN |
+| `/clawbot/lingshu/onboard` | POST | 自助引导门户（v3.0+） | ❌ |
+| `/clawbot/lingshu/connect` | POST | 统一灵枢通道连接（v2.9+） | ❌ |
+| `/clawbot/ops/billing` | GET | 企业计费概览（v3.1+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/ops/billing/export` | POST | 账单导出（v3.1+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/ops/dashboard` | GET | 运营仪表板（v3.0+） | SERVICE_TOKEN + IP白名单 |
+| `/clawbot/component/verify_ticket` | POST | 微信组件验证票据（v3.2+） | 微信平台 |
+| `/clawbot/component/auth_callback` | GET | 微信组件授权回调（v3.2+） | ❌ |
+| `/clawbot/admin` | GET | Web 管理后台首页（v2.7+） | Admin Session |
+| `/clawbot/admin/api/wechat/config` | GET/PUT | 微信配置管理（v3.2+） | Admin Session |
+| `/clawbot/admin/api/wechat/authorizers` | GET | 授权列表查询（v3.2+） | Admin Session |
+| `/clawbot/admin/api/settings` | GET | 超级管理员设置（v3.2+） | Admin Session |
 | `/stats` | GET | 运营统计（消息数、会话数、封禁数等） | SERVICE_TOKEN + IP白名单 |
 | `/wecom/webhook` | GET | 企业微信 URL 验证（需启用） | WeCom签名 |
 | `/wecom/webhook` | POST | 企业微信消息接收（需启用） | WeCom签名 |
