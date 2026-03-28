@@ -129,7 +129,7 @@ tr:hover{background:rgba(59,130,246,.05)}
   <nav class="sidebar">
     <div class="sidebar-header">
       <h2>🔮 灵枢管理</h2>
-      <div class="ver">ClawBot v2.8</div>
+      <div class="ver">ClawBot v3.2</div>
     </div>
     <div class="nav-group">
       <div class="nav-group-title">概览</div>
@@ -156,6 +156,12 @@ tr:hover{background:rgba(59,130,246,.05)}
       <div class="nav-item" data-page="condmenu"><span class="icon">🎯</span><span>个性化菜单</span></div>
     </div>
     <div class="nav-group">
+      <div class="nav-group-title">微信接入管理</div>
+      <div class="nav-item" data-page="wxconfig"><span class="icon">⚙️</span><span>接入配置</span></div>
+      <div class="nav-item" data-page="wxauthorizers"><span class="icon">🔐</span><span>授权管理</span></div>
+      <div class="nav-item" data-page="wxsessions"><span class="icon">👤</span><span>登录会话</span></div>
+    </div>
+    <div class="nav-group">
       <div class="nav-group-title">企业运营</div>
       <div class="nav-item" data-page="tenants"><span class="icon">🏢</span><span>租户管理</span></div>
       <div class="nav-item" data-page="gateway"><span class="icon">🔗</span><span>通道网关</span></div>
@@ -165,6 +171,7 @@ tr:hover{background:rgba(59,130,246,.05)}
     <div class="nav-group">
       <div class="nav-group-title">安全与合规</div>
       <div class="nav-item" data-page="compliance"><span class="icon">🛡️</span><span>合规报告</span></div>
+      <div class="nav-item" data-page="cis"><span class="icon">📋</span><span>CIS 基线</span></div>
       <div class="nav-item" data-page="audit"><span class="icon">📝</span><span>审计日志</span></div>
       <div class="nav-item" data-page="plugin"><span class="icon">🔌</span><span>插件状态</span></div>
     </div>
@@ -393,6 +400,49 @@ tr:hover{background:rgba(59,130,246,.05)}
         </div>
         <div id="condmenu-content" class="loading">加载中...</div>
       </div>
+
+      <!-- v3.2 微信接入管理 -->
+      <div class="page" id="page-wxconfig">
+        <div class="card">
+          <div class="card-title">微信接入配置</div>
+          <div class="card-subtitle" style="color:var(--text-muted);font-size:12px;margin-bottom:16px">
+            ⚠️ 所有微信管理操作仅允许通过此 Web 管理面执行（CIS 4.1 / PCI-DSS 7.1）
+          </div>
+          <div id="wxconfig-content" class="loading">加载中...</div>
+        </div>
+      </div>
+
+      <div class="page" id="page-wxauthorizers">
+        <div class="card">
+          <div class="card-title">微信授权管理</div>
+          <div class="toolbar" style="margin-bottom:12px">
+            <button class="btn btn-outline btn-sm" onclick="loadWxAuthorizers()">🔄 刷新</button>
+          </div>
+          <div id="wxauthorizers-content" class="loading">加载中...</div>
+        </div>
+      </div>
+
+      <div class="page" id="page-wxsessions">
+        <div class="card">
+          <div class="card-title">微信登录会话监控</div>
+          <div class="toolbar" style="margin-bottom:12px">
+            <button class="btn btn-outline btn-sm" onclick="loadWxSessions()">🔄 刷新</button>
+          </div>
+          <div id="wxsessions-content" class="loading">加载中...</div>
+        </div>
+      </div>
+
+      <!-- v3.2 CIS 合规基线 -->
+      <div class="page" id="page-cis">
+        <div class="card">
+          <div class="card-title">CIS Controls v8 合规基线</div>
+          <div class="toolbar" style="margin-bottom:12px">
+            <button class="btn btn-primary btn-sm" onclick="runCisAssess()">🔍 执行评估</button>
+            <button class="btn btn-outline btn-sm" onclick="loadCisControls()">🔄 刷新</button>
+          </div>
+          <div id="cis-content" class="loading">加载中...</div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -417,7 +467,8 @@ const pageTitles = {
   templates:'模板消息',quickreply:'快捷回复',menu:'自定义菜单',qrcode:'二维码',
   material:'素材管理',tags:'标签管理',tenants:'租户管理',gateway:'通道网关',
   relay:'事件中继',federation:'会话联邦',compliance:'合规报告',audit:'审计日志',plugin:'插件状态',
-  kf:'客服系统',drafts:'草稿/发布',comments:'评论管理',subscribe:'订阅消息',condmenu:'个性化菜单'
+  kf:'客服系统',drafts:'草稿/发布',comments:'评论管理',subscribe:'订阅消息',condmenu:'个性化菜单',
+  wxconfig:'微信接入配置',wxauthorizers:'微信授权管理',wxsessions:'登录会话监控',cis:'CIS 合规基线'
 };
 
 /* ── Auth ── */
@@ -502,7 +553,8 @@ function loadPage(page){
     tenants:loadTenants,gateway:loadGateway,relay:loadRelay,federation:loadFederation,
     compliance:()=>showComplianceTab('report'),audit:loadAudit,plugin:()=>showPluginTab('status'),
     kf:()=>showKfTab('accounts'),drafts:()=>showDraftTab('list'),comments:()=>showCommentTab('list'),
-    subscribe:()=>showSubscribeTab('templates'),condmenu:()=>showCondMenuTab('list')
+    subscribe:()=>showSubscribeTab('templates'),condmenu:()=>showCondMenuTab('list'),
+    wxconfig:loadWxConfig,wxauthorizers:loadWxAuthorizers,wxsessions:loadWxSessions,cis:loadCisControls
   };
   if(loaders[page]) loaders[page]();
 }
@@ -1081,6 +1133,94 @@ async function showCondMenuTab(tab){
 }
 async function createCondMenu(){const s=document.getElementById('cond-menu-json').value.trim();if(!s)return;let j;try{j=JSON.parse(s)}catch(e){return alert('JSON 格式错误')}await api('POST','/menu/conditional',j);alert('创建成功');showCondMenuTab('list')}
 async function testMenuMatch(){const u=document.getElementById('cond-test-user').value.trim();if(!u)return;const d=await api('POST','/menu/trymatch',{user_id:u});document.getElementById('cond-test-result').innerHTML='<pre style="background:var(--card);padding:16px;border-radius:8px;overflow:auto">'+esc(JSON.stringify(d.menu,null,2))+'</pre>'}
+
+/* ── v3.2 微信接入管理 ── */
+async function loadWxConfig(){
+  const el=document.getElementById('wxconfig-content');
+  try{
+    const d=await api('GET','/clawbot/admin/api/wechat/config');
+    el.innerHTML=`
+      <div class="stats-grid">
+        <div class="stat-card"><div class="label">接入模式</div><div class="value">${esc(d.mode==='open_platform'?'开放平台':'直连')}</div></div>
+        <div class="stat-card"><div class="label">Component AppID</div><div class="value">${esc(d.component_appid||'未配置')}</div></div>
+        <div class="stat-card"><div class="label">App ID</div><div class="value">${esc(d.app_id||'未配置')}</div></div>
+        <div class="stat-card"><div class="label">加密模式</div><div class="value">${d.encrypt_mode?'✅ 已启用':'❌ 未启用'}</div></div>
+        <div class="stat-card"><div class="label">OAuth 范围</div><div class="value">${esc(d.oauth_scope)}</div></div>
+      </div>
+      <div style="margin-top:16px">
+        <h4 style="margin-bottom:8px">合规状态</h4>
+        <div class="stats-grid">
+          <div class="stat-card"><div class="label">认证方式</div><div class="value" style="font-size:12px">${esc(d.compliance?.auth_method||'N/A')}</div></div>
+          <div class="stat-card"><div class="label">PCI-DSS</div><div class="value">${esc(d.compliance?.pci_dss||'N/A')}</div></div>
+          <div class="stat-card"><div class="label">CIS</div><div class="value">${esc(d.compliance?.cis||'N/A')}</div></div>
+        </div>
+      </div>
+      ${d.configs&&d.configs.length?'<table style="margin-top:16px"><tr><th>租户</th><th>Component AppID</th><th>类型</th><th>状态</th><th>创建时间</th></tr>'+d.configs.map(c=>'<tr><td>'+esc(c.tenant_id)+'</td><td>'+esc(c.component_appid)+'</td><td>'+esc(c.auth_type)+'</td><td>'+esc(c.status)+'</td><td>'+new Date(c.created_at).toLocaleString()+'</td></tr>').join('')+'</table>':''}
+    `;
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+
+async function loadWxAuthorizers(){
+  const el=document.getElementById('wxauthorizers-content');
+  try{
+    const d=await api('GET','/clawbot/admin/api/wechat/authorizers');
+    if(!d.authorizers||!d.authorizers.length){
+      el.innerHTML='<p>暂无授权方</p>';return;
+    }
+    el.innerHTML='<table><tr><th>授权方 AppID</th><th>名称</th><th>类型</th><th>状态</th><th>授权时间</th><th>操作</th></tr>'+
+      d.authorizers.map(a=>'<tr><td>'+esc(a.authorizer_appid)+'</td><td>'+esc(a.authorizer_name||'-')+'</td><td>'+esc(a.authorizer_type)+'</td><td>'+esc(a.status)+'</td><td>'+new Date(a.authorized_at).toLocaleString()+'</td><td>'+(a.status==='active'?'<button class="btn btn-danger btn-sm revoke-btn" data-appid="'+esc(a.authorizer_appid)+'">吊销</button>':'<span style="color:var(--text-muted)">已吊销</span>')+'</td></tr>').join('')+'</table>';
+    el.querySelectorAll('.revoke-btn').forEach(btn=>{btn.addEventListener('click',()=>revokeAuthorizer(btn.dataset.appid))});
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+
+async function revokeAuthorizer(appid){
+  if(!confirm('确认吊销该授权方？此操作不可撤销。'))return;
+  await api('POST','/clawbot/admin/api/wechat/revoke',{authorizer_appid:appid});
+  alert('已吊销');loadWxAuthorizers();
+}
+
+async function loadWxSessions(){
+  const el=document.getElementById('wxsessions-content');
+  try{
+    const d=await api('GET','/clawbot/admin/api/wechat/sessions');
+    if(!d.sessions||!d.sessions.length){
+      el.innerHTML='<p>暂无活跃会话</p>';return;
+    }
+    el.innerHTML='<table><tr><th>用户 OpenID</th><th>昵称</th><th>平台</th><th>登录方式</th><th>IP</th><th>登录时间</th><th>过期时间</th></tr>'+
+      d.sessions.map(s=>'<tr><td>'+esc(s.open_id)+'</td><td>'+esc(s.nickname||'-')+'</td><td>'+esc(s.platform)+'</td><td>'+esc(s.login_method)+'</td><td>'+esc(s.ip_address||'-')+'</td><td>'+new Date(s.created_at).toLocaleString()+'</td><td>'+new Date(s.expires_at).toLocaleString()+'</td></tr>').join('')+'</table>';
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+
+/* ── v3.2 CIS 合规基线 ── */
+async function loadCisControls(){
+  const el=document.getElementById('cis-content');
+  try{
+    const d=await api('GET','/clawbot/compliance/cis');
+    const statusColors={compliant:'var(--success)',partial:'var(--warning)',non_compliant:'var(--danger)',not_assessed:'var(--text-muted)'};
+    const statusLabels={compliant:'✅ 合规',partial:'⚠️ 部分',non_compliant:'❌ 不合规',not_assessed:'⬜ 未评估'};
+    el.innerHTML=`
+      <div class="stats-grid" style="margin-bottom:16px">
+        <div class="stat-card"><div class="label">总控制项</div><div class="value">${d.summary?.total||0}</div></div>
+        <div class="stat-card"><div class="label">合规</div><div class="value" style="color:var(--success)">${d.summary?.compliant||0}</div></div>
+        <div class="stat-card"><div class="label">不合规</div><div class="value" style="color:var(--danger)">${d.summary?.non_compliant||0}</div></div>
+        <div class="stat-card"><div class="label">未评估</div><div class="value">${d.summary?.not_assessed||0}</div></div>
+      </div>
+      <table><tr><th>控制项 ID</th><th>名称</th><th>分类</th><th>PCI-DSS 映射</th><th>状态</th><th>最后评估</th></tr>
+      ${(d.controls||[]).map(c=>'<tr><td>'+esc(c.id)+'</td><td>'+esc(c.name)+'</td><td>'+esc(c.category)+'</td><td>'+esc(c.pci_map||'-')+'</td><td style="color:'+statusColors[c.status]+'">'+statusLabels[c.status]+'</td><td>'+(c.last_assessed?new Date(c.last_assessed).toLocaleString():'未评估')+'</td></tr>').join('')}
+      </table>`;
+  }catch(e){el.innerHTML='<p class="error">加载失败: '+esc(e.message)+'</p>'}
+}
+
+async function runCisAssess(){
+  if(!confirm('确认执行 CIS Controls v8 合规评估？'))return;
+  const el=document.getElementById('cis-content');
+  el.innerHTML='<p>正在评估...</p>';
+  try{
+    const d=await api('POST','/clawbot/compliance/cis/assess');
+    alert('评估完成：合规 '+d.summary.compliant+'/'+d.summary.total);
+    loadCisControls();
+  }catch(e){el.innerHTML='<p class="error">评估失败: '+esc(e.message)+'</p>'}
+}
 </script>
 </body>
 </html>

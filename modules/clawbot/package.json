@@ -1,6 +1,6 @@
 {
   "name": "anima-clawbot",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "Anima 灵枢 · 微信 ClawBot 插件灵枢接入通道",
   "main": "bot.js",
   "engines": {
