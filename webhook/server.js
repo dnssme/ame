@@ -1083,7 +1083,11 @@ function parseCIDR(cidr) {
   if (!Number.isFinite(prefixLen) || prefixLen < 0 || prefixLen > maxBits) return null;
   // 将 IP 转为字节数组
   const buf = family === 4
-    ? Buffer.from(ip.split('.').map(Number))
+    ? (() => {
+        const octets = ip.split('.').map(Number);
+        if (octets.length !== 4 || octets.some(o => !Number.isFinite(o) || o < 0 || o > 255)) return null;
+        return Buffer.from(octets);
+      })()
     : ipv6ToBuffer(ip);
   if (!buf) return null;
   return { address: buf, prefixLen, family };
@@ -1131,7 +1135,11 @@ function ipMatchesCIDR(ipBuf, cidr) {
 
 /** 将 IP 地址字符串转为字节 Buffer（支持 IPv4 和 IPv6） */
 function ipToBuffer(ip) {
-  if (net.isIPv4(ip)) return Buffer.from(ip.split('.').map(Number));
+  if (net.isIPv4(ip)) {
+    const octets = ip.split('.').map(Number);
+    if (octets.length !== 4 || octets.some(o => !Number.isFinite(o) || o < 0 || o > 255)) return null;
+    return Buffer.from(octets);
+  }
   if (net.isIPv6(ip)) return ipv6ToBuffer(ip);
   return null;
 }
