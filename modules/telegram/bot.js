@@ -14,6 +14,7 @@
  *            导致整个进程崩溃。
  *   #BUG-6  /balance 命令中的余额查询添加 AbortController 兜底，
  *            与 callAgent 保持一致，防止 Billing API 挂起。
+ *   #FIX-T3  safeSend 改为在换行符处智能分割，避免粗暴截断破坏消息上下文。
  */
 
 const http        = require('http');
@@ -208,17 +209,43 @@ async function callAgent(userId, message) {
 }
 
 // ─── 安全发送消息 ─────────────────────────────────────────────
-async function safeSend(ctx, text) {
-  try {
-    if (text.length <= 4096) {
-      await ctx.reply(text);
-    } else {
-      for (let i = 0; i < text.length; i += 4096) {
-        await ctx.reply(text.substring(i, i + 4096));
-      }
+const TELEGRAM_MSG_LIMIT = 4096;
+
+/**
+ * FIX-T3：智能分割 + 容错发送
+ * - Telegram 单条消息上限 4096 字符
+ * - 优先在换行符处分割，避免截断句子中间
+ * - 发送失败记录日志，不阻断后续分段
+ */
+function splitText(text, limit) {
+  const parts = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    let splitAt = remaining.lastIndexOf('\n', limit);
+    if (splitAt <= 0) {
+      splitAt = remaining.lastIndexOf('。', limit);
     }
-  } catch (err) {
-    logger.error('ctx.reply 失败（Telegram API 错误，可能用户已封禁 bot）', { err: err.message, userId: ctx.from?.id });
+    if (splitAt <= 0) {
+      splitAt = remaining.lastIndexOf(' ', limit);
+    }
+    if (splitAt <= 0) {
+      splitAt = limit;
+    }
+    parts.push(remaining.substring(0, splitAt));
+    remaining = remaining.substring(splitAt).replace(/^\n/, '');
+  }
+  if (remaining) parts.push(remaining);
+  return parts;
+}
+
+async function safeSend(ctx, text) {
+  const parts = splitText(text, TELEGRAM_MSG_LIMIT);
+  for (const part of parts) {
+    try {
+      await ctx.reply(part);
+    } catch (err) {
+      logger.error('ctx.reply 失败（Telegram API 错误，可能用户已封禁 bot）', { err: err.message, userId: ctx.from?.id });
+    }
   }
 }
 

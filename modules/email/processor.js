@@ -15,6 +15,10 @@
  *   #FIX-E3  IMAP logout cleanup 日志级别从 debug 提升为 warn
  *            原实现用 debug 级别，生产环境通常不显示 debug 日志，
  *            运维无法感知 logout 清理失败（可能暗示连接泄漏）。
+ *   #FIX-E4  单封邮件处理失败不影响后续邮件，增加 per-email try/catch。
+ *   #FIX-E5  邮件正文增加最大长度截断（MAX_BODY_LENGTH），防止超大邮件耗尽内存。
+ *   #FIX-E6  过滤 HTML 邮件中的 script 标签，防范 XSS 风险。
+ *   #FIX-E7  AI 分析结果增加长度截断，防止通知邮件过大。
  */
 
 const http           = require('http');
@@ -52,6 +56,11 @@ const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL || '300', 10) * 1000;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL || process.env.SMTP_USER;
 const MAX_EMAILS_PER_CHECK = parseInt(process.env.MAX_EMAILS_PER_CHECK || '20', 10);
 
+// FIX-E5：邮件正文最大长度，超过截断（防止超大邮件耗尽内存）
+const MAX_BODY_LENGTH = parseInt(process.env.MAX_BODY_LENGTH || '50000', 10);
+// FIX-E7：AI 分析结果最大长度
+const MAX_ANALYSIS_LENGTH = parseInt(process.env.MAX_ANALYSIS_LENGTH || '5000', 10);
+
 // ─── IMAP 客户端 ─────────────────────────────────────────────
 function createImapClient() {
   return new ImapFlow({
@@ -83,6 +92,15 @@ const transporter = nodemailer.createTransport({
 function sanitizeEmailField(str) {
   if (!str || typeof str !== 'string') return '';
   return str.replace(/[\r\n\x00-\x1f]/g, ' ').trim();
+}
+
+/**
+ * FIX-E6：过滤 HTML 邮件中的危险标签（script/style/iframe/object/embed），
+ * 防范 XSS 风险。虽然是内部使用，但通知邮件可能被邮件客户端渲染。
+ */
+function stripDangerousTags(text) {
+  if (!text || typeof text !== 'string') return '';
+  return text.replace(/<\s*\/?\s*(script|style|iframe|object|embed)[^>]*>/gi, '');
 }
 
 // ─── AI 分析 ─────────────────────────────────────────────────
@@ -146,30 +164,51 @@ async function checkNewEmails() {
 
       let count = 0;
       for await (const msg of messages) {
-        const parsed = await simpleParser(msg.source);
-        const subject = sanitizeEmailField(parsed.subject || '(无主题)');
-        const from = sanitizeEmailField(parsed.from?.text || '(未知发件人)');
-        const textBody = parsed.text || '';
+        // FIX-E4：per-email try/catch，单封邮件失败不影响后续邮件
+        try {
+          const parsed = await simpleParser(msg.source);
+          const subject = sanitizeEmailField(parsed.subject || '(无主题)');
+          const from = sanitizeEmailField(parsed.from?.text || '(未知发件人)');
+          // FIX-E5：截断超大邮件正文，防止耗尽内存
+          // FIX-E6：过滤 HTML 危险标签
+          let textBody = parsed.text || '';
+          textBody = stripDangerousTags(textBody);
+          if (textBody.length > MAX_BODY_LENGTH) {
+            textBody = textBody.substring(0, MAX_BODY_LENGTH);
+            logger.warn('邮件正文超长已截断', { subject, from, originalLength: (parsed.text || '').length });
+          }
 
-        logger.info('新邮件', { subject, from });
+          const messageId = parsed.messageId || msg.uid || '(unknown)';
+          logger.info('新邮件', { subject, from, messageId });
 
-        const analysis = await analyzeEmail(subject, from, textBody);
-        logger.info('邮件分析完成', { subject, analysis: analysis.substring(0, 200) });
+          let analysis = await analyzeEmail(subject, from, textBody);
+          // FIX-E7：截断过长的 AI 分析结果
+          if (analysis.length > MAX_ANALYSIS_LENGTH) {
+            analysis = analysis.substring(0, MAX_ANALYSIS_LENGTH) + '\n\n[分析结果已截断]';
+          }
+          logger.info('邮件分析完成', { subject, messageId });
 
-        if (NOTIFY_EMAIL) {
-          await sendEmail(
-            NOTIFY_EMAIL,
-            `[Anima 邮件摘要] ${subject}`,
-            [
-              `发件人：${from}`,
-              `主题：${subject}`,
-              '',
-              '── AI 分析结果 ──',
-              analysis,
-            ].join('\n')
-          );
-        } else {
-          logger.warn('NOTIFY_EMAIL 未配置，分析结果仅写入日志');
+          if (NOTIFY_EMAIL) {
+            await sendEmail(
+              NOTIFY_EMAIL,
+              `[Anima 邮件摘要] ${subject}`,
+              [
+                `发件人：${from}`,
+                `主题：${subject}`,
+                '',
+                '── AI 分析结果 ──',
+                analysis,
+              ].join('\n')
+            );
+          } else {
+            logger.warn('NOTIFY_EMAIL 未配置，分析结果仅写入日志');
+          }
+        } catch (emailErr) {
+          // FIX-E4：记录失败详情（含邮件 UID），继续处理下一封
+          logger.error('单封邮件处理失败', {
+            err: emailErr.message,
+            uid: msg.uid || '(unknown)',
+          });
         }
 
         count++;
