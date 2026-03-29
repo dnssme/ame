@@ -1,8 +1,37 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.34
+ * Anima 灵枢 · Webhook 服务 v5.35
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.35 相对于 v5.34）：
+ *
+ *   #FIX-5.35-1  /admin/dashboard 新增服务端 requireAdmin 鉴权
+ *                - 原：/admin/dashboard 仅返回静态 HTML，未做服务端鉴权，
+ *                  虽然 Nginx 层已做 IP 限制（仅 172.16.1.0/24），
+ *                  但纵深防御要求应用层也必须鉴权，与其他 /admin/* 端点对齐。
+ *                - 修：追加 requireAdmin 中间件。
+ *
+ *   #FIX-5.35-2  错误消息移除内部端点路径泄露
+ *                - 原：模型不存在时返回 '请先通过 POST /admin/models 注册'，
+ *                  泄露了管理员端点路径，有助于攻击者枚举内部 API 结构。
+ *                - 修：改为 '模型不存在或未启用'，不泄露端点细节。
+ *
+ *   #FIX-5.35-3  FREE_LIMIT_REDIS_REQUIRED 默认值改为 true（fail-closed）
+ *                - 原：默认 false（fail-open），Redis 不可用时免费限额
+ *                  不生效，攻击者可无限调用免费模型耗尽上游 API 配额。
+ *                - 修：默认 true，除非显式设置为 'false' 才 fail-open。
+ *
+ *   #FIX-5.35-4  /billing/record 强制要求 idempotencyKey
+ *                - 原：idempotencyKey 可选，未提供时无法防止并发重复扣费
+ *                  （同一请求被多次提交），也无法利用 DB 唯一索引去重。
+ *                - 修：idempotencyKey 改为必填参数，缺失时返回 400。
+ *
+ *   #FIX-5.35-5  /activate 新增 ACTIVATION_TOKEN 鉴权
+ *                - 原：/activate 端点仅限速 5 次/10 分钟，无身份验证，
+ *                  任何持有卡密的人可为任意邮箱激活充值（卡密窃取风险）。
+ *                - 修：新增 ACTIVATION_TOKEN 环境变量，要求请求携带
+ *                  X-Activation-Token 头通过鉴权，防止未授权激活。
+ *
  * 修复记录（v5.34 相对于 v5.33）：
  *
  *   #FIX-5.34-1  peekFreeDailyUsage 新增 FREE_LIMIT_REDIS_REQUIRED 检查
@@ -790,7 +819,8 @@ async function peekFreeDailyUsage(userEmail) {
 
 // FIX-5.32-2: Redis 免费限额 fail-closed 模式——当 Redis 不可用时拒绝免费请求，
 // 防止 Redis 宕机期间无限调用免费模型耗尽上游 API 配额
-const FREE_LIMIT_REDIS_REQUIRED = process.env.FREE_LIMIT_REDIS_REQUIRED === 'true';
+// FIX-5.35-3: 默认值改为 true（fail-closed），仅当显式设置为 'false' 时才 fail-open
+const FREE_LIMIT_REDIS_REQUIRED = process.env.FREE_LIMIT_REDIS_REQUIRED !== 'false';
 
 async function incrFreeDailyUsage(userEmail) {
   const FREE_DAILY_LIMIT = getFreeDailyLimit();
@@ -998,8 +1028,10 @@ const adminLimiter = rateLimit({
 });
 
 // ─── 鉴权中间件 ──────────────────────────────────────────────
-const ADMIN_TOKEN   = process.env.ADMIN_TOKEN;
-const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
+const ADMIN_TOKEN      = process.env.ADMIN_TOKEN;
+const SERVICE_TOKEN    = process.env.SERVICE_TOKEN;
+// FIX-5.35-5: 充值卡激活鉴权——防止未授权用户为任意邮箱激活卡密
+const ACTIVATION_TOKEN = process.env.ACTIVATION_TOKEN;
 
 // FIX-5.31-3: 固定大小缓冲区消除长度侧信道——无论输入长度，内存分配耗时恒定
 // SAFE_CMP_LEN=256 足以容纳 ADMIN_TOKEN/SERVICE_TOKEN（启动校验 ≥ 64 字符，推荐 openssl rand -hex 32 = 64 字符）
@@ -1041,6 +1073,20 @@ function requireServiceToken(req, res, next) {
   if (!safeCompare(token, SERVICE_TOKEN)) {
     logger.warn('Service token auth failed', { ip: req.ip, path: req.path });
     return res.status(401).json({ success: false, msg: '内部服务鉴权失败' });
+  }
+  next();
+}
+
+// FIX-5.35-5: 充值卡激活鉴权——防止未授权用户为任意邮箱激活卡密
+function requireActivationToken(req, res, next) {
+  if (!ACTIVATION_TOKEN) {
+    logger.error('ACTIVATION_TOKEN 未配置，拒绝激活请求', { path: req.path, ip: req.ip });
+    return res.status(503).json({ success: false, msg: '激活服务未配置，请联系管理员' });
+  }
+  const token = req.headers['x-activation-token'] || '';
+  if (!safeCompare(token, ACTIVATION_TOKEN)) {
+    logger.warn('Activation token auth failed', { ip: req.ip, path: req.path });
+    return res.status(401).json({ success: false, msg: '激活鉴权失败' });
   }
   next();
 }
@@ -1339,7 +1385,8 @@ app.get('/providers', readLimiter, async (_req, res) => {
 });
 
 // ─── 充值卡激活 ───────────────────────────────────────────────
-app.post('/activate', activateLimiter, async (req, res) => {
+// FIX-5.35-5: 新增 requireActivationToken 鉴权，防止未授权用户为任意邮箱激活
+app.post('/activate', activateLimiter, requireActivationToken, async (req, res) => {
   let { cardKey, userEmail } = req.body ?? {};
 
   if (!cardKey || !userEmail) {
@@ -1535,7 +1582,8 @@ app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req,
   }
 
   if (!model) {
-    return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
+    // FIX-5.35-2: 错误消息不泄露内部端点路径
+    return res.status(404).json({ success: false, msg: '模型不存在或未启用' });
   }
   if (!model.is_active) {
     return res.status(400).json({ success: false, msg: '该模型当前未启用' });
@@ -1736,23 +1784,25 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     return res.status(400).json({ success: false, msg: 'inputTokens/outputTokens 单次上限为 10,000,000' });
   }
 
-  if (idempotencyKey !== undefined) {
-    if (typeof idempotencyKey !== 'string') {
-      return res.status(400).json({ success: false, msg: 'idempotencyKey 必须为字符串' });
-    }
-    idempotencyKey = idempotencyKey.trim();
-    if (
-      idempotencyKey.length === 0 ||
-      idempotencyKey.length > 128 ||
-      !IDEMPOTENCY_KEY_RE.test(idempotencyKey)
-    ) {
-      return res.status(400).json({
-        success: false,
-        msg: 'idempotencyKey 不合法：必须为 1-128 字符，仅允许字母、数字、- : _ 字符',
-      });
-    }
+  // FIX-5.35-4: idempotencyKey 改为必填——防止未提供幂等键时并发重复扣费
+  if (idempotencyKey === undefined || idempotencyKey === null) {
+    return res.status(400).json({ success: false, msg: '参数缺失：需要 idempotencyKey（格式：<conversation_id>:<message_id>:<model_name>）' });
   }
-  const normalizedIdempKey = (typeof idempotencyKey === 'string') ? idempotencyKey : null;
+  if (typeof idempotencyKey !== 'string') {
+    return res.status(400).json({ success: false, msg: 'idempotencyKey 必须为字符串' });
+  }
+  idempotencyKey = idempotencyKey.trim();
+  if (
+    idempotencyKey.length === 0 ||
+    idempotencyKey.length > 128 ||
+    !IDEMPOTENCY_KEY_RE.test(idempotencyKey)
+  ) {
+    return res.status(400).json({
+      success: false,
+      msg: 'idempotencyKey 不合法：必须为 1-128 字符，仅允许字母、数字、- : _ 字符',
+    });
+  }
+  const normalizedIdempKey = idempotencyKey;
 
   const promptTk  = parseOptionalNonNegInt(rawPromptTokens);
   const historyTk = parseOptionalNonNegInt(rawHistoryTokens);
@@ -1796,7 +1846,8 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     if (!model) {
       await safeRollback(client, '/billing/record model not found');
       logger.warn('Model not registered in api_models', { modelName, apiProvider });
-      return res.status(404).json({ success: false, msg: '模型不存在，请先通过 POST /admin/models 注册' });
+      // FIX-5.35-2: 错误消息不泄露内部端点路径
+      return res.status(404).json({ success: false, msg: '模型不存在或未启用' });
     }
     if (!model.is_active) {
       await safeRollback(client, '/billing/record model inactive');
@@ -2086,7 +2137,8 @@ try {
 }
 
 // FIX-5.31-1: 追加 adminLimiter，与其他 /admin/* 端点对齐
-app.get('/admin/dashboard', adminLimiter, (req, res) => {
+// FIX-5.35-1: 服务端 requireAdmin 鉴权（纵深防御，与其他 /admin/* 端点对齐）
+app.get('/admin/dashboard', adminLimiter, requireAdmin, (req, res) => {
   if (!adminHtmlBuffer) {
     return res.status(500).json({ success: false, msg: '管理页面文件缺失' });
   }
@@ -2880,6 +2932,15 @@ if (ADMIN_TOKEN && SERVICE_TOKEN && ADMIN_TOKEN === SERVICE_TOKEN) {
   logger.error('ADMIN_TOKEN 与 SERVICE_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
   process.exit(1);
 }
+// FIX-5.35-5: ACTIVATION_TOKEN 不得与其他 Token 相同
+if (ACTIVATION_TOKEN && ADMIN_TOKEN && ACTIVATION_TOKEN === ADMIN_TOKEN) {
+  logger.error('ACTIVATION_TOKEN 与 ADMIN_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
+  process.exit(1);
+}
+if (ACTIVATION_TOKEN && SERVICE_TOKEN && ACTIVATION_TOKEN === SERVICE_TOKEN) {
+  logger.error('ACTIVATION_TOKEN 与 SERVICE_TOKEN 相同，存在凭据复用风险（PCI-DSS 2.1），请使用不同密钥');
+  process.exit(1);
+}
 // FIX-5.28-1 + FIX-5.29-1: PCI-DSS 8.2.3——ADMIN_TOKEN / SERVICE_TOKEN 最短 64 字符强制校验
 // 64 字符 = 256 位熵（hex 编码 32 字节，即 openssl rand -hex 32 的输出），满足 PCI-DSS / NIST 密钥长度要求
 // 原 < 32 字符拒绝启动，现对齐至 < 64 字符拒绝启动
@@ -2891,10 +2952,19 @@ if (SERVICE_TOKEN && SERVICE_TOKEN.length < 64) {
   logger.error('SERVICE_TOKEN 过短（< 64 字符 / 256 位），不满足 PCI-DSS 8.2.3 密钥长度要求，请使用 openssl rand -hex 32 生成，拒绝启动');
   process.exit(1);
 }
+// FIX-5.35-5: ACTIVATION_TOKEN 长度校验
+if (ACTIVATION_TOKEN && ACTIVATION_TOKEN.length < 64) {
+  logger.error('ACTIVATION_TOKEN 过短（< 64 字符 / 256 位），不满足 PCI-DSS 8.2.3 密钥长度要求，请使用 openssl rand -hex 32 生成，拒绝启动');
+  process.exit(1);
+}
 // FIX-5.30-2: SERVICE_TOKEN 为计费核心鉴权凭据，缺失则所有 /billing/* 写入接口返回 503，拒绝启动
 if (!SERVICE_TOKEN) {
   logger.error('SERVICE_TOKEN 未设置，计费服务核心功能不可用，拒绝启动。请设置 SERVICE_TOKEN 环境变量（openssl rand -hex 32）');
   process.exit(1);
+}
+// FIX-5.35-5: ACTIVATION_TOKEN 为充值卡激活鉴权凭据，缺失则 /activate 返回 503
+if (!ACTIVATION_TOKEN) {
+  logger.warn('ACTIVATION_TOKEN 未设置，/activate 端点将返回 503（充值卡激活不可用）');
 }
 // FIX-5.28-1: PCI-DSS 4.1——检测 NODE_TLS_REJECT_UNAUTHORIZED=0（全局禁用 TLS 证书校验）
 // 此设置会使所有 HTTPS 连接（包括 DB SSL）跳过证书验证，生产环境严禁使用
