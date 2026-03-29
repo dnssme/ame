@@ -1,8 +1,34 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.43
+ * Anima 灵枢 · Webhook 服务 v5.44
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.44 相对于 v5.43）：
+ *
+ *   #FIX-5.44-1  isValidBaseUrl SSRF 防护：补齐 0.0.0.0/8 保留段
+ *                - 原：PRIVATE_IP_RE 仅精确匹配 0.0.0.0，未覆盖
+ *                  0.0.0.0/8 整段（RFC 791 "This host on this network"）。
+ *                  攻击者（已获取管理权限）可将 provider baseUrl 设为
+ *                  http://0.1.2.3/ 等 0.x.x.x 地址。部分操作系统
+ *                  将 0.0.0.0/8 范围的地址视为本机别名，可能导致
+ *                  SSRF 请求到达本机服务。
+ *                - 修：将 0\.0\.0\.0 精确匹配改为 0\.\d+\.\d+\.\d+
+ *                  前缀匹配，阻断整个 0.0.0.0/8 段。
+ *
+ *   #FIX-5.44-2  isValidBaseUrl SSRF 防护：补齐 IPv6 多播 ff00::/8
+ *                - 原：PRIVATE_IPV6_RE 未覆盖 IPv6 多播地址段
+ *                  ff00::/8（RFC 4291 Section 2.7）。虽然 HTTP 请求
+ *                  到多播地址通常不可达，但纵深防御要求阻断所有
+ *                  非单播保留地址。
+ *                - 修：PRIVATE_IPV6_RE 新增 ff[0-9a-f]{2}: 前缀匹配。
+ *
+ *   #FIX-5.44-3  GET /admin/cards SQL 查询改用参数化 WHERE 子句
+ *                - 原：usedFilter 通过字符串比较确定 WHERE 子句文本，
+ *                  虽然当前实现安全（仅使用预定义字面量），但与其他端点
+ *                  使用参数化查询的风格不一致，未来维护者可能误引入注入。
+ *                - 修：改用 $N 参数化占位符构造 WHERE 子句，
+ *                  与项目其他 SQL 查询风格对齐（纵深防御）。
+ *
  * 修复记录（v5.43 相对于 v5.42）：
  *
  *   #FIX-5.43-1  isValidBaseUrl 补齐 IANA 保留 IP 段（SSRF 纵深防御）
@@ -1469,9 +1495,11 @@ const MAX_PAGINATION_OFFSET = 100_000;
 // PCI-DSS 1.3.x 网络安全要求：不允许从 DMZ 访问内网资源
 // FIX-5.43-1: 补齐 IANA 保留 IP 段——CGNAT（RFC 6598）、基准测试（RFC 2544）、
 //   TEST-NET-1/2/3（RFC 5737）、E 类保留（240.0.0.0/4）、协议分配（192.0.0.0/24）
-const PRIVATE_IP_RE = /^(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|0\.0\.0\.0|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+|198\.1[89]\.\d+\.\d+|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+|192\.0\.0\.\d+|2[4-5]\d\.\d+\.\d+\.\d+)$/;
+// FIX-5.44-1: 0.0.0.0 精确匹配改为 0.0.0.0/8 前缀匹配（RFC 791 "This host on this network"）
+const PRIVATE_IP_RE = /^(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|0\.\d+\.\d+\.\d+|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+|198\.1[89]\.\d+\.\d+|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+|192\.0\.0\.\d+|2[4-5]\d\.\d+\.\d+\.\d+)$/;
 // FIX-5.43-1: 补齐 IPv6 保留段——未指定地址 ::、文档前缀 2001:db8::（RFC 3849）
-const PRIVATE_IPV6_RE = /^(\[?)(::1|::|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe[89ab][0-9a-f]:|2001:0?db8:)/i;
+// FIX-5.44-2: 补齐 IPv6 多播地址段 ff00::/8（RFC 4291 Section 2.7）
+const PRIVATE_IPV6_RE = /^(\[?)(::1|::|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe[89ab][0-9a-f]:|ff[0-9a-f]{2}:|2001:0?db8:)/i;
 function isValidBaseUrl(urlStr) {
   if (typeof urlStr !== 'string') return false;
   let parsed;
@@ -3211,12 +3239,15 @@ app.get('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
   const usedFilter = req.query.used;  // 'true', 'false', or undefined (all)
 
   try {
+    // FIX-5.44-3: 改用参数化 WHERE 子句，与项目其他 SQL 查询风格对齐（纵深防御）
     let whereClause = '';
     const params = [limit, offset];
     if (usedFilter === 'true') {
-      whereClause = 'WHERE used = true';
+      params.push(true);
+      whereClause = `WHERE used = $${params.length}`;
     } else if (usedFilter === 'false') {
-      whereClause = 'WHERE used = false';
+      params.push(false);
+      whereClause = `WHERE used = $${params.length}`;
     }
 
     // FIX-5.25-2: 使用 COUNT(*) OVER() 窗口函数，单次查询同时返回分页数据与总数
