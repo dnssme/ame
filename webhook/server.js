@@ -1,8 +1,30 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.33
+ * Anima 灵枢 · Webhook 服务 v5.34
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.34 相对于 v5.33）：
+ *
+ *   #FIX-5.34-1  peekFreeDailyUsage 新增 FREE_LIMIT_REDIS_REQUIRED 检查
+ *                - 原：peekFreeDailyUsage（/billing/check 免费模型预检路径）
+ *                  在 Redis 不可用时始终 fail-open（返回 allowed=true），
+ *                  无视 FREE_LIMIT_REDIS_REQUIRED 环境变量。
+ *                  而 incrFreeDailyUsage（/billing/record）在同等条件下
+ *                  正确返回 allowed=false + HTTP 503。
+ *                  攻击场景：Redis 宕机时调用方从 /billing/check 获得
+ *                  can_proceed=true，提交上游 AI 请求后 /billing/record
+ *                  返回 503 拒绝计费，导致上游 API 配额被无偿消耗。
+ *                - 修：peekFreeDailyUsage 在 Redis 不可用且
+ *                  FREE_LIMIT_REDIS_REQUIRED=true 时返回
+ *                  { allowed: false, redisUnavailable: true }；
+ *                  /billing/check 据此返回 HTTP 503。
+ *
+ *   #FIX-5.34-2  /billing/check 免费模型路径增加 Redis 503 响应
+ *                - 原：/billing/check 免费模型路径仅处理 dailyCheck.allowed
+ *                  为 false 时的 429（限额耗尽），缺少 Redis 不可用的 503。
+ *                - 修：新增 dailyCheck.redisUnavailable 分支，
+ *                  返回 HTTP 503 + 明确提示信息，与 /billing/record 对齐。
+ *
  * 修复记录（v5.33 相对于 v5.32）：
  *
  *   #FIX-5.33-1  /billing/record 付费模型路径 userRes.rows[0] 防御性空检查
@@ -739,7 +761,12 @@ function getShanghaiDate() {
 async function peekFreeDailyUsage(userEmail) {
   const FREE_DAILY_LIMIT = getFreeDailyLimit();
   try {
+    // FIX-5.34-1: Redis 不可用时尊重 FREE_LIMIT_REDIS_REQUIRED，与 incrFreeDailyUsage 行为对齐
     if (redis.status !== 'ready') {
+      if (FREE_LIMIT_REDIS_REQUIRED) {
+        logger.error('Redis unavailable and FREE_LIMIT_REDIS_REQUIRED=true: rejecting free peek', { userEmail });
+        return { allowed: false, used: 0, limit: FREE_DAILY_LIMIT, redisUnavailable: true };
+      }
       return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
     }
     const today = getShanghaiDate();
@@ -751,6 +778,11 @@ async function peekFreeDailyUsage(userEmail) {
       limit:   FREE_DAILY_LIMIT,
     };
   } catch (err) {
+    // FIX-5.34-1: 异常路径同样尊重 FREE_LIMIT_REDIS_REQUIRED
+    if (FREE_LIMIT_REDIS_REQUIRED) {
+      logger.error('Redis daily peek failed and FREE_LIMIT_REDIS_REQUIRED=true: rejecting free peek', { err: err.message, userEmail });
+      return { allowed: false, used: 0, limit: FREE_DAILY_LIMIT, redisUnavailable: true };
+    }
     logger.warn('Redis daily peek failed, allowing request', { err: err.message });
     return { allowed: true, used: 0, limit: FREE_DAILY_LIMIT };
   }
@@ -1539,6 +1571,14 @@ app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req,
 
     const dailyCheck = await peekFreeDailyUsage(userEmail);
     if (!dailyCheck.allowed) {
+      // FIX-5.34-2: Redis 不可用时返回 503，与 /billing/record 对齐
+      if (dailyCheck.redisUnavailable) {
+        return res.status(503).json({
+          success: false, can_proceed: false, is_free: true,
+          msg: '免费模型限额服务暂时不可用，请稍后重试',
+          balance_fen: freeBalance, is_suspended: false,
+        });
+      }
       return res.status(429).json({
         success: false, can_proceed: false, is_free: true,
         msg: `免费用户每日限 ${dailyCheck.limit} 次调用，今日已使用 ${dailyCheck.used} 次。充值后可无限使用。`,
