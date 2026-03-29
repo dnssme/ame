@@ -1,8 +1,20 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.44
+ * Anima 灵枢 · Webhook 服务 v5.45
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.45 相对于 v5.44）：
+ *
+ *   #FIX-5.45-1  POST /admin/models 补齐 modelName 的 MODEL_NAME_RE 校验
+ *                - 原：/billing/check 和 /billing/record 均对 modelName 做了
+ *                  MODEL_NAME_RE 字符集校验（FIX-5.24-1 / FIX-5.38-1），但
+ *                  POST /admin/models 创建/upsert 模型时未做此校验。管理员可
+ *                  创建含控制字符或非法字符的模型名称（如 modelName 含换行符、
+ *                  Unicode 特殊字符等），当该模型名称出现在日志或 billing
+ *                  description 拼接字段时，可能导致日志注入或格式破坏。
+ *                - 修：在 POST /admin/models 的 modelName 长度校验后新增
+ *                  MODEL_NAME_RE.test() 检查，与 /billing/* 路由行为对齐。
+ *
  * 修复记录（v5.44 相对于 v5.43）：
  *
  *   #FIX-5.44-1  isValidBaseUrl SSRF 防护：补齐 0.0.0.0/8 保留段
@@ -2606,6 +2618,10 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   modelName = modelName.trim();
   if (modelName.length === 0 || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
+  }
+  // FIX-5.45-1: 补齐 modelName 字符集校验，与 /billing/check、/billing/record 对齐（防御日志注入）
+  if (!MODEL_NAME_RE.test(modelName)) {
+    return res.status(400).json({ success: false, msg: 'modelName 仅允许字母、数字、连字符、下划线、点、冒号、斜杠' });
   }
   if (typeof displayName !== 'string') {
     return res.status(400).json({ success: false, msg: 'displayName 必须为字符串' });
