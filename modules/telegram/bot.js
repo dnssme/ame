@@ -221,6 +221,7 @@ function splitText(text, limit) {
   const parts = [];
   let remaining = text;
   while (remaining.length > limit) {
+    // 注意：<= 0 而非 < 0，因为 splitAt===0 会产生空首段，无意义
     let splitAt = remaining.lastIndexOf('\n', limit);
     if (splitAt <= 0) {
       splitAt = remaining.lastIndexOf('。', limit);

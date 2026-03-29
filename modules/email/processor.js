@@ -174,8 +174,9 @@ async function checkNewEmails() {
           let textBody = parsed.text || '';
           textBody = stripDangerousTags(textBody);
           if (textBody.length > MAX_BODY_LENGTH) {
+            const preTruncateLength = textBody.length;
             textBody = textBody.substring(0, MAX_BODY_LENGTH);
-            logger.warn('邮件正文超长已截断', { subject, from, originalLength: (parsed.text || '').length });
+            logger.warn('邮件正文超长已截断', { subject, from, originalLength: preTruncateLength });
           }
 
           const messageId = parsed.messageId || msg.uid || '(unknown)';

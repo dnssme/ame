@@ -156,20 +156,19 @@ function splitText(text, limit) {
   let remaining = text;
   while (remaining.length > limit) {
     // 在 limit 范围内找最后一个换行符作为分割点
+    // 注意：<= 0 而非 < 0，因为 splitAt===0 会产生空首段，无意义
     let splitAt = remaining.lastIndexOf('\n', limit);
     if (splitAt <= 0) {
-      // 没有换行符时，退而求其次找最后一个句号/空格
       splitAt = remaining.lastIndexOf('。', limit);
     }
     if (splitAt <= 0) {
       splitAt = remaining.lastIndexOf(' ', limit);
     }
     if (splitAt <= 0) {
-      // 实在没有合理分割点，才按 limit 硬切
       splitAt = limit;
     }
     parts.push(remaining.substring(0, splitAt));
-    remaining = remaining.substring(splitAt).replace(/^\n/, ''); // 去掉分割点的换行符
+    remaining = remaining.substring(splitAt).replace(/^\n/, '');
   }
   if (remaining) parts.push(remaining);
   return parts;
