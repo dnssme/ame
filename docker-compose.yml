@@ -8,9 +8,9 @@
 # 硬件基准：5× 双核 1 GB VPS (香港 Azure) + CXI4 i7-10610U 8 GB (青岛)
 #   VPS A (172.16.1.1)：Nginx 反向代理（无 Docker 服务，仅系统级 Nginx）
 #   VPS B (172.16.1.2)：OpenClaw   450m（default）/ 256m（lightweight）
-#   VPS C (172.16.1.3)：LibreChat  680m（default）/ 384m（lightweight）
+#   VPS C (172.16.1.3)：LibreChat  768m（default）/ 384m（lightweight）
 #   VPS D (172.16.1.4)：Nextcloud  512m（日历/网盘，靠近 Azure PG）
-#   VPS E (172.16.1.6)：Webhook 384m（default）/ 256m（lightweight）+ Redis 128m（计费服务，靠近 Azure PG）
+#   VPS E (172.16.1.6)：Webhook 256m（default / lightweight）+ Redis 128m（计费服务，靠近 Azure PG）
 #   CXI4  (172.16.1.5)：Whisper 2g + TTS 768m + Email 192m + HA 512m
 #                        ≈ 3.5g，系统预留 ≈ 4.5g
 # =============================================================
@@ -22,8 +22,8 @@ services:
     restart: unless-stopped
     profiles: ["default"]
 
-    mem_limit: 680m
-    mem_reservation: 320m
+    mem_limit: 768m
+    mem_reservation: 384m
     cpus: '1.5'
     pids_limit: 200
 
@@ -48,7 +48,7 @@ services:
 
     environment:
       NODE_ENV: production
-      NODE_OPTIONS: "--max-old-space-size=448"
+      NODE_OPTIONS: "--max-old-space-size=512"
       TZ: Asia/Shanghai
 
     healthcheck:
@@ -61,8 +61,8 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "50m"
-        max-file: "5"
+        max-size: "10m"
+        max-file: "3"
 
   # ─── OpenClaw Agent ────────────────────────────────────────
   openclaw:
@@ -115,7 +115,7 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "20m"
+        max-size: "10m"
         max-file: "3"
 
   # ─── LibreChat 轻量版（lightweight profile）─────────────────
@@ -165,7 +165,7 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "20m"
+        max-size: "10m"
         max-file: "3"
 
   # ─── OpenClaw Agent 轻量版 ─────────────────────────────────
@@ -218,7 +218,7 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "20m"
+        max-size: "10m"
         max-file: "3"
 
   # ─── Webhook 计费服务（VPS E 1GB）───────────────────────────
@@ -228,9 +228,9 @@ services:
     restart: unless-stopped
     profiles: ["default"]
 
-    # VPS E (1GB)：Webhook 384m + Redis 128m ≈ 512m → 系统预留 ~500m
-    mem_limit: 384m
-    mem_reservation: 192m
+    # VPS E (1GB)：Webhook 256m + Redis 128m ≈ 384m → 系统预留 ~640m
+    mem_limit: 256m
+    mem_reservation: 128m
     cpus: '1.5'
     pids_limit: 100
 
@@ -255,7 +255,7 @@ services:
 
     environment:
       NODE_ENV: production
-      NODE_OPTIONS: "--max-old-space-size=256"
+      NODE_OPTIONS: "--max-old-space-size=192"
       TZ: Asia/Shanghai
 
     healthcheck:
@@ -268,7 +268,7 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "20m"
+        max-size: "10m"
         max-file: "3"
 
   # ─── Webhook 计费服务 轻量版 ─────────────────────────────────
@@ -318,5 +318,54 @@ services:
     logging:
       driver: "json-file"
       options:
-        max-size: "20m"
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── Redis 缓存（VPS E 1GB，计费限额计数）──────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: anima-redis
+    restart: unless-stopped
+
+    # VPS E (1GB)：Redis 128m + Webhook 256m ≈ 384m → 系统预留 ~640m
+    mem_limit: 128m
+    mem_reservation: 64m
+    cpus: '0.5'
+    pids_limit: 50
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    # ⚠️ 只绑定内网 IP，绝不暴露在 0.0.0.0
+    ports:
+      - "172.16.1.6:6379:6379"
+
+    command: >
+      redis-server
+      --requirepass "${REDIS_PASSWORD}"
+      --maxmemory 96mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+
+    env_file:
+      - path: ./webhook/.env
+        required: true
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
         max-file: "3"
