@@ -1,8 +1,21 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.39
+ * Anima 灵枢 · Webhook 服务 v5.40
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.40 相对于 v5.39）：
+ *
+ *   #FIX-5.40-1  原型污染检测深度限制从 6 提升至 20
+ *                - 原：hasProtoPollution 递归深度上限为 6 层，超过 6 层嵌套的
+ *                  __proto__/constructor/prototype 键不会被检测到。攻击者可构造
+ *                  7+ 层嵌套的 JSON 负载绕过原型污染防护。
+ *                  示例：{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"__proto__":{"isAdmin":true}}}}}}}}}
+ *                  该 payload 在深度 7 处的 __proto__ 键不会被检测。
+ *                - 修：将深度上限从 6 提升至 20，覆盖所有合理的 API 负载结构。
+ *                  计费 API 正常请求体嵌套深度不超过 3 层，20 层已远超安全余量。
+ *                  配合 Express 256KB body limit 和 V8 JSON.parse 限制，
+ *                  不会导致栈溢出风险。
+ *
  * 修复记录（v5.39 相对于 v5.38）：
  *
  *   #FIX-5.39-1  requireActivationToken 新增应用层 IP 白名单
@@ -994,10 +1007,11 @@ app.use(helmet({
 // FIX-5.22-1: 计费 API 负载均 < 1 KB，收紧至 256 KB 防止大包体 DoS（CIS）
 app.use(express.json({ limit: '256kb' }));
 
-// FIX-5.38-5: 原型污染防护——检测 JSON 体中的 __proto__ / constructor.prototype 字段
+// FIX-5.38-5 + FIX-5.40-1: 原型污染防护——检测 JSON 体中的 __proto__ / constructor.prototype 字段
 // Express JSON 解析器不阻止这些字段，攻击者可构造 {"__proto__":{"isAdmin":true}} 污染原型链
+// FIX-5.40-1: 深度上限从 6 提升至 20，防止 7+ 层嵌套绕过检测
 function hasProtoPollution(obj, depth) {
-  if (depth > 6 || obj === null || typeof obj !== 'object') return false;
+  if (depth > 20 || obj === null || typeof obj !== 'object') return false;
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) {
       if (typeof obj[i] === 'object' && obj[i] !== null && hasProtoPollution(obj[i], depth + 1)) return true;
