@@ -1,8 +1,36 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.42
+ * Anima 灵枢 · Webhook 服务 v5.43
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.43 相对于 v5.42）：
+ *
+ *   #FIX-5.43-1  isValidBaseUrl 补齐 IANA 保留 IP 段（SSRF 纵深防御）
+ *                - 原：PRIVATE_IP_RE 仅覆盖 RFC 1918 私有地址（10/8、172.16/12、192.168/16）
+ *                  和链路本地（169.254/16）、环回（127/8），遗漏以下保留段：
+ *                  · 100.64.0.0/10（CGNAT，RFC 6598）
+ *                  · 198.18.0.0/15（基准测试，RFC 2544）
+ *                  · 192.0.2.0/24（TEST-NET-1，RFC 5737）
+ *                  · 198.51.100.0/24（TEST-NET-2，RFC 5737）
+ *                  · 203.0.113.0/24（TEST-NET-3，RFC 5737）
+ *                  · 192.0.0.0/24（IETF 协议分配，RFC 6890）
+ *                  · 240.0.0.0/4（E 类保留，RFC 1112）
+ *                  PRIVATE_IPV6_RE 遗漏：
+ *                  · ::（未指定地址，RFC 4291）
+ *                  · 2001:db8::/32（文档前缀，RFC 3849）
+ *                  管理员可通过 POST /admin/providers 将 baseUrl 设为上述保留地址，
+ *                  虽然管理端点有 IP 白名单 + Token 双重保护，但纵深防御要求阻断。
+ *                - 修：PRIVATE_IP_RE 新增全部遗漏段；PRIVATE_IPV6_RE 新增 :: 和 2001:db8:: 前缀。
+ *
+ *   #FIX-5.43-2  阻断 *.localhost 子域名绕过 SSRF 防护
+ *                - 原：isValidBaseUrl 仅检查 host === 'localhost'，
+ *                  但 RFC 2606 保留了整个 .localhost TLD，
+ *                  foo.localhost、evil.localhost 等子域名在大多数 DNS 解析器中
+ *                  指向 127.0.0.1，可绕过原有 localhost 精确匹配检查。
+ *                - 修：新增 host.endsWith('.localhost') 检查，阻断所有 .localhost 子域名；
+ *                  同时在 host 精确匹配列表中增加 '::' 检查，
+ *                  阻断 IPv6 未指定地址 http://[::] 绕过。
+ *
  * 修复记录（v5.42 相对于 v5.41）：
  *
  *   #FIX-5.42-1  Nginx /admin/ location 移除 Content-Security-Policy 头
@@ -1439,8 +1467,11 @@ const MAX_PAGINATION_OFFSET = 100_000;
 
 // FIX-5.21-1: SSRF 防护——校验 URL 禁止内网/保留地址
 // PCI-DSS 1.3.x 网络安全要求：不允许从 DMZ 访问内网资源
-const PRIVATE_IP_RE = /^(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|0\.0\.0\.0)$/;
-const PRIVATE_IPV6_RE = /^(\[?)(::1|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe[89ab][0-9a-f]:)/i;
+// FIX-5.43-1: 补齐 IANA 保留 IP 段——CGNAT（RFC 6598）、基准测试（RFC 2544）、
+//   TEST-NET-1/2/3（RFC 5737）、E 类保留（240.0.0.0/4）、协议分配（192.0.0.0/24）
+const PRIVATE_IP_RE = /^(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+|169\.254\.\d+\.\d+|0\.0\.0\.0|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+|198\.1[89]\.\d+\.\d+|192\.0\.2\.\d+|198\.51\.100\.\d+|203\.0\.113\.\d+|192\.0\.0\.\d+|2[4-5]\d\.\d+\.\d+\.\d+)$/;
+// FIX-5.43-1: 补齐 IPv6 保留段——未指定地址 ::、文档前缀 2001:db8::（RFC 3849）
+const PRIVATE_IPV6_RE = /^(\[?)(::1|::|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe[89ab][0-9a-f]:|2001:0?db8:)/i;
 function isValidBaseUrl(urlStr) {
   if (typeof urlStr !== 'string') return false;
   let parsed;
@@ -1448,9 +1479,10 @@ function isValidBaseUrl(urlStr) {
   // 生产环境允许 HTTP/HTTPS（部分内部 provider 仍使用 HTTP）
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
   const host = parsed.hostname.toLowerCase();
-  // 阻断 localhost / IPv4 内网保留 IP / IPv6 loopback 与私有地址
+  // 阻断 localhost / *.localhost / IPv4 内网保留 IP / IPv6 loopback 与私有地址
   // FIX-5.22-1: URL 类将 [::1] 解析为 hostname='::1'（无方括号），修正判断条件
-  if (host === 'localhost' || host === '::1' || PRIVATE_IP_RE.test(host) || PRIVATE_IPV6_RE.test(host)) return false;
+  // FIX-5.43-2: 阻断 *.localhost 子域名——RFC 2606 保留 TLD，所有 *.localhost 解析到本地环回
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '::' || PRIVATE_IP_RE.test(host) || PRIVATE_IPV6_RE.test(host)) return false;
   return true;
 }
 
