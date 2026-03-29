@@ -1,8 +1,27 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.40
+ * Anima 灵枢 · Webhook 服务 v5.41
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.41 相对于 v5.40）：
+ *
+ *   #FIX-5.41-1  原型污染检测深度超限改为 fail-closed（拒绝请求）
+ *                - 原：hasProtoPollution 在 depth > 20 时返回 false（无污染），
+ *                  攻击者可将 __proto__/constructor/prototype 键嵌套到 21+ 层
+ *                  绕过检测。V8 JSON.parse 支持 ~500 层嵌套，配合 Express
+ *                  256KB body limit，攻击者可轻松构造超深 payload 绕过防护。
+ *                  示例：21 层嵌套的 {"a":{"b":...{"__proto__":{"isAdmin":true}}...}}
+ *                  在深度 21 处的 __proto__ 键不会被检测。
+ *                - 修：depth > 20 时返回 true（视为污染，拒绝请求），
+ *                  遵循 fail-closed 原则。计费 API 正常请求体嵌套不超过 3 层，
+ *                  任何超过 20 层嵌套的 payload 本身就是可疑的。
+ *
+ *   #FIX-5.41-2  .env.example 修正 FREE_LIMIT_REDIS_REQUIRED 默认值描述
+ *                - 原：注释称默认值为 false（fail-open），但自 FIX-5.35-3 起
+ *                  代码默认值已改为 true（fail-closed）。运维人员读到旧注释
+ *                  可能误以为不设置该变量时系统为 fail-open，实际已是 fail-closed。
+ *                - 修：注释更新为"默认 true"，与代码行为一致。
+ *
  * 修复记录（v5.40 相对于 v5.39）：
  *
  *   #FIX-5.40-1  原型污染检测深度限制从 6 提升至 20
@@ -1007,11 +1026,15 @@ app.use(helmet({
 // FIX-5.22-1: 计费 API 负载均 < 1 KB，收紧至 256 KB 防止大包体 DoS（CIS）
 app.use(express.json({ limit: '256kb' }));
 
-// FIX-5.38-5 + FIX-5.40-1: 原型污染防护——检测 JSON 体中的 __proto__ / constructor.prototype 字段
+// FIX-5.38-5 + FIX-5.40-1 + FIX-5.41-1: 原型污染防护——检测 JSON 体中的 __proto__ / constructor.prototype 字段
 // Express JSON 解析器不阻止这些字段，攻击者可构造 {"__proto__":{"isAdmin":true}} 污染原型链
 // FIX-5.40-1: 深度上限从 6 提升至 20，防止 7+ 层嵌套绕过检测
+// FIX-5.41-1: 深度超限时返回 true（fail-closed），防止 21+ 层嵌套绕过检测
 function hasProtoPollution(obj, depth) {
-  if (depth > 20 || obj === null || typeof obj !== 'object') return false;
+  // FIX-5.41-1: fail-closed——深度超限直接视为可疑 payload 并拒绝
+  // 计费 API 正常请求体不超过 3 层嵌套，20 层以上的深度本身就是异常信号
+  if (depth > 20) return true;
+  if (obj === null || typeof obj !== 'object') return false;
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) {
       if (typeof obj[i] === 'object' && obj[i] !== null && hasProtoPollution(obj[i], depth + 1)) return true;
