@@ -1786,7 +1786,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
   // FIX-5.35-4: idempotencyKey 改为必填——防止未提供幂等键时并发重复扣费
   if (idempotencyKey === undefined || idempotencyKey === null) {
-    return res.status(400).json({ success: false, msg: '参数缺失：需要 idempotencyKey（格式：<conversation_id>:<message_id>:<model_name>）' });
+    return res.status(400).json({ success: false, msg: '参数缺失：需要 idempotencyKey（建议格式：conversation_id:message_id:model_name，允许字母、数字、- : _ 字符）' });
   }
   if (typeof idempotencyKey !== 'string') {
     return res.status(400).json({ success: false, msg: 'idempotencyKey 必须为字符串' });
@@ -2963,8 +2963,9 @@ if (!SERVICE_TOKEN) {
   process.exit(1);
 }
 // FIX-5.35-5: ACTIVATION_TOKEN 为充值卡激活鉴权凭据，缺失则 /activate 返回 503
+// 使用 error 级别日志确保运维人员注意到此配置缺失
 if (!ACTIVATION_TOKEN) {
-  logger.warn('ACTIVATION_TOKEN 未设置，/activate 端点将返回 503（充值卡激活不可用）');
+  logger.error('ACTIVATION_TOKEN 未设置，/activate 端点将返回 503。如需启用充值卡激活功能，请设置 ACTIVATION_TOKEN 环境变量（openssl rand -hex 32）');
 }
 // FIX-5.28-1: PCI-DSS 4.1——检测 NODE_TLS_REJECT_UNAUTHORIZED=0（全局禁用 TLS 证书校验）
 // 此设置会使所有 HTTPS 连接（包括 DB SSL）跳过证书验证，生产环境严禁使用
