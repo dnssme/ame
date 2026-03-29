@@ -1,8 +1,29 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.35
+ * Anima 灵枢 · Webhook 服务 v5.36
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.36 相对于 v5.35）：
+ *
+ *   #FIX-5.36-1  requireAdmin / requireServiceToken 增加应用层 IP 白名单
+ *                - 原：管理员 / 计费端点仅依赖 Nginx 层做 IP 限制（allow 172.16.1.0/24），
+ *                  应用层仅校验 Token。若攻击者通过 SSRF、容器逃逸或其他途径
+ *                  绕过 Nginx 直连 172.16.1.6:3002，则只剩 Token 一道防线。
+ *                - 修：新增 INTERNAL_IP_CIDRS 环境变量（默认 172.16.1.0/24,::1,127.0.0.1），
+ *                  requireAdmin 和 requireServiceToken 在 Token 校验前先检查 req.ip
+ *                  是否匹配白名单，不匹配直接返回 403。纵深防御（Defense-in-Depth）。
+ *
+ *   #FIX-5.36-2  /health 端点新增限速器
+ *                - 原：/health 无任何速率限制，攻击者可高频轮询触发 DB/Redis ping
+ *                  消耗后端连接资源（轻量级 DoS）。
+ *                - 修：新增 healthLimiter（30 req/min），保护后端资源。
+ *
+ *   #FIX-5.36-3  Nginx 屏蔽 /billing/record 尾部斜杠变体
+ *                - 原：location = /billing/record 为精确匹配，/billing/record/
+ *                  （尾部斜杠）可绕过此屏蔽规则到达默认 proxy_pass。
+ *                  Express 层仍有 requireServiceToken 兜底，但违反纵深防御原则。
+ *                - 修：新增 location = /billing/record/ { return 403; } 屏蔽尾部斜杠。
+ *
  * 修复记录（v5.35 相对于 v5.34）：
  *
  *   #FIX-5.35-1  /admin/dashboard 新增服务端 requireAdmin 鉴权
@@ -617,6 +638,7 @@
 
 const crypto      = require('crypto');
 const fs          = require('fs');
+const net         = require('net');
 const path        = require('path');
 const { URL }     = require('url');
 const express     = require('express');
@@ -985,6 +1007,15 @@ app.use(rateLimit({
   skip: (req) => req.path === '/billing/record',
 }));
 
+// FIX-5.36-2: /health 限速器——防止高频轮询消耗 DB/Redis 连接资源
+const healthLimiter = rateLimit({
+  windowMs: 60_000,
+  max:      30,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { success: false, msg: '健康检查请求过于频繁' },
+});
+
 const activateLimiter = rateLimit({
   windowMs: 10 * 60_000,
   max:      5,
@@ -1033,6 +1064,113 @@ const SERVICE_TOKEN    = process.env.SERVICE_TOKEN;
 // FIX-5.35-5: 充值卡激活鉴权——防止未授权用户为任意邮箱激活卡密
 const ACTIVATION_TOKEN = process.env.ACTIVATION_TOKEN;
 
+// FIX-5.36-1: 应用层 IP 白名单——纵深防御（Defense-in-Depth）
+// 默认仅允许 WireGuard 内网 + 本地环回地址
+// 格式：逗号分隔的 CIDR 或单 IP，例如 '172.16.1.0/24,10.0.0.0/8,::1,127.0.0.1'
+const INTERNAL_IP_CIDRS_RAW = (process.env.INTERNAL_IP_CIDRS || '172.16.1.0/24,::1,127.0.0.1,::ffff:127.0.0.1').split(',').map(s => s.trim()).filter(Boolean);
+
+/**
+ * 解析 CIDR 为 { address: Buffer, prefixLen: number, family: 4|6 }
+ * 支持单 IP（等效 /32 或 /128）和标准 CIDR 表示法
+ */
+function parseCIDR(cidr) {
+  const parts = cidr.split('/');
+  const ip = parts[0];
+  const family = net.isIPv4(ip) ? 4 : net.isIPv6(ip) ? 6 : 0;
+  if (!family) return null;
+  const maxBits = family === 4 ? 32 : 128;
+  const prefixLen = parts.length === 2 ? parseInt(parts[1], 10) : maxBits;
+  if (!Number.isFinite(prefixLen) || prefixLen < 0 || prefixLen > maxBits) return null;
+  // 将 IP 转为字节数组
+  const buf = family === 4
+    ? Buffer.from(ip.split('.').map(Number))
+    : ipv6ToBuffer(ip);
+  if (!buf) return null;
+  return { address: buf, prefixLen, family };
+}
+
+/** 将 IPv6 地址字符串转为 16 字节 Buffer */
+function ipv6ToBuffer(ip) {
+  // 展开 :: 简写
+  const halves = ip.split('::');
+  if (halves.length > 2) return null;
+  let groups;
+  if (halves.length === 2) {
+    const left  = halves[0] ? halves[0].split(':') : [];
+    const right = halves[1] ? halves[1].split(':') : [];
+    const fill  = 8 - left.length - right.length;
+    if (fill < 0) return null;
+    groups = [...left, ...Array(fill).fill('0'), ...right];
+  } else {
+    groups = ip.split(':');
+  }
+  if (groups.length !== 8) return null;
+  const buf = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) {
+    const val = parseInt(groups[i], 16);
+    if (!Number.isFinite(val) || val < 0 || val > 0xffff) return null;
+    buf.writeUInt16BE(val, i * 2);
+  }
+  return buf;
+}
+
+/** 检查 IP 字节数组是否匹配 CIDR */
+function ipMatchesCIDR(ipBuf, cidr) {
+  if (ipBuf.length !== cidr.address.length) return false;
+  const fullBytes = Math.floor(cidr.prefixLen / 8);
+  for (let i = 0; i < fullBytes; i++) {
+    if (ipBuf[i] !== cidr.address[i]) return false;
+  }
+  const remainBits = cidr.prefixLen % 8;
+  if (remainBits > 0) {
+    const mask = 0xff << (8 - remainBits);
+    if ((ipBuf[fullBytes] & mask) !== (cidr.address[fullBytes] & mask)) return false;
+  }
+  return true;
+}
+
+/** 将 IP 地址字符串转为字节 Buffer（支持 IPv4 和 IPv6） */
+function ipToBuffer(ip) {
+  if (net.isIPv4(ip)) return Buffer.from(ip.split('.').map(Number));
+  if (net.isIPv6(ip)) return ipv6ToBuffer(ip);
+  return null;
+}
+
+// 预解析 CIDR 列表（启动时一次性解析，运行时无额外开销）
+const INTERNAL_CIDRS = INTERNAL_IP_CIDRS_RAW.map(parseCIDR).filter(Boolean);
+
+/**
+ * 检查 IP 是否属于内部网络白名单
+ * @param {string} ip - req.ip（可能是 IPv4 或 IPv6 映射地址 ::ffff:x.x.x.x）
+ * @returns {boolean}
+ */
+function isInternalIP(ip) {
+  if (!ip) return false;
+  // 处理 IPv6 映射的 IPv4 地址（::ffff:172.16.1.2）
+  let normalizedIP = ip;
+  const v4Mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(ip);
+  if (v4Mapped) normalizedIP = v4Mapped[1];
+
+  const ipBuf = ipToBuffer(normalizedIP);
+  if (!ipBuf) return false;
+
+  for (const cidr of INTERNAL_CIDRS) {
+    // IPv4 映射地址需同时尝试 IPv4 CIDR 匹配
+    if (ipBuf.length === 4 && cidr.family === 4 && ipMatchesCIDR(ipBuf, cidr)) return true;
+    if (ipBuf.length === 16 && cidr.family === 6 && ipMatchesCIDR(ipBuf, cidr)) return true;
+  }
+  // 额外处理：原始 IP 是 v4-mapped IPv6（::ffff:x.x.x.x）但 CIDR 是 IPv4
+  if (v4Mapped) {
+    const v4Buf = ipToBuffer(v4Mapped[1]);
+    if (v4Buf) {
+      for (const cidr of INTERNAL_CIDRS) {
+        if (cidr.family === 4 && ipMatchesCIDR(v4Buf, cidr)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 // FIX-5.31-3: 固定大小缓冲区消除长度侧信道——无论输入长度，内存分配耗时恒定
 // SAFE_CMP_LEN=256 足以容纳 ADMIN_TOKEN/SERVICE_TOKEN（启动校验 ≥ 64 字符，推荐 openssl rand -hex 32 = 64 字符）
 const SAFE_CMP_LEN = 256;
@@ -1052,6 +1190,11 @@ function safeCompare(a, b) {
 }
 
 function requireAdmin(req, res, next) {
+  // FIX-5.36-1: 纵深防御——应用层 IP 白名单（补充 Nginx 层 allow/deny）
+  if (!isInternalIP(req.ip)) {
+    logger.warn('Admin IP rejected (app-level)', { ip: req.ip, path: req.path });
+    return res.status(403).json({ success: false, msg: '禁止访问' });
+  }
   if (!ADMIN_TOKEN) {
     return res.status(503).json({ success: false, msg: '管理员接口未启用（未设置 ADMIN_TOKEN）' });
   }
@@ -1065,6 +1208,11 @@ function requireAdmin(req, res, next) {
 }
 
 function requireServiceToken(req, res, next) {
+  // FIX-5.36-1: 纵深防御——应用层 IP 白名单（补充 Nginx 层 allow/deny）
+  if (!isInternalIP(req.ip)) {
+    logger.warn('Service IP rejected (app-level)', { ip: req.ip, path: req.path });
+    return res.status(403).json({ success: false, msg: '禁止访问' });
+  }
   if (!SERVICE_TOKEN) {
     logger.error('SERVICE_TOKEN 未配置，拒绝 /billing 写入请求', { path: req.path, ip: req.ip });
     return res.status(503).json({ success: false, msg: '服务鉴权未配置，请联系管理员' });
@@ -1298,7 +1446,8 @@ async function safeRollback(client, context) {
 // ─── 健康检查（FIX-5.9-1: 含 Redis 状态）────────────────────
 // FIX-5.25-1: CIS 2.3 信息最小化——不暴露 db/redis 内部组件状态
 // FIX-5.27-2: DB 与 Redis 并行检查，健康检查延迟从串行 2×RTT 降至 1×RTT
-app.get('/health', async (_req, res) => {
+// FIX-5.36-2: 新增 healthLimiter，防止高频轮询 DB/Redis ping 消耗连接资源
+app.get('/health', healthLimiter, async (_req, res) => {
   // 并行发起 DB 和 Redis 检查，各自返回是否成功
   const [dbOk, redisOk] = await Promise.all([
     db.query('SELECT 1').then(() => true, (err) => {
@@ -2976,6 +3125,12 @@ if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
   } else {
     logger.warn('NODE_TLS_REJECT_UNAUTHORIZED=0 已设置，TLS 证书校验全局禁用，生产环境严禁此配置（PCI-DSS 4.1）');
   }
+}
+// FIX-5.36-1: 启动时输出 IP 白名单配置，便于运维确认
+if (INTERNAL_CIDRS.length === 0) {
+  logger.warn('INTERNAL_IP_CIDRS 解析后为空，所有 requireAdmin/requireServiceToken 请求将被拒绝。请检查 INTERNAL_IP_CIDRS 配置');
+} else {
+  logger.info('应用层 IP 白名单已启用', { cidrs: INTERNAL_IP_CIDRS_RAW, parsed: INTERNAL_CIDRS.length });
 }
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
