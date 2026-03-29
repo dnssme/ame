@@ -1,8 +1,30 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.36
+ * Anima 灵枢 · Webhook 服务 v5.37
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.37 相对于 v5.36）：
+ *
+ *   #FIX-5.37-1  Nginx 屏蔽 /billing/check/ 尾部斜杠变体
+ *                - 原：location = /billing/check 为精确匹配，/billing/check/
+ *                  不命中，会落入默认 location / 被代理到 LibreChat 后端。
+ *                  虽不可利用（LibreChat 无此端点），但违反纵深防御原则。
+ *                - 修：新增 location = /billing/check/ { return 403; }，
+ *                  与 #FIX-5.36-3（/billing/record/）对齐。
+ *
+ *   #FIX-5.37-2  Nginx 屏蔽 /activate/ 尾部斜杠变体
+ *                - 原：location = /activate 为精确匹配，/activate/
+ *                  不命中，落入默认 location / 被代理到 LibreChat。
+ *                - 修：新增 location = /activate/ { return 403; }。
+ *
+ *   #FIX-5.37-3  Nginx 为 webhook 代理路径添加 client_max_body_size 1m
+ *                - 原：全局 client_max_body_size 50m（为 nextcloud 文件上传设置），
+ *                  webhook 计费 API 仅需 < 1 KB，50 MB 远超实际需求，
+ *                  存在 Nginx 层面的大包体 DoS 风险。
+ *                - 修：在 /admin/、/billing/*、/activate、/models、/providers
+ *                  各 location 块中显式设置 client_max_body_size 1m，
+ *                  与 Express 层 256kb JSON 限制纵深对齐。
+ *
  * 修复记录（v5.36 相对于 v5.35）：
  *
  *   #FIX-5.36-1  requireAdmin / requireServiceToken 增加应用层 IP 白名单
