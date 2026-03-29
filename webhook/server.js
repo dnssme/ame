@@ -14,9 +14,9 @@
  *
  *   #FIX-5.38-2  收紧邮箱正则表达式（EMAIL_RE）
  *                - 原：/^[^\s@]+@[^\s@]+\.[^\s@]+$/ 允许 TLD 部分仅含 1 字符
- *                  或含特殊字符（如 test@test.!），不符合 RFC 5321。
- *                - 修：改为 /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/ 要求 TLD 至少 2 位纯字母，
- *                  覆盖所有合法 TLD（.cn / .com / .museum / .photography 等）。
+ *                  或含特殊字符（如 test@test.!），也允许连续点 test@test..com。
+ *                - 修：改为 RFC 5321 友好正则：本地部分仅允许合法字符（字母、数字、._%+-），
+ *                  域名部分禁止连续点和首尾连字符，TLD 至少 2 位纯字母。
  *
  *   #FIX-5.38-3  Nginx 屏蔽 /models/ 和 /providers/ 尾部斜杠变体
  *                - 原：location = /models 和 location = /providers 为精确匹配，
@@ -988,7 +988,15 @@ app.use(express.json({ limit: '256kb' }));
 // Express JSON 解析器不阻止这些字段，攻击者可构造 {"__proto__":{"isAdmin":true}} 污染原型链
 function hasProtoPollution(obj, depth) {
   if (depth > 6 || obj === null || typeof obj !== 'object') return false;
-  for (const key of Object.keys(obj)) {
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      if (typeof obj[i] === 'object' && obj[i] !== null && hasProtoPollution(obj[i], depth + 1)) return true;
+    }
+    return false;
+  }
+  const keys = Object.getOwnPropertyNames(obj);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') return true;
     if (typeof obj[key] === 'object' && obj[key] !== null && hasProtoPollution(obj[key], depth + 1)) return true;
   }
@@ -1334,8 +1342,8 @@ function auditLog(action, details, req) {
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────
-// FIX-5.38-2: 收紧 TLD 要求——至少 2 位纯字母，拒绝 test@test.! 等畸形地址
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/;
+// FIX-5.38-2: 收紧邮箱校验——本地部分限定合法字符，域名部分禁止连续点，TLD 至少 2 位纯字母
+const EMAIL_RE = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
 const MAX_EMAIL_LEN = 254;
 // 连字符置末尾，语义清晰，避免与字符范围操作符混淆
 const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
