@@ -97,10 +97,18 @@ function sanitizeEmailField(str) {
 /**
  * FIX-E6：过滤 HTML 邮件中的危险标签（script/style/iframe/object/embed），
  * 防范 XSS 风险。虽然是内部使用，但通知邮件可能被邮件客户端渲染。
+ * 使用循环替换防止嵌套构造绕过（如 <scr<script>ipt>）。
  */
 function stripDangerousTags(text) {
   if (!text || typeof text !== 'string') return '';
-  return text.replace(/<\s*\/?\s*(script|style|iframe|object|embed)[^>]*>/gi, '');
+  const pattern = /<\s*\/?\s*(script|style|iframe|object|embed)[^>]*>/gi;
+  let result = text;
+  let prev;
+  do {
+    prev = result;
+    result = result.replace(pattern, '');
+  } while (result !== prev);
+  return result;
 }
 
 // ─── AI 分析 ─────────────────────────────────────────────────
