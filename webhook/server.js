@@ -1,8 +1,21 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.45
+ * Anima 灵枢 · Webhook 服务 v5.46
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.46 相对于 v5.45）：
+ *
+ *   #FIX-5.46-1  全部 catch 块补齐 request_id 审计字段（PCI-DSS 10.3）
+ *                - 原：管理员接口（/admin/*）和计费接口（/billing/*、/models、
+ *                  /providers）的 catch 块仅记录 err.message，未携带
+ *                  request_id，导致错误日志无法与特定请求关联，违反
+ *                  PCI-DSS 10.3 日志完整性要求。
+ *                  对比：/billing/record 和 /activate 已在 v5.23 中补齐，
+ *                  但其余路由遗漏。
+ *                - 修：所有 catch 块的 logger.error/warn 调用统一添加
+ *                  request_id: req.id 字段；使用 _req 参数名的路由
+ *                  改为 req，使 req.id 可用。
+ *
  * 修复记录（v5.45 相对于 v5.44）：
  *
  *   #FIX-5.45-1  POST /admin/models 补齐 modelName 的 MODEL_NAME_RE 校验
@@ -1711,7 +1724,7 @@ app.get('/health', healthLimiter, async (_req, res) => {
 });
 
 // ─── 模型列表（公开）──────────────────────────────────────────
-app.get('/models', readLimiter, async (_req, res) => {
+app.get('/models', readLimiter, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT provider, model_name, display_name, is_free,
@@ -1727,7 +1740,7 @@ app.get('/models', readLimiter, async (_req, res) => {
     res.set('Vary', 'Accept-Encoding');
     res.json({ success: true, models: result.rows });
   } catch (err) {
-    logger.error('Models query error', { err: err.message });
+    logger.error('Models query error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -1735,7 +1748,7 @@ app.get('/models', readLimiter, async (_req, res) => {
 // ─── Provider 配置列表（公开，不含 API Key）───────────────────
 // 数据库统一调用：OpenClaw/LibreChat 从此接口动态获取 provider base URL。
 // API Key 仍在各服务 .env（PCI-DSS 3.x 要求，不允许密钥入库）。
-app.get('/providers', readLimiter, async (_req, res) => {
+app.get('/providers', readLimiter, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT provider_name, display_name, base_url, is_enabled, description
@@ -1756,7 +1769,7 @@ app.get('/providers', readLimiter, async (_req, res) => {
     res.set('Vary', 'Accept-Encoding');
     res.json({ success: true, providers: result.rows });
   } catch (err) {
-    logger.error('Providers query error', { err: err.message });
+    logger.error('Providers query error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -1889,7 +1902,7 @@ app.get('/billing/balance/:email', readLimiter, requireServiceToken, async (req,
       is_suspended:      r ? r.is_suspended : false,
     });
   } catch (err) {
-    logger.error('Balance query error', { err: err.message, email });
+    logger.error('Balance query error', { err: err.message, email, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -1920,7 +1933,7 @@ app.get('/billing/history/:email', readLimiter, requireServiceToken, async (req,
     const records = result.rows.map(({ _total, ...rest }) => rest);
     res.json({ success: true, records, total });
   } catch (err) {
-    logger.error('History query error', { err: err.message, email });
+    logger.error('History query error', { err: err.message, email, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -1958,7 +1971,7 @@ app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req,
   try {
     model = await lookupModelCached(modelName);
   } catch (err) {
-    logger.error('Model lookup error in /billing/check', { err: err.message, modelName });
+    logger.error('Model lookup error in /billing/check', { err: err.message, modelName, request_id: req.id });
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 
@@ -1986,7 +1999,7 @@ app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req,
         freeSuspended = freeUserRes.rows[0].is_suspended;
       }
     } catch (err) {
-      logger.error('Free model user lookup error in /billing/check', { err: err.message, userEmail });
+      logger.error('Free model user lookup error in /billing/check', { err: err.message, userEmail, request_id: req.id });
       return res.status(500).json({ success: false, msg: '服务器内部错误' });
     }
 
@@ -2062,7 +2075,7 @@ app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req,
       isSuspended = balRes.rows[0].is_suspended;
     }
   } catch (err) {
-    logger.error('Billing check error', { err: err.message, userEmail });
+    logger.error('Billing check error', { err: err.message, userEmail, request_id: req.id });
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 
@@ -2213,7 +2226,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
         });
       }
     } catch (err) {
-      logger.warn('Idempotency pre-check error, continuing with normal billing', { err: err.message });
+      logger.warn('Idempotency pre-check error, continuing with normal billing', { err: err.message, request_id: req.id });
     }
   }
 
@@ -2315,7 +2328,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
         await client.query('COMMIT');
       } catch (err) {
-        logger.error('Free usage DB insert failed, attempting Redis counter rollback', { err: err.message });
+        logger.error('Free usage DB insert failed, attempting Redis counter rollback', { err: err.message, request_id: req.id });
         await safeRollback(client, '/billing/record free insert failed');
         await tryDecrFreeDailyUsage(dailyCheck.key);
         return res.status(500).json({ success: false, msg: '服务器内部错误' });
@@ -2345,7 +2358,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
     // FIX-5.33-1: 防御性空检查——ensureUser 保证行存在，此处兜底防止极端情况 TypeError
     if (!u) {
       await safeRollback(client, '/billing/record user row missing after ensureUser');
-      logger.error('User row missing after ensureUser', { userEmail });
+      logger.error('User row missing after ensureUser', { userEmail, request_id: req.id });
       return res.status(500).json({ success: false, msg: '用户数据异常，请稍后重试' });
     }
 
@@ -2459,7 +2472,7 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
 
     const usageId = usageRes.rows[0]?.id;
     if (!usageId) {
-      logger.error('api_usage INSERT returned no rows (non-idempotent path)', { userEmail, modelName });
+      logger.error('api_usage INSERT returned no rows (non-idempotent path)', { userEmail, modelName, request_id: req.id });
       await safeRollback(client, '/billing/record no usage id');
       return res.status(500).json({ success: false, msg: '服务器内部错误' });
     }
@@ -2547,7 +2560,7 @@ app.get('/admin/dashboard', adminLimiter, requireAdmin, (req, res) => {
 const MODULES_YML_PATH = process.env.MODULES_YML_PATH
   || path.join(__dirname, '..', 'modules', 'modules.yml');
 
-app.get('/admin/modules', adminLimiter, requireAdmin, async (_req, res) => {
+app.get('/admin/modules', adminLimiter, requireAdmin, async (req, res) => {
   try {
     // 安全校验：仅允许读取 .yml/.yaml 文件
     const resolvedPath = path.resolve(MODULES_YML_PATH);
@@ -2571,14 +2584,14 @@ app.get('/admin/modules', adminLimiter, requireAdmin, async (_req, res) => {
       logger.info('modules.yml not found, returning empty list', { path: MODULES_YML_PATH });
       return res.json({ success: true, categories: {} });
     }
-    logger.error('Modules YAML read error', { err: err.message });
+    logger.error('Modules YAML read error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '模块配置读取失败' });
   }
 });
 
 // ── 模型管理 ─────────────────────────────────────────────────
 
-app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
+app.get('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT id, provider, model_name, display_name, is_free,
@@ -2589,7 +2602,7 @@ app.get('/admin/models', adminLimiter, requireAdmin, async (_req, res) => {
     );
     res.json({ success: true, models: result.rows });
   } catch (err) {
-    logger.error('Admin models query error', { err: err.message });
+    logger.error('Admin models query error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -2689,7 +2702,7 @@ app.post('/admin/models', adminLimiter, requireAdmin, async (req, res) => {
     auditLog('model_upsert', { modelName, isFree }, req);
     res.json({ success: true, model: result.rows[0] });
   } catch (err) {
-    logger.error('Model upsert error', { err: err.message });
+    logger.error('Model upsert error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -2708,7 +2721,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     }
     currentModel = cur.rows[0];
   } catch (err) {
-    logger.error('Model fetch error in PUT', { err: err.message, id });
+    logger.error('Model fetch error in PUT', { err: err.message, id, request_id: req.id });
     return res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 
@@ -2818,7 +2831,7 @@ app.put('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => {
     auditLog('model_update', { id, modelName: currentModel.model_name }, req);
     res.json({ success: true, model: result.rows[0] });
   } catch (err) {
-    logger.error('Model update error', { err: err.message });
+    logger.error('Model update error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -2846,14 +2859,14 @@ app.delete('/admin/models/:id', adminLimiter, requireAdmin, async (req, res) => 
     auditLog('model_deactivate', { id, modelName: result.rows[0].model_name }, req);
     res.json({ success: true, model: result.rows[0] });
   } catch (err) {
-    logger.error('Model deactivate error', { err: err.message });
+    logger.error('Model deactivate error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
 
 // ── Provider 配置管理 ─────────────────────────────────────────
 
-app.get('/admin/providers', adminLimiter, requireAdmin, async (_req, res) => {
+app.get('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
   try {
     const result = await db.query(
       `SELECT id, provider_name, display_name, base_url, is_enabled,
@@ -2865,7 +2878,7 @@ app.get('/admin/providers', adminLimiter, requireAdmin, async (_req, res) => {
     });
     res.json({ success: true, providers: result.rows });
   } catch (err) {
-    logger.error('Admin providers query error', { err: err.message });
+    logger.error('Admin providers query error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -2932,7 +2945,7 @@ app.post('/admin/providers', adminLimiter, requireAdmin, async (req, res) => {
     auditLog('provider_upsert', { providerName }, req);
     res.json({ success: true, provider: result.rows[0] });
   } catch (err) {
-    logger.error('Provider upsert error', { err: err.message });
+    logger.error('Provider upsert error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -2992,7 +3005,7 @@ app.put('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) => 
     auditLog('provider_update', { id }, req);
     res.json({ success: true, provider: result.rows[0] });
   } catch (err) {
-    logger.error('Provider update error', { err: err.message });
+    logger.error('Provider update error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -3019,7 +3032,7 @@ app.delete('/admin/providers/:id', adminLimiter, requireAdmin, async (req, res) 
     auditLog('provider_deactivate', { id, providerName: result.rows[0].provider_name }, req);
     res.json({ success: true, provider: result.rows[0] });
   } catch (err) {
-    logger.error('Provider deactivate error', { err: err.message });
+    logger.error('Provider deactivate error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -3114,7 +3127,7 @@ app.post('/admin/adjust', adminLimiter, requireAdmin, async (req, res) => {
     res.json(response);
   } catch (err) {
     await safeRollback(client, '/admin/adjust error');
-    logger.error('Admin adjust error', { err: err.message });
+    logger.error('Admin adjust error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   } finally {
     client.release(!!client.destroyOnRelease); // FIX-5.32-1
@@ -3142,7 +3155,7 @@ app.get('/admin/users', adminLimiter, requireAdmin, async (req, res) => {
     const users = result.rows.map(({ _total, ...rest }) => rest);
     res.json({ success: true, users, total });
   } catch (err) {
-    logger.error('Admin users query error', { err: err.message });
+    logger.error('Admin users query error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -3165,7 +3178,7 @@ app.put('/admin/users/:email/suspend', adminLimiter, requireAdmin, async (req, r
     auditLog('user_suspend', { email }, req);
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
-    logger.error('User suspend error', { err: err.message, email });
+    logger.error('User suspend error', { err: err.message, email, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -3188,7 +3201,7 @@ app.put('/admin/users/:email/unsuspend', adminLimiter, requireAdmin, async (req,
     auditLog('user_unsuspend', { email }, req);
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
-    logger.error('User unsuspend error', { err: err.message, email });
+    logger.error('User unsuspend error', { err: err.message, email, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -3243,7 +3256,7 @@ app.post('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
     auditLog('cards_create', { count: cardCount, creditFen }, req);
     res.json({ success: true, cards: result.rows });
   } catch (err) {
-    logger.error('Card creation error', { err: err.message });
+    logger.error('Card creation error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
@@ -3287,7 +3300,7 @@ app.get('/admin/cards', adminLimiter, requireAdmin, async (req, res) => {
     }));
     res.json({ success: true, cards: maskedCards, total });
   } catch (err) {
-    logger.error('Admin cards query error', { err: err.message });
+    logger.error('Admin cards query error', { err: err.message, request_id: req.id });
     res.status(500).json({ success: false, msg: '服务器内部错误' });
   }
 });
