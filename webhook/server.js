@@ -1,8 +1,21 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.41
+ * Anima 灵枢 · Webhook 服务 v5.42
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.42 相对于 v5.41）：
+ *
+ *   #FIX-5.42-1  Nginx /admin/ location 移除 Content-Security-Policy 头
+ *                - 原：Nginx 为 /admin/ 添加 CSP "default-src 'none'; frame-ancestors 'none'"，
+ *                  与 Express /admin/dashboard 设置的宽松 CSP（含 script-src 'self'
+ *                  'unsafe-inline' 等）同时出现在 HTTP 响应中。浏览器对多个 CSP 头
+ *                  取交集（RFC 9110），导致 script-src 被收紧为 'none'，管理控制台
+ *                  的内联脚本全部被阻断，页面功能完全失效。
+ *                  管理员被迫绕过 Nginx 直连 webhook 服务，失去 TLS/WAF/审计日志保护。
+ *                - 修：删除 Nginx /admin/ location 的 CSP add_header，
+ *                  CSP 策略由 Express 层按响应类型分别设置（HTML 宽松 / JSON 严格），
+ *                  Nginx 仅负责 IP 白名单 + 限速 + 其他安全头。
+ *
  * 修复记录（v5.41 相对于 v5.40）：
  *
  *   #FIX-5.41-1  原型污染检测深度超限改为 fail-closed（拒绝请求）
