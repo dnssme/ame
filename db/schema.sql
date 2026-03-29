@@ -1,6 +1,14 @@
 -- =============================================================
--- Anima 灵枢 · 数据库 Schema v5.4
+-- Anima 灵枢 · 数据库 Schema v5.5
 -- 数据库: librechat (Azure PostgreSQL)
+--
+-- 变更记录（v5.5 · Schema 审计修复）：
+--   · billing_transactions 新增 idempotency_key 列（可 NULL），
+--     支持充值/退款等操作的幂等保护，部分唯一索引 (idempotency_key, user_email)。
+--   · api_models 新增 CHECK 约束 chk_api_models_free_price：
+--     is_free=true 时强制 input/output 价格为 0，防止免费模型误扣费。
+--   · 新增 billing_transactions(created_at DESC) 索引，支持时间范围查询。
+--   · 新增 api_models(is_active, is_free) 复合索引，加速 /models 接口过滤。
 --
 -- 变更记录（v5.4）：
 --   · billing_transactions.user_email 新增外键引用 user_billing(user_email)，
@@ -91,6 +99,10 @@ CREATE TABLE IF NOT EXISTS api_models (
     is_free                    BOOLEAN      NOT NULL DEFAULT false,
     price_input_per_1k_tokens  NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_input_per_1k_tokens >= 0),
     price_output_per_1k_tokens NUMERIC(10,6) NOT NULL DEFAULT 0 CHECK (price_output_per_1k_tokens >= 0),
+    -- v5.5: is_free=true 时价格必须为 0，防止免费模型误扣费
+    CONSTRAINT chk_api_models_free_price CHECK (
+        NOT (is_free = true AND (price_input_per_1k_tokens > 0 OR price_output_per_1k_tokens > 0))
+    ),
     currency                   VARCHAR(3)   NOT NULL DEFAULT 'CNY',
     supports_cache BOOLEAN    NOT NULL DEFAULT false,
     is_active    BOOLEAN      NOT NULL DEFAULT true,
@@ -101,6 +113,10 @@ CREATE TABLE IF NOT EXISTS api_models (
 
 CREATE INDEX IF NOT EXISTS idx_api_models_active
     ON api_models(is_active, provider);
+
+-- v5.5: /models 接口按 is_active + is_free 过滤
+CREATE INDEX IF NOT EXISTS idx_api_models_active_free
+    ON api_models(is_active, is_free);
 
 -- 预置模型
 INSERT INTO api_models
@@ -499,6 +515,7 @@ COMMENT ON COLUMN api_usage.idempotency_key IS
 
 -- =============================================================
 -- 5. 充值/扣费流水
+-- v5.5: 新增 idempotency_key 列，支持充值/退款幂等保护
 -- v5.4: user_email 新增 FK → user_billing，ON DELETE RESTRICT 保护审计完整性
 --       amount_fen CHECK 增强为类型感知（charge/recharge/refund > 0，admin_adjust != 0）
 -- v5.3: 新增 CHECK (amount_fen != 0) 防止零金额流水在 DB 层绕过应用校验写入
@@ -512,6 +529,8 @@ CREATE TABLE IF NOT EXISTS billing_transactions (
     balance_after_fen NUMERIC(12,2) NOT NULL CHECK (balance_after_fen >= 0),
     description       TEXT,
     ref_id            VARCHAR(128),
+    -- v5.5: 幂等键，防止充值/退款等操作重复执行
+    idempotency_key   VARCHAR(128),
     created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     -- v5.4: 类型感知 CHECK——charge/recharge/refund 强制正数，admin_adjust 允许正负但禁止零
     -- 注：admin_adjust 负数扣减时，应用层使用 GREATEST(0, balance_fen + amount) 截断余额，
@@ -524,6 +543,20 @@ CREATE TABLE IF NOT EXISTS billing_transactions (
 
 CREATE INDEX IF NOT EXISTS idx_billing_txn_user
     ON billing_transactions(user_email, created_at DESC);
+
+-- v5.5: 时间范围查询索引（管理员按时间段查看所有流水）
+CREATE INDEX IF NOT EXISTS idx_billing_txn_created
+    ON billing_transactions(created_at DESC);
+
+-- v5.5: 幂等键部分唯一索引（按用户隔离，仅非 NULL 值生效）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_txn_idempotency
+    ON billing_transactions(idempotency_key, user_email)
+    WHERE idempotency_key IS NOT NULL;
+
+COMMENT ON COLUMN billing_transactions.idempotency_key IS
+  '幂等键，防止充值/退款等操作重复执行。
+   由调用方提供，相同 (user_email, idempotency_key) 的第二次请求将被忽略。
+   NULL 表示非幂等操作（如 admin_adjust）。';
 
 -- =============================================================
 -- 6. 触发器：自动更新 updated_at
