@@ -1,8 +1,41 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.37
+ * Anima 灵枢 · Webhook 服务 v5.38
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.38 相对于 v5.37）：
+ *
+ *   #FIX-5.38-1  /billing/check 补齐 modelName 字符集校验
+ *                - 原：/billing/check 对 modelName 仅校验了类型和长度，
+ *                  未使用 MODEL_NAME_RE 做字符白名单校验（/billing/record 已有）。
+ *                  攻击者可通过构造含控制字符或特殊字符的 modelName 进行日志注入。
+ *                - 修：在 /billing/check 的 modelName 校验后新增 MODEL_NAME_RE.test()，
+ *                  与 /billing/record 行为对齐。
+ *
+ *   #FIX-5.38-2  收紧邮箱正则表达式（EMAIL_RE）
+ *                - 原：/^[^\s@]+@[^\s@]+\.[^\s@]+$/ 允许 TLD 部分仅含 1 字符
+ *                  或含特殊字符（如 test@test.!），也允许连续点 test@test..com。
+ *                - 修：改为 RFC 5321 友好正则：本地部分仅允许合法字符（字母、数字、._%+-），
+ *                  域名部分禁止连续点和首尾连字符，TLD 至少 2 位纯字母。
+ *
+ *   #FIX-5.38-3  Nginx 屏蔽 /models/ 和 /providers/ 尾部斜杠变体
+ *                - 原：location = /models 和 location = /providers 为精确匹配，
+ *                  /models/ 和 /providers/ 不命中，落入 location / 被代理到 LibreChat。
+ *                  虽不可利用，但与 /billing/check/、/activate/ 的处理不一致。
+ *                - 修：新增 location = /models/ { return 403; } 和
+ *                  location = /providers/ { return 403; }。
+ *
+ *   #FIX-5.38-4  降低 billingRecordLimiter 至 200 req/min
+ *                - 原：600 req/min 远超 PG_POOL_MAX=10 的承载能力，
+ *                  极端情况下可导致连接池耗尽。
+ *                - 修：降至 200 req/min，仍为 billingCheckLimiter (120r/m) 的合理倍数。
+ *
+ *   #FIX-5.38-5  新增 JSON 原型污染防护中间件
+ *                - 原：Express JSON 解析器不阻止 __proto__、constructor.prototype 等
+ *                  原型污染字段，攻击者可通过构造 {"__proto__":{"isAdmin":true}} 等
+ *                  payload 尝试污染对象原型链。
+ *                - 修：在 JSON 解析后新增中间件，检测并拒绝含原型污染关键字的请求体。
+ *
  * 修复记录（v5.37 相对于 v5.36）：
  *
  *   #FIX-5.37-1  Nginx 屏蔽 /billing/check/ 尾部斜杠变体
@@ -951,6 +984,32 @@ app.use(helmet({
 // FIX-5.22-1: 计费 API 负载均 < 1 KB，收紧至 256 KB 防止大包体 DoS（CIS）
 app.use(express.json({ limit: '256kb' }));
 
+// FIX-5.38-5: 原型污染防护——检测 JSON 体中的 __proto__ / constructor.prototype 字段
+// Express JSON 解析器不阻止这些字段，攻击者可构造 {"__proto__":{"isAdmin":true}} 污染原型链
+function hasProtoPollution(obj, depth) {
+  if (depth > 6 || obj === null || typeof obj !== 'object') return false;
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      if (typeof obj[i] === 'object' && obj[i] !== null && hasProtoPollution(obj[i], depth + 1)) return true;
+    }
+    return false;
+  }
+  const keys = Object.getOwnPropertyNames(obj);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return true;
+    if (typeof obj[key] === 'object' && obj[key] !== null && hasProtoPollution(obj[key], depth + 1)) return true;
+  }
+  return false;
+}
+app.use((req, res, next) => {
+  if (req.body && typeof req.body === 'object' && hasProtoPollution(req.body, 0)) {
+    logger.warn('Prototype pollution attempt blocked', { ip: req.ip, path: req.path });
+    return res.status(400).json({ success: false, msg: '请求包含非法字段' });
+  }
+  next();
+});
+
 // FIX-5.21-2: gzip/br 压缩 JSON 响应，减少带宽占用 60-80%
 app.use(compression({ threshold: 512 }));
 
@@ -1062,9 +1121,10 @@ const billingCheckLimiter = rateLimit({
   message: { success: false, msg: '预检请求过于频繁，请稍后再试' },
 });
 
+// FIX-5.38-4: 原 600 req/min 远超 PG_POOL_MAX=10 承载能力，降至 200
 const billingRecordLimiter = rateLimit({
   windowMs: 60_000,
-  max:      600,
+  max:      200,
   keyGenerator: (req) => req.ip,
   standardHeaders: true,
   legacyHeaders:   false,
@@ -1282,7 +1342,8 @@ function auditLog(action, details, req) {
 }
 
 // ─── 工具函数 ─────────────────────────────────────────────────
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// FIX-5.38-2: 收紧邮箱校验——本地部分限定合法字符，域名部分禁止连续点，TLD 至少 2 位纯字母
+const EMAIL_RE = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
 const MAX_EMAIL_LEN = 254;
 // 连字符置末尾，语义清晰，避免与字符范围操作符混淆
 const IDEMPOTENCY_KEY_RE = /^[a-zA-Z0-9:_-]+$/;
@@ -1749,6 +1810,10 @@ app.post('/billing/check', billingCheckLimiter, requireServiceToken, async (req,
   modelName = modelName.trim();
   if (modelName.length === 0 || modelName.length > 128) {
     return res.status(400).json({ success: false, msg: 'modelName 长度不能超过 128 字符' });
+  }
+  // FIX-5.38-1: 补齐 modelName 字符集校验，与 /billing/record 对齐（防御日志注入）
+  if (!MODEL_NAME_RE.test(modelName)) {
+    return res.status(400).json({ success: false, msg: 'modelName 仅允许字母、数字、连字符、下划线、点、冒号、斜杠' });
   }
 
   // 使用带缓存的查询（60s TTL），减少高频场景 DB 压力（FIX-5.9-2）
