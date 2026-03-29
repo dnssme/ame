@@ -15,6 +15,9 @@
  *            修复：从 wechaty 包直接导入 types 枚举。
  *   #FIX-W3  WECHAT_MSG_LIMIT 从 4000 修正为 2000（微信单条消息上限约 2000 字符）
  *            原值 4000 可能导致消息被微信服务端静默截断，用户收不到完整回复。
+ *   #FIX-W4  saySplitMessage 改为在换行符处智能分割，避免粗暴截断破坏上下文。
+ *            每段发送增加 try/catch，单段失败不阻断后续分段。
+ *   #FIX-W5  启动时校验必要环境变量，缺失时明确报错并退出。
  */
 
 const http       = require('http');
@@ -64,6 +67,15 @@ if (redis) {
   redis.on('error', (err) => {
     logger.error('Redis 连接错误', { err: err.message });
   });
+}
+
+// ─── 启动验证：必要环境变量 ──────────────────────────────────
+// FIX-W5：缺少必要变量时明确报错退出，避免运行时出现隐晦错误
+const REQUIRED_ENV_VARS = ['AGENT_API_URL'];
+const missingEnvVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
+if (missingEnvVars.length > 0) {
+  logger.error(`缺少必要的环境变量，模块无法启动：${missingEnvVars.join(', ')}`);
+  process.exit(1);
 }
 
 /** 转义正则特殊字符，防止 new RegExp() 注入 */
@@ -134,12 +146,41 @@ const sessionCleanupTimer = setInterval(() => {
 // FIX-W3：微信单条消息上限约 2000 字符（原值 4000 会被服务端静默截断）
 const WECHAT_MSG_LIMIT = 2000;
 
+/**
+ * FIX-W4：智能分割 + 容错发送
+ * - 优先在换行符处分割，避免截断句子中间
+ * - 每段发送失败仅记录日志，不阻断后续分段
+ */
+function splitText(text, limit) {
+  const parts = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    // 在 limit 范围内找最后一个换行符作为分割点
+    // 注意：<= 0 而非 < 0，因为 splitAt===0 会产生空首段，无意义
+    let splitAt = remaining.lastIndexOf('\n', limit);
+    if (splitAt <= 0) {
+      splitAt = remaining.lastIndexOf('。', limit);
+    }
+    if (splitAt <= 0) {
+      splitAt = remaining.lastIndexOf(' ', limit);
+    }
+    if (splitAt <= 0) {
+      splitAt = limit;
+    }
+    parts.push(remaining.substring(0, splitAt));
+    remaining = remaining.substring(splitAt).replace(/^\n/, '');
+  }
+  if (remaining) parts.push(remaining);
+  return parts;
+}
+
 async function saySplitMessage(msg, text) {
-  if (text.length <= WECHAT_MSG_LIMIT) {
-    await msg.say(text);
-  } else {
-    for (let i = 0; i < text.length; i += WECHAT_MSG_LIMIT) {
-      await msg.say(text.substring(i, i + WECHAT_MSG_LIMIT));
+  const parts = splitText(text, WECHAT_MSG_LIMIT);
+  for (const part of parts) {
+    try {
+      await msg.say(part);
+    } catch (err) {
+      logger.error('分段消息发送失败', { err: err.message, partLength: part.length });
     }
   }
 }
