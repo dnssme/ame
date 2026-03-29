@@ -1,8 +1,18 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.38
+ * Anima 灵枢 · Webhook 服务 v5.39
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.39 相对于 v5.38）：
+ *
+ *   #FIX-5.39-1  requireActivationToken 新增应用层 IP 白名单
+ *                - 原：requireActivationToken 仅校验 Token，未校验来源 IP，
+ *                  与 requireAdmin / requireServiceToken 的纵深防御策略不一致。
+ *                  若 ACTIVATION_TOKEN 泄露，攻击者可从任意 IP 调用 /activate
+ *                  为任意邮箱充值。
+ *                - 修：在 Token 校验前新增 isInternalIP(req.ip) 检查，
+ *                  与 requireAdmin / requireServiceToken 行为对齐。
+ *
  * 修复记录（v5.38 相对于 v5.37）：
  *
  *   #FIX-5.38-1  /billing/check 补齐 modelName 字符集校验
@@ -1317,6 +1327,11 @@ function requireServiceToken(req, res, next) {
 
 // FIX-5.35-5: 充值卡激活鉴权——防止未授权用户为任意邮箱激活卡密
 function requireActivationToken(req, res, next) {
+  // FIX-5.39-1: 应用层 IP 白名单——与 requireAdmin / requireServiceToken 对齐
+  if (!isInternalIP(req.ip)) {
+    logger.warn('Activation IP rejected (app-level)', { ip: req.ip, path: req.path });
+    return res.status(403).json({ success: false, msg: '禁止访问' });
+  }
   if (!ACTIVATION_TOKEN) {
     logger.error('ACTIVATION_TOKEN 未配置，拒绝激活请求', { path: req.path, ip: req.ip });
     return res.status(503).json({ success: false, msg: '激活服务未配置，请联系管理员' });
