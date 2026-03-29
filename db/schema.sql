@@ -464,7 +464,8 @@ CREATE INDEX IF NOT EXISTS idx_recharge_cards_unused
 -- =============================================================
 CREATE TABLE IF NOT EXISTS api_usage (
     id              BIGSERIAL     PRIMARY KEY,
-    user_email      VARCHAR(254)  NOT NULL,
+    -- FIX-5.33-3: 新增 FK 约束，与 billing_transactions 对齐，防止孤儿记录
+    user_email      VARCHAR(254)  NOT NULL REFERENCES user_billing(user_email) ON DELETE RESTRICT,
     api_model_id    INT           REFERENCES api_models(id) ON DELETE SET NULL,
     api_provider    VARCHAR(32)   NOT NULL,
     model_name      VARCHAR(128)  NOT NULL,

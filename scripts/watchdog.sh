@@ -61,26 +61,38 @@ restart_service() {
 }
 
 # ─── 单次检查模式（适合 cron）─────────────────────────────────
+# FIX: 使用 flock 文件锁防止并发 cron 实例之间的竞态条件
 if [[ "${1:-}" == "--once" ]]; then
   FAIL_COUNT_FILE="${FAIL_COUNT_FILE:-/var/tmp/anima-watchdog-failures}"
-  fail_count=0
-  if [[ -f "${FAIL_COUNT_FILE}" ]]; then
-    fail_count=$(cat "${FAIL_COUNT_FILE}" 2>/dev/null || echo 0)
-  fi
+  LOCK_FILE="${FAIL_COUNT_FILE}.lock"
 
-  if check_health; then
-    echo 0 > "${FAIL_COUNT_FILE}"
-    exit 0
-  else
-    fail_count=$((fail_count + 1))
-    echo "${fail_count}" > "${FAIL_COUNT_FILE}"
-    log_warn "健康检查失败 (${fail_count}/${MAX_FAILURES})"
-    if [[ ${fail_count} -ge ${MAX_FAILURES} ]]; then
-      restart_service
-      echo 0 > "${FAIL_COUNT_FILE}"
+  (
+    # 获取排他锁（非阻塞：若另一实例正在运行则立即退出）
+    if ! flock -n 9; then
+      log_warn "另一个看门狗实例正在运行，跳过本次检查"
+      exit 0
     fi
-    exit 1
-  fi
+
+    fail_count=0
+    if [[ -f "${FAIL_COUNT_FILE}" ]]; then
+      fail_count=$(cat "${FAIL_COUNT_FILE}" 2>/dev/null || echo 0)
+    fi
+
+    if check_health; then
+      echo 0 > "${FAIL_COUNT_FILE}"
+      exit 0
+    else
+      fail_count=$((fail_count + 1))
+      echo "${fail_count}" > "${FAIL_COUNT_FILE}"
+      log_warn "健康检查失败 (${fail_count}/${MAX_FAILURES})"
+      if [[ ${fail_count} -ge ${MAX_FAILURES} ]]; then
+        restart_service
+        echo 0 > "${FAIL_COUNT_FILE}"
+      fi
+      exit 1
+    fi
+  ) 9>"${LOCK_FILE}"
+  exit $?
 fi
 
 # ─── 持续监控模式（默认）──────────────────────────────────────

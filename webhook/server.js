@@ -1,8 +1,21 @@
 'use strict';
 
 /**
- * Anima 灵枢 · Webhook 服务 v5.32
+ * Anima 灵枢 · Webhook 服务 v5.33
  * ─────────────────────────────────────────────────────────────
+ * 修复记录（v5.33 相对于 v5.32）：
+ *
+ *   #FIX-5.33-1  /billing/record 付费模型路径 userRes.rows[0] 防御性空检查
+ *                - 原：ensureUser 后直接取 rows[0] 访问属性，若行异常缺失
+ *                  会抛出 TypeError 导致未捕获异常。
+ *                - 修：增加 !u 空检查，返回 500 并记录错误日志。
+ *
+ *   #FIX-5.33-2  优雅关闭超时路径增加 DB/Redis 清理
+ *                - 原：server.close 超时后直接 process.exit(1)，DB 连接池
+ *                  和 Redis 客户端未被关闭，可能产生孤儿连接。
+ *                - 修：强制退出前尝试 db.end() + redis.quit()，
+ *                  在 finally 中 process.exit(1)。
+ *
  * 修复记录（v5.32 相对于 v5.31）：
  *
  *   #FIX-5.32-1  safeRollback ROLLBACK 失败时销毁连接而非放回连接池
@@ -1857,6 +1870,12 @@ app.post('/billing/record', billingRecordLimiter, requireServiceToken, async (re
       values: [userEmail],
     });
     const u = userRes.rows[0];
+    // FIX-5.33-1: 防御性空检查——ensureUser 保证行存在，此处兜底防止极端情况 TypeError
+    if (!u) {
+      await safeRollback(client, '/billing/record user row missing after ensureUser');
+      logger.error('User row missing after ensureUser', { userEmail });
+      return res.status(500).json({ success: false, msg: '用户数据异常，请稍后重试' });
+    }
 
     // FIX-5.14-1: 付费模型 403 暂停响应补齐 balance_fen 和 is_suspended
     if (u.is_suspended) {
@@ -2915,7 +2934,14 @@ const shutdown = (signal) => {
     if (typeof server.closeAllConnections === 'function') {
       server.closeAllConnections();
     }
-    process.exit(1);
+    // FIX-5.33-2: 强制退出路径也尝试关闭 DB/Redis，防止连接泄漏
+    // 设置 2 秒内部超时，确保即使清理操作挂起也能退出
+    const forceExitTimer = setTimeout(() => process.exit(1), 2000);
+    forceExitTimer.unref();
+    Promise.all([
+      db.end().catch(() => {}),
+      redis.quit().catch(() => {}),
+    ]).finally(() => process.exit(1));
   }, GRACEFUL_SHUTDOWN_TIMEOUT);
 };
 
